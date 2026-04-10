@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Foundry build artifacts
+out/
+cache/
+
+# Deploy logs (contain deployer addresses + tx data)
+broadcast/
+
+# Dependencies (fetched via forge install)
+lib/

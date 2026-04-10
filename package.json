@@ -1,0 +1,12 @@
+{
+  "name": "woco-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test -vv",
+    "deploy:base-sepolia": "forge script script/Deploy.s.sol --rpc-url base_sepolia --broadcast",
+    "deploy:base": "forge script script/Deploy.s.sol --rpc-url base --broadcast",
+    "deploy:op-sepolia": "forge script script/Deploy.s.sol --rpc-url op_sepolia --broadcast"
+  }
+}
