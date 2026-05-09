@@ -9,6 +9,9 @@ remappings = ["@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"]
 optimizer = true
 optimizer_runs = 200
 
+# Allow deploy scripts to write deployment address JSON files
+fs_permissions = [{ access = "read-write", path = "deployments/" }]
+
 [rpc_endpoints]
 base_sepolia = "https://sepolia.base.org"
 base = "https://mainnet.base.org"
@@ -20,5 +23,7 @@ sepolia = "https://rpc.sepolia.org"
 [etherscan]
 base_sepolia = { key = "${BASESCAN_API_KEY}", url = "https://api-sepolia.basescan.org/api" }
 base = { key = "${BASESCAN_API_KEY}", url = "https://api.basescan.org/api" }
+optimism = { key = "${OPSCAN_API_KEY}", url = "https://api-optimistic.etherscan.io/api" }
+op_sepolia = { key = "${OPSCAN_API_KEY}", url = "https://api-sepolia-optimistic.etherscan.io/api" }
 mainnet = { key = "${ETHERSCAN_API_KEY}" }
 sepolia = { key = "${ETHERSCAN_API_KEY}" }
