@@ -44,6 +44,7 @@ contract WoCoEvent is Ownable2Step {
 
     mapping(bytes32 => Event) public events;
     mapping(bytes32 => mapping(uint256 => address)) public slotOwner;
+    mapping(bytes32 => mapping(uint256 => bytes32)) public slotOrderRef;
     mapping(address => bool) public authorisedSponsors;
     mapping(address => uint256) public organiserNonce;
 
@@ -139,8 +140,22 @@ contract WoCoEvent is Ownable2Step {
         slot = ev.nextSlot;
         ev.nextSlot = slot + 1;
         slotOwner[eventId][slot] = burner;
+        slotOrderRef[eventId][slot] = orderRef;
 
         emit SlotClaimed(eventId, slot, burner, orderRef);
+    }
+
+    /**
+     * @notice Convenience view: return the slot owner and encrypted-order ref together.
+     *         Organiser calls this for each slot 0..nextSlot-1 to reconstruct the
+     *         attendee list without walking any Swarm feed.
+     */
+    function getSlotData(bytes32 eventId, uint256 slot)
+        external
+        view
+        returns (address owner, bytes32 orderRef)
+    {
+        return (slotOwner[eventId][slot], slotOrderRef[eventId][slot]);
     }
 
     /**

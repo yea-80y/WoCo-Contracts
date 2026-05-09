@@ -116,6 +116,57 @@ contract WoCoEventTest is Test {
 
         assertEq(slot, 0);
         assertEq(woco.slotOwner(eventId, 0), burner);
+        assertEq(woco.slotOrderRef(eventId, 0), orderRef);
+    }
+
+    function test_ClaimFor_StoresOrderRef() public {
+        bytes32 eventId  = _register();
+        bytes32 orderRef = keccak256("my-sealed-box-ref");
+
+        vm.prank(sponsor);
+        woco.claimFor(eventId, burner, orderRef);
+
+        assertEq(woco.slotOrderRef(eventId, 0), orderRef);
+    }
+
+    function test_GetSlotData_ReturnsOwnerAndOrderRef() public {
+        bytes32 eventId  = _register();
+        bytes32 orderRef = keccak256("order-ref-abc");
+
+        vm.prank(sponsor);
+        woco.claimFor(eventId, burner, orderRef);
+
+        (address owner, bytes32 ref) = woco.getSlotData(eventId, 0);
+        assertEq(owner, burner);
+        assertEq(ref, orderRef);
+    }
+
+    function test_GetSlotData_UnclaimedSlotReturnsZero() public {
+        bytes32 eventId = _register();
+
+        (address owner, bytes32 ref) = woco.getSlotData(eventId, 0);
+        assertEq(owner, address(0));
+        assertEq(ref, bytes32(0));
+    }
+
+    function test_GetSlotData_MultipleSlots() public {
+        bytes32 eventId  = _register();
+        bytes32 orderRef0 = keccak256("order-0");
+        bytes32 orderRef1 = keccak256("order-1");
+        address burner2  = address(0x42);
+
+        vm.startPrank(sponsor);
+        woco.claimFor(eventId, burner, orderRef0);
+        woco.claimFor(eventId, burner2, orderRef1);
+        vm.stopPrank();
+
+        (address owner0, bytes32 ref0) = woco.getSlotData(eventId, 0);
+        (address owner1, bytes32 ref1) = woco.getSlotData(eventId, 1);
+
+        assertEq(owner0, burner);
+        assertEq(ref0, orderRef0);
+        assertEq(owner1, burner2);
+        assertEq(ref1, orderRef1);
     }
 
     function test_ClaimFor_AllocatesSequentialSlots() public {
