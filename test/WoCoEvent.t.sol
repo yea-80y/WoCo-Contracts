@@ -250,6 +250,123 @@ contract WoCoEventTest is Test {
         assertEq(nextSlot, 1);
     }
 
+    // ── batchClaimFor ──────────────────────────────────────────────────────────
+
+    function test_BatchClaimFor_AllocatesNContiguousSlots() public {
+        bytes32 eventId = _register();
+        address[] memory burners = new address[](3);
+        burners[0] = address(0xA1);
+        burners[1] = address(0xA2);
+        burners[2] = address(0xA3);
+        bytes32 orderRef = keccak256("shared-order");
+
+        vm.prank(sponsor);
+        uint256 firstSlot = woco.batchClaimFor(eventId, burners, orderRef);
+
+        assertEq(firstSlot, 0);
+        assertEq(woco.slotOwner(eventId, 0), burners[0]);
+        assertEq(woco.slotOwner(eventId, 1), burners[1]);
+        assertEq(woco.slotOwner(eventId, 2), burners[2]);
+        assertEq(woco.slotOrderRef(eventId, 0), orderRef);
+        assertEq(woco.slotOrderRef(eventId, 1), orderRef);
+        assertEq(woco.slotOrderRef(eventId, 2), orderRef);
+
+        (, uint256 nextSlot, ,) = woco.events(eventId);
+        assertEq(nextSlot, 3);
+    }
+
+    function test_BatchClaimFor_FollowsExistingClaims() public {
+        bytes32 eventId = _register();
+
+        vm.prank(sponsor);
+        woco.claimFor(eventId, burner, keccak256("solo"));
+
+        address[] memory burners = new address[](2);
+        burners[0] = address(0xB1);
+        burners[1] = address(0xB2);
+
+        vm.prank(sponsor);
+        uint256 firstSlot = woco.batchClaimFor(eventId, burners, keccak256("batch"));
+        assertEq(firstSlot, 1);
+        assertEq(woco.slotOwner(eventId, 1), burners[0]);
+        assertEq(woco.slotOwner(eventId, 2), burners[1]);
+    }
+
+    function test_BatchClaimFor_RevertEmpty() public {
+        bytes32 eventId = _register();
+        address[] memory burners = new address[](0);
+        vm.prank(sponsor);
+        vm.expectRevert("Empty batch");
+        woco.batchClaimFor(eventId, burners, keccak256("x"));
+    }
+
+    function test_BatchClaimFor_RevertTooLarge() public {
+        bytes32 eventId = _register();
+        address[] memory burners = new address[](101);
+        for (uint256 i = 0; i < 101; i++) burners[i] = address(uint160(i + 1));
+        vm.prank(sponsor);
+        vm.expectRevert("Batch too large");
+        woco.batchClaimFor(eventId, burners, keccak256("x"));
+    }
+
+    function test_BatchClaimFor_RevertInsufficientSupply() public {
+        vm.prank(organiser);
+        bytes32 eventId = woco.registerEvent(2, MANIFEST);
+
+        address[] memory burners = new address[](3);
+        burners[0] = address(0xC1);
+        burners[1] = address(0xC2);
+        burners[2] = address(0xC3);
+
+        vm.prank(sponsor);
+        vm.expectRevert("Insufficient supply");
+        woco.batchClaimFor(eventId, burners, keccak256("x"));
+
+        // Nothing was written
+        (, uint256 nextSlot, ,) = woco.events(eventId);
+        assertEq(nextSlot, 0);
+    }
+
+    function test_BatchClaimFor_RevertUnauthorised() public {
+        bytes32 eventId = _register();
+        address[] memory burners = new address[](1);
+        burners[0] = burner;
+        vm.prank(attacker);
+        vm.expectRevert("Not authorised");
+        woco.batchClaimFor(eventId, burners, keccak256("x"));
+    }
+
+    function test_BatchClaimFor_EmitsOneEventPerSlot() public {
+        bytes32 eventId = _register();
+        address[] memory burners = new address[](2);
+        burners[0] = address(0xD1);
+        burners[1] = address(0xD2);
+        bytes32 orderRef = keccak256("batch-emit");
+
+        vm.prank(sponsor);
+        vm.expectEmit(true, false, true, true);
+        emit WoCoEvent.SlotClaimed(eventId, 0, burners[0], orderRef);
+        vm.expectEmit(true, false, true, true);
+        emit WoCoEvent.SlotClaimed(eventId, 1, burners[1], orderRef);
+        woco.batchClaimFor(eventId, burners, orderRef);
+    }
+
+    function test_BatchClaimFor_MaxSize100() public {
+        // Register an event with 100-supply so the full batch fits.
+        vm.prank(organiser);
+        bytes32 eventId = woco.registerEvent(100, MANIFEST);
+
+        address[] memory burners = new address[](100);
+        for (uint256 i = 0; i < 100; i++) burners[i] = address(uint160(i + 1));
+
+        vm.prank(sponsor);
+        uint256 firstSlot = woco.batchClaimFor(eventId, burners, keccak256("max"));
+        assertEq(firstSlot, 0);
+
+        (, uint256 nextSlot, ,) = woco.events(eventId);
+        assertEq(nextSlot, 100);
+    }
+
     // ── Sponsor management ─────────────────────────────────────────────────────
 
     function test_AddSponsor_OwnerCanAdd() public {
@@ -404,7 +521,7 @@ contract WoCoEventTest is Test {
     // ── Fuzz tests ─────────────────────────────────────────────────────────────
 
     function testFuzz_RegisterEvent(uint256 supply, bytes32 manifestRef) public {
-        vm.assume(supply > 0);
+        supply = bound(supply, 1, type(uint96).max);
         vm.assume(manifestRef != bytes32(0));
 
         bytes32 expected = keccak256(abi.encode(organiser, uint256(0)));
