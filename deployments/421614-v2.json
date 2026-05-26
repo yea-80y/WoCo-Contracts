@@ -1,0 +1,12 @@
+{
+  "address": "0x351070Aff6dECa449506a6eA6dC6cB84D13cAedf",
+  "chainId": 421614,
+  "contract": "WoCoEventV2",
+  "defaultFeeBps": 150,
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "initialSponsor": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "note_owner": "Rotate to multisig post-deploy",
+  "note_treasury": "Currently = deployer; set PLATFORM_TREASURY to override",
+  "paymentToken": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
+  "platformTreasury": "0xff9758533Ec0FE75030820Af9468989B53b19a5c"
+}
