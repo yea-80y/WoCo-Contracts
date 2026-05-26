@@ -1,0 +1,8 @@
+{
+  "address": "0x172031E6a8428617B05F2002e0e278bb8fb3Ed8A",
+  "chainId": 421614,
+  "contract": "WoCoEvent",
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "note_owner": "Rotate to multisig post-deploy",
+  "note_sponsor": "Rotate to dedicated sponsor wallet pre-load"
+}

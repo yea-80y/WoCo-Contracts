@@ -23,6 +23,14 @@ import "../src/WoCoEvent.sol";
  *     forge script script/DeployEvent.s.sol \
  *       --rpc-url op_sepolia --broadcast --verify
  *
+ *   Arbitrum Sepolia (Arbitrum Buildathon staging):
+ *     forge script script/DeployEvent.s.sol \
+ *       --rpc-url arb_sepolia --broadcast --verify
+ *
+ *   Arbitrum One (Arbitrum Buildathon production) — explicit user confirmation required:
+ *     forge script script/DeployEvent.s.sol \
+ *       --rpc-url arbitrum --broadcast --verify
+ *
  * Dry-run (no broadcast — safe for mainnet testing):
  *     forge script script/DeployEvent.s.sol --rpc-url base
  *

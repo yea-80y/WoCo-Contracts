@@ -17,6 +17,8 @@ base_sepolia = "https://sepolia.base.org"
 base = "https://mainnet.base.org"
 op_sepolia = "https://sepolia.optimism.io"
 optimism = "https://mainnet.optimism.io"
+arb_sepolia = "https://sepolia-rollup.arbitrum.io/rpc"
+arbitrum = "https://arb1.arbitrum.io/rpc"
 mainnet = "https://eth.llamarpc.com"
 sepolia = "https://rpc.sepolia.org"
 
@@ -25,5 +27,7 @@ base_sepolia = { key = "${BASESCAN_API_KEY}", url = "https://api-sepolia.basesca
 base = { key = "${BASESCAN_API_KEY}", url = "https://api.basescan.org/api" }
 optimism = { key = "${OPSCAN_API_KEY}", url = "https://api-optimistic.etherscan.io/api" }
 op_sepolia = { key = "${OPSCAN_API_KEY}", url = "https://api-sepolia-optimistic.etherscan.io/api" }
+arb_sepolia = { key = "${ARBISCAN_API_KEY}", url = "https://api-sepolia.arbiscan.io/api" }
+arbitrum = { key = "${ARBISCAN_API_KEY}", url = "https://api.arbiscan.io/api" }
 mainnet = { key = "${ETHERSCAN_API_KEY}" }
 sepolia = { key = "${ETHERSCAN_API_KEY}" }
