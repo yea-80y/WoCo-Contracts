@@ -1,4 +1,7 @@
 {
+  "lib/ens-contracts": {
+    "rev": "a6139f0381ce6bcc584cbce36933c5ea95837212"
+  },
   "lib/forge-std": {
     "tag": {
       "name": "v1.15.0",
@@ -10,5 +13,8 @@
       "name": "v5.6.1",
       "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
     }
+  },
+  "lib/solidity-stringutils": {
+    "rev": "4b2fcc43fa0426e19ce88b1f1ec16f5903a2e461"
   }
 }
