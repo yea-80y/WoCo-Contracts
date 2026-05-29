@@ -17,14 +17,14 @@ interface IL2RegistryFactory {
 ///         deploys WoCoRegistrar, wires it in, and seeds sponsor + reserved names.
 /// @dev Run against Arbitrum Sepolia first:
 ///        forge script script/DeploySubEnsRegistry.s.sol --rpc-url arb_sepolia --broadcast
-///      Env: PRIVATE_KEY (deployer = registry admin + registrar owner), SPONSOR_ADDRESS
+///      Env: DEPLOYER_PRIVATE_KEY (deployer = registry admin + registrar owner), SPONSOR_ADDRESS
 ///      (platform gas-sponsor wallet authorised to mint). PARENT_NAME defaults to "woco.eth".
 contract DeploySubEnsRegistry is Script {
     // Durin's L2RegistryFactory — same address on every supported chain (incl. Arbitrum + Arb Sepolia).
     address constant L2_REGISTRY_FACTORY = 0xDddddDdDDD8Aa1f237b4fa0669cb46892346d22d;
 
     function run() external {
-        uint256 deployerPk = vm.envUint("PRIVATE_KEY");
+        uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPk);
         address sponsor = vm.envAddress("SPONSOR_ADDRESS");
         string memory parentName = vm.envOr("PARENT_NAME", string("woco.eth"));

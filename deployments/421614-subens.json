@@ -1,0 +1,14 @@
+{
+  "contract": "SubENSRegistry",
+  "chainId": 421614,
+  "parentName": "woco.eth",
+  "l2Registry": "0x41Fb196Ae7D65E06880A240c8d1B91245Fb84807",
+  "wocoRegistrar": "0x206e5e2fBF813b5E8A2c2D6ae54106165975BEd3",
+  "factory": "0xDddddDdDDD8Aa1f237b4fa0669cb46892346d22d",
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "authorisedSponsor": "0x7b318c46a6FDC544212ebd83335f6b7414A97925",
+  "deployTx": "0x4719c3f2bdaa9b43813c04aaf32634c067810e6ce23e7f21b68f56c60ca82a43",
+  "arbiscan": "https://sepolia.arbiscan.io/address/0x206e5e2fbf813b5e8a2c2d6ae54106165975bed3",
+  "verified": true,
+  "durinPinCommit": "1ef1ea30"
+}
