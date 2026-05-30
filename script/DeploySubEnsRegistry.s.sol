@@ -27,6 +27,9 @@ contract DeploySubEnsRegistry is Script {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPk);
         address sponsor = vm.envAddress("SPONSOR_ADDRESS");
+        // Platform signer: address whose off-chain signature authorises registerWithPermit.
+        // For buildathon: same address as sponsor. Post-buildathon: use a separate cold key.
+        address platformSigner = vm.envOr("PLATFORM_SIGNER_ADDRESS", sponsor);
         string memory parentName = vm.envOr("PARENT_NAME", string("woco.eth"));
 
         vm.startBroadcast(deployerPk);
@@ -37,7 +40,7 @@ contract DeploySubEnsRegistry is Script {
         IL2Registry registry = IL2Registry(registryAddr);
 
         // 2. Deploy our minting-policy layer.
-        WoCoRegistrar registrar = new WoCoRegistrar(registryAddr, deployer);
+        WoCoRegistrar registrar = new WoCoRegistrar(registryAddr, deployer, platformSigner);
 
         // 3. Grant the registrar record-setting + minting authority on the registry.
         registry.addRegistrar(address(registrar));
@@ -59,5 +62,6 @@ contract DeploySubEnsRegistry is Script {
         console.log("WoCoRegistrar:    ", address(registrar));
         console.log("Registry admin:   ", deployer);
         console.log("Authorised sponsor:", sponsor);
+        console.log("Platform signer:  ", platformSigner);
     }
 }
