@@ -1,0 +1,17 @@
+{
+  "contract": "WoCoGuardianHook",
+  "chainId": 421614,
+  "address": "0xF43524473EBC651969BeCc748462ED27ed39d4Db",
+  "deployedVia": "CREATE2 deterministic-deployment proxy 0x4e59b44847b379578588920cA78FbF26c0B4956C",
+  "salt": "0x768b330ef2688febb8545cb54b3f30bd9e0b8ac11f6a5cc864ed272de4f43a9c",
+  "saltPreimage": "woco/recovery/guardian-hook/v1",
+  "creationCodeHash": "0xfb995fafc78ca4198ffe4f6f26319789e50703b4630173137acb2c7ea353e057",
+  "deployTx": "0x89e65a637cb10c910c5ce21caae6b825f393c5d9ba887421a69e5e13d7c883f3",
+  "deployBlock": 300947688,
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "deployerRole": "gas only — the contract has no owner, admin or upgrade path",
+  "arbiscan": "https://sepolia.arbiscan.io/address/0xf43524473ebc651969becc748462ed27ed39d4db",
+  "verified": true,
+  "replaces": "ZeroDev caller hook 0x990a9FC8189D96d59E3cE98bd87F42135a24a30E (append-only allowed[][] mapping, no revoke)",
+  "note": "Deployed 2026-08-22 for WoCo-Event-App #164 — ERC-7579 hook (type 4) with set-semantics onInstall, addGuardian/revokeGuardian/setGuardians/clearGuardians, guardiansOf/isGuardian getters. Same salt + bytecode yields the same address on any chain with the proxy."
+}
