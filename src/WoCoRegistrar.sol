@@ -135,18 +135,50 @@ contract WoCoRegistrar is Ownable {
     }
 
     /// @notice Updates a name's Swarm site pointer (called on each site redeploy).
-    /// @dev Authorised because this registrar is in the registry's `registrars` set.
+    ///
+    /// @dev This is the ONLY post-mint record write the platform retains
+    ///      (owner decision, 2026-08-29, WoCo-Event-App #422). `setText` was
+    ///      removed in the same pass: it was never called by the server, so it
+    ///      was standing authority over holders' profile records purchased with
+    ///      no operational benefit at all.
+    ///
+    ///      RESIDUAL, STATED PLAINLY SO IT IS NOT REDISCOVERED: this function
+    ///      takes an ARBITRARY label. Because the registrar sits in the
+    ///      registry's `registrars` set, and `onlyOwnerOrRegistrar` scopes to
+    ///      registrar MEMBERSHIP rather than to the node, an authorised sponsor
+    ///      can repoint ANY name's contenthash, including one it did not mint.
+    ///      That is retained deliberately — automated site redeploy needs it and
+    ///      the organiser is not present to sign — but it is real standing
+    ///      authority sitting on the hot key `WOCO_SPONSOR_PRIVATE_KEY`.
+    ///
+    ///      What bounds it: the server refuses to call this unless the
+    ///      authenticated caller owns the label (routes/sub-ens.ts:290-296 and
+    ///      routes/sites.ts:1060-1061 both check `getLabelOwner` against the
+    ///      verified parentAddress). That check is application code, not a
+    ///      contract guarantee.
+    ///
+    ///      WHY THE RESIDUAL IS ACCEPTED RATHER THAN CLOSED NOW, stated
+    ///      accurately: a per-redeploy holder signature would defeat automated
+    ///      redeploy, but that is not the only shape available — a REVERSIBLE
+    ///      per-node "platform-managed" toggle (default on at mint, holder may
+    ///      opt out and back in) would bound this at the cost of one signature
+    ///      per opt-out, not per redeploy. It is deferred, not ruled out.
+    ///
+    ///      What makes deferring it safe: unlike the registry, THIS contract is
+    ///      not frozen. The registry reaches it through `registrars`, so a
+    ///      registrar v2 can narrow this post-launch via `addRegistrar` /
+    ///      `removeRegistrar` without touching the EIP-1167 clone. Note also
+    ///      that no registrar-level scheme can bind the registry OWNER, which
+    ///      can add any address to `registrars` — see `adminTransfer`'s notes.
+    ///
+    ///      The blast radius is where a name POINTS, never what it owns or where
+    ///      its funds go: address records are written once inside `_register`
+    ///      and there is no post-mint `setAddr` on this contract.
     function setContenthash(string calldata label, bytes calldata contenthash) external onlySponsor {
         if (contenthash.length == 0) revert EmptyContenthash();
         bytes32 node = registry.makeNode(registry.baseNode(), label);
         registry.setContenthash(node, contenthash);
         emit ContenthashUpdated(label, contenthash);
-    }
-
-    /// @notice Updates a single profile text record for a name.
-    function setText(string calldata label, string calldata key, string calldata value) external onlySponsor {
-        bytes32 node = registry.makeNode(registry.baseNode(), label);
-        registry.setText(node, key, value);
     }
 
     /*//////////////////////////////////////////////////////////////

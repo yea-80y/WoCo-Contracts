@@ -20,6 +20,22 @@ import {L2Resolver} from "./L2Resolver.sol";
 /// @author NameStone
 /// @notice Manages ENS subname registration and management on L2
 /// @dev Combined Registry, BaseRegistrar and PublicResolver from the official .eth contracts
+///
+/// ┌──────────────────────────────────────────────────────────────────────────┐
+/// │ VENDORED + MODIFIED BY WOCO — this is NOT pristine upstream Durin.        │
+/// │                                                                          │
+/// │ WoCo additions (WoCo-Event-App #422), all pure additions, nothing         │
+/// │ upstream removed:                                                        │
+/// │   · `adminTransfer(node, newOwner)`  · event `AdminTransfer`              │
+/// │   · errors AdminTransferToZero / BaseNode / Unregistered / SameOwner      │
+/// │                                                                          │
+/// │ DO NOT resync this file from upstream without re-applying them. The       │
+/// │ tripwire is test/L2RegistryAdminTransfer.t.sol, which fails to compile    │
+/// │ if they are dropped — do not delete that file to make a sync pass.        │
+/// │                                                                          │
+/// │ This contract is deployed as an EIP-1167 clone and CANNOT be upgraded.    │
+/// │ Anything wrong here is permanent from the mainnet deploy onward.          │
+/// └──────────────────────────────────────────────────────────────────────────┘
 contract L2Registry is ERC721, Initializable, L2Resolver {
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -62,6 +78,16 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     event RegistrarRemoved(address registrar);
     event BaseURIUpdated(string baseURI);
 
+    /// @notice A name was reassigned by the registry admin without the holder's
+    ///         consent (WoCo addition, #422). Distinct from the ERC-721
+    ///         `Transfer` this also emits, so that an admin reassignment is
+    ///         legible on chain rather than indistinguishable from a sale.
+    event AdminTransfer(
+        bytes32 indexed node,
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -69,6 +95,10 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     error LabelTooShort();
     error LabelTooLong(string label);
     error NotAvailable(string label, bytes32 parentNode);
+    error AdminTransferToZero();
+    error AdminTransferBaseNode();
+    error AdminTransferUnregistered(bytes32 node);
+    error AdminTransferSameOwner();
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -237,6 +267,66 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     /// @dev Only callable by admin role
     function setBaseURI(string calldata baseURI) external onlyOwner {
         _setBaseURI(baseURI);
+    }
+
+    /// @notice Reassign a name to a new owner, without the current owner's consent.
+    ///
+    /// @dev WoCo addition to the vendored Durin registry (WoCo-Event-App #422).
+    ///      Upstream has no reclaim, no burn and no admin transfer, and the
+    ///      registry is deployed as an EIP-1167 clone which cannot be upgraded —
+    ///      so this had to exist before the mainnet deploy or never.
+    ///
+    ///      WHY TRANSFER AND NOT BURN: `createSubnode` reverts `NotAvailable`
+    ///      for a node that already has an owner, so burning would strand the
+    ///      name permanently and could never be reissued. The motivating case
+    ///      (a label infringing a venue or brand) is only resolved by the name
+    ///      reaching its rightful holder, which requires a transfer.
+    ///
+    ///      SCOPE, deliberately narrow. This does NOT let the admin mint over an
+    ///      existing name, forge records as a third party, or bypass
+    ///      `NotAvailable`. It moves one token and clears its records.
+    ///
+    ///      Records are cleared by bumping the node's resolver record version,
+    ///      so the name stops resolving to the previous holder's site in the
+    ///      same transaction. Without it a reassigned name keeps serving the
+    ///      old contenthash until someone sends a second transaction — which
+    ///      for the abuse cases this exists for is the whole point.
+    ///      `clearRecords` itself is `authorised(node)` and so is not callable
+    ///      by the admin for a node it does not own; the version counter is
+    ///      inherited state and is incremented directly.
+    ///
+    ///      NO TIMELOCK (owner decision, 2026-08-29): the check on this power is
+    ///      that `owner()` is the holder of `baseNode`, intended to be a DAO
+    ///      multisig, plus the event trail below. A compromised admin key can
+    ///      take names; that is the accepted cost of the power existing at all,
+    ///      and it is why this must not sit on the hot sponsor key.
+    ///
+    /// @param node     The namehash of the name to reassign.
+    /// @param newOwner The address that will own it. Cannot be the zero address —
+    ///                 use of this function to burn is deliberately not possible.
+    function adminTransfer(bytes32 node, address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert AdminTransferToZero();
+        // Rotating registry admin means moving `baseNode`, which is an ordinary
+        // ERC-721 transfer by its holder. Routing it through the abuse path
+        // would let one call hand over the whole registry.
+        if (node == baseNode) revert AdminTransferBaseNode();
+
+        address previousOwner = owner(node);
+        if (previousOwner == address(0)) revert AdminTransferUnregistered(node);
+        // `_transfer` permits `from == to`. Without this guard, calling with the
+        // CURRENT owner would move nothing yet still bump the record version —
+        // a wipe-in-place, which is functionally the suspend/takedown power this
+        // design deliberately excluded in favour of transfer-only. It has no
+        // legitimate transfer use, and this contract cannot be patched after the
+        // clone deploy, so it is refused here rather than left as latitude.
+        if (newOwner == previousOwner) revert AdminTransferSameOwner();
+
+        _transfer(previousOwner, newOwner, uint256(node));
+
+        recordVersions[node]++;
+        emit VersionChanged(node, recordVersions[node]);
+
+        emit AdminTransfer(node, previousOwner, newOwner);
     }
 
     /*//////////////////////////////////////////////////////////////
