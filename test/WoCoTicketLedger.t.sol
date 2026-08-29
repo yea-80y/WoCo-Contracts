@@ -46,6 +46,14 @@ contract WoCoTicketLedgerTest is Test {
         eventId = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
     }
 
+    /// Mirrors the contract's derivation. Written out in full rather than
+    /// calling a helper on the contract, so a change to the derivation has to
+    /// be made deliberately in two places instead of silently agreeing with
+    /// itself. The server keeps a third copy in `deriveEventId`.
+    function _expectedId(address registrant, uint256 nonce) internal view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(ledger), registrant, nonce));
+    }
+
     function _owners(uint256 n) internal view returns (address[] memory a) {
         a = new address[](n);
         for (uint256 i; i < n; ++i) a[i] = buyer;
@@ -105,11 +113,65 @@ contract WoCoTicketLedgerTest is Test {
         assertEq(ledger.registrantNonce(sponsor), 2);
 
         assertTrue(first != second);
-        assertEq(first,  keccak256(abi.encode(sponsor, uint256(0))));
-        assertEq(second, keccak256(abi.encode(sponsor, uint256(1))));
+        assertEq(first,  _expectedId(sponsor, 0));
+        assertEq(second, _expectedId(sponsor, 1));
 
         // The organiser's own counter is untouched — it is not the key.
         assertEq(ledger.registrantNonce(organiser), 0);
+    }
+
+    /// The cutover regression. WoCoEventV2 hashed only (msg.sender, nonce), so
+    /// this ledger — same sponsor wallet, nonce restarting at 0 — reproduced
+    /// V2's ids exactly. Ids live in Swarm feeds that outlive a migration, so
+    /// after a flip an old id would resolve here and, once the count passed it,
+    /// return a DIFFERENT event: wrong supply, wrong gate, a mint against
+    /// someone else's allocation.
+    function test_RegisterEvent_IdCannotCollideWithV2Derivation() public {
+        bytes32 id = _register();
+
+        bytes32 v2Shape = keccak256(abi.encode(sponsor, uint256(0)));
+        assertTrue(id != v2Shape, "ledger id reproduced V2's derivation");
+        assertEq(id, _expectedId(sponsor, 0));
+    }
+
+    /// Domain separation by contract: two deployments cannot mint the same id
+    /// from the same registrant at the same nonce. This is what makes a future
+    /// successor contract structurally safe rather than dependent on remembering
+    /// to use a fresh sponsor wallet.
+    function test_RegisterEvent_IdDiffersAcrossContractInstances() public {
+        WoCoTicketLedger other = new WoCoTicketLedger(owner, sponsor);
+
+        vm.prank(sponsor);
+        bytes32 idA = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        vm.prank(sponsor);
+        bytes32 idB = other.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+
+        // Same registrant, same nonce (0 on each), same args — only the
+        // deployment differs.
+        assertEq(ledger.registrantNonce(sponsor), 1);
+        assertEq(other.registrantNonce(sponsor), 1);
+        assertTrue(idA != idB, "two deployments minted the same eventId");
+    }
+
+    /// Domain separation by chain: the same contract at the same address on two
+    /// chains cannot mint the same id. Already a live ambiguity for V1, which is
+    /// deployed on both Base Sepolia and Arbitrum Sepolia.
+    function test_RegisterEvent_IdDiffersAcrossChains() public {
+        uint256 originalChain = block.chainid;
+
+        vm.chainId(8453);
+        vm.prank(sponsor);
+        bytes32 onBase = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        assertEq(onBase, keccak256(abi.encode(uint256(8453), address(ledger), sponsor, uint256(0))));
+
+        // The same (contract, registrant, nonce) on a different chain would have
+        // produced a different id — which is the property under test.
+        assertTrue(
+            onBase != keccak256(abi.encode(originalChain, address(ledger), sponsor, uint256(0))),
+            "chainid does not participate in the derivation"
+        );
+
+        vm.chainId(originalChain);
     }
 
     function test_RegisterEvent_RevertZeroOrganiser() public {
@@ -584,7 +646,7 @@ contract WoCoTicketLedgerTest is Test {
     event EventCancelled(bytes32 indexed eventId, address indexed by);
 
     function test_Emit_Registered() public {
-        bytes32 expectedId = keccak256(abi.encode(sponsor, uint256(0)));
+        bytes32 expectedId = _expectedId(sponsor, 0);
 
         vm.expectEmit(true, true, true, true, address(ledger));
         emit Registered(expectedId, organiser, sponsor, SUPPLY, MANIFEST, END_TS);

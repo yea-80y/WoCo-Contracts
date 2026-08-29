@@ -236,10 +236,33 @@ contract WoCoTicketLedger is Ownable2Step {
         if (manifestRef == bytes32(0))     revert ZeroAddress();
         if (eventEndTs <= block.timestamp) revert InvalidEventEnd();
 
-        // Keyed by msg.sender (the registrant) — clients predict eventIds from
-        // the registrant address plus sequential nonces. Do not change this
-        // derivation without updating that prediction path.
-        eventId = keccak256(abi.encode(msg.sender, registrantNonce[msg.sender]++));
+        // DOMAIN-SEPARATED by chain and contract, then keyed by the registrant.
+        //
+        // WoCoEventV2 hashed only (msg.sender, nonce). That makes an id
+        // ambiguous about WHICH deployment it belongs to, and two concrete
+        // collisions follow from it:
+        //   · A successor contract registering from the same sponsor wallet
+        //     reproduces the predecessor's ids exactly, because its nonce
+        //     starts at 0 again. Ids stored off chain (Swarm feeds outlive any
+        //     migration) would then resolve against the new contract and, once
+        //     its count passed them, silently return a DIFFERENT event.
+        //   · The same contract deployed to two chains yields identical ids —
+        //     already true of V1 on Base Sepolia and Arbitrum Sepolia.
+        //
+        // Including `block.chainid` and `address(this)` makes an id unique per
+        // (chain, contract, registrant, nonce), so those collisions are not
+        // merely unlikely but unrepresentable. This is the same discipline as
+        // the EIP-712 domain separators used elsewhere in the platform, and it
+        // is why the fix is structural rather than a rule about never reusing
+        // a sponsor wallet — a rule that holds only until someone forgets it.
+        //
+        // The off-chain mirror of this formula lives in the server's
+        // `deriveEventId` (lib/event/onchain-registry.ts). Changing one without
+        // the other makes the registration walk silently find nothing, which
+        // reads as "never registered" and re-broadcasts a duplicate.
+        eventId = keccak256(
+            abi.encode(block.chainid, address(this), msg.sender, registrantNonce[msg.sender]++)
+        );
 
         _events[eventId] = Event({
             totalSupply: supply,
