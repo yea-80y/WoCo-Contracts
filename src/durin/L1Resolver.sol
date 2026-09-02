@@ -46,6 +46,7 @@ interface INameWrapper {
 /// │                                                                          │
 /// │ WoCo addition (WoCo-Event-App #419), opt-in and inert until used:         │
 /// │   · `fallbackResolver` + `setFallbackResolver` + event                    │
+/// │   · error `FallbackResolverHasNoCode`                                     │
 /// │   · the apex branch in `resolve()`                                        │
 /// │                                                                          │
 /// │ With no fallback set, `resolve()` behaves exactly as upstream does —      │
@@ -108,6 +109,7 @@ contract L1Resolver is IExtendedResolver, Ownable {
     error Unauthorized();
     error InvalidSignature();
     error UnsupportedName();
+    error FallbackResolverHasNoCode(address resolver);
     error OffchainLookup(
         address sender,
         string[] urls,
@@ -179,8 +181,18 @@ contract L1Resolver is IExtendedResolver, Ownable {
     ///      Authorisation is the ENS name owner, exactly as `setL2Registry` —
     ///      NOT this contract's `owner()`. Whoever controls the name decides
     ///      where the name answers from.
+    ///
+    ///      A non-zero `r` with no code is refused. A STATICCALL to an empty
+    ///      address succeeds with empty return data, so a mistyped cutover
+    ///      would have the apex answer "no record" — the app vanishing with no
+    ///      error anywhere, which is precisely the failure `_resolveOnFallback`
+    ///      refuses to produce by swallowing a revert. Checked at set time, on
+    ///      the cold path, so `resolve()` gains no code.
     function setFallbackResolver(bytes32 node, address r) external {
         _requireNameOwner(node);
+        if (r != address(0) && r.code.length == 0) {
+            revert FallbackResolverHasNoCode(r);
+        }
 
         fallbackResolver[node] = r;
         emit FallbackResolverSet(node, r);

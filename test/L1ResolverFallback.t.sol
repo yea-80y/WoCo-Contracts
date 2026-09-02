@@ -197,14 +197,17 @@ contract L1ResolverFallbackTest is Test {
         resolver.resolve(wocoName, data);
     }
 
-    /// An address with no code returns success and empty data to a staticcall.
-    /// Pinned because it is the shape of a typo'd cutover: the operator sets a
-    /// wrong address, and the apex answers "no record" rather than erroring.
-    function test_Set_ToAnAddressWithNoCodeYieldsAnEmptyAnswer() public {
-        _setFallback(makeAddr("nothing-deployed-here"));
+    /// An address with no code returns success and empty data to a staticcall,
+    /// so a typo'd cutover would have the apex answer "no record" — the app
+    /// vanishing with no error anywhere. The setter refuses it instead.
+    function test_SetFallbackResolver_RefusesAnAddressWithNoCode() public {
+        address nothing = makeAddr("nothing-deployed-here");
 
-        bytes memory data = abi.encodeWithSelector(bytes4(keccak256("contenthash(bytes32)")), wocoNode);
-        assertEq(resolver.resolve(wocoName, data).length, 0, "a codeless fallback answered with data");
+        vm.expectRevert(abi.encodeWithSelector(L1Resolver.FallbackResolverHasNoCode.selector, nothing));
+        vm.prank(nameOwner);
+        resolver.setFallbackResolver(wocoNode, nothing);
+
+        assertEq(resolver.fallbackResolver(wocoNode), address(0), "a codeless fallback was stored");
     }
 
     /*//////////////////////////////////////////////////////////////
