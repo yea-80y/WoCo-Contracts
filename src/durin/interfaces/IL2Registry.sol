@@ -47,4 +47,12 @@ interface IL2Registry is IL2Resolver, IERC721 {
     function addRegistrar(address registrar) external;
     function removeRegistrar(address registrar) external;
     function setBaseURI(string calldata baseURI) external;
+
+    // WoCo additions (WoCo-Event-App #464). Exposed here so a REGISTRAR can
+    // read release history when deciding mint policy — the registry itself
+    // never reads it.
+    function release(bytes32 node) external;
+    function lastRelease(
+        bytes32 node
+    ) external view returns (address previousOwner, uint64 releasedAt);
 }

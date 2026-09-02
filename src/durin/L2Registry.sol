@@ -22,19 +22,22 @@ import {L2Resolver} from "./L2Resolver.sol";
 /// @dev Combined Registry, BaseRegistrar and PublicResolver from the official .eth contracts
 ///
 /// ┌──────────────────────────────────────────────────────────────────────────┐
-/// │ VENDORED + MODIFIED BY WOCO — this is NOT pristine upstream Durin.        │
+/// │ VENDORED + MODIFIED BY WOCO — this is NOT pristine upstream Durin.       │
 /// │                                                                          │
-/// │ WoCo additions (WoCo-Event-App #422), all pure additions, nothing         │
-/// │ upstream removed:                                                        │
-/// │   · `adminTransfer(node, newOwner)`  · event `AdminTransfer`              │
-/// │   · errors AdminTransferToZero / BaseNode / Unregistered / SameOwner      │
+/// │ WoCo additions, all pure additions, nothing upstream removed:            │
+/// │   #422 · `adminTransfer(node, newOwner)`  · event `AdminTransfer`        │
+/// │        · errors AdminTransferToZero / BaseNode / Unregistered / SameOwner│
+/// │   #464 · `release(node)` + `lastRelease[node]` · event `Released`        │
+/// │        · errors ReleaseBaseNode / ReleaseUnregistered                    │
+/// │        · `totalSupply` now counts LIVE names (decremented on release)    │
 /// │                                                                          │
-/// │ DO NOT resync this file from upstream without re-applying them. The       │
-/// │ tripwire is test/L2RegistryAdminTransfer.t.sol, which fails to compile    │
-/// │ if they are dropped — do not delete that file to make a sync pass.        │
+/// │ DO NOT resync this file from upstream without re-applying them. The      │
+/// │ tripwires are test/L2RegistryAdminTransfer.t.sol and                     │
+/// │ test/L2RegistryRelease.t.sol, which fail to compile if they are dropped —│
+/// │ do not delete those files to make a sync pass.                           │
 /// │                                                                          │
-/// │ This contract is deployed as an EIP-1167 clone and CANNOT be upgraded.    │
-/// │ Anything wrong here is permanent from the mainnet deploy onward.          │
+/// │ This contract is deployed as an EIP-1167 clone and CANNOT be upgraded.   │
+/// │ Anything wrong here is permanent from the mainnet deploy onward.         │
 /// └──────────────────────────────────────────────────────────────────────────┘
 contract L2Registry is ERC721, Initializable, L2Resolver {
     /*//////////////////////////////////////////////////////////////
@@ -45,8 +48,10 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     /// @dev namehash of `name()`
     bytes32 public baseNode;
 
-    /// @notice Total number of subnames
-    /// @dev Includes names at any depth
+    /// @notice Number of names that currently exist, at any depth, including
+    ///         the base name.
+    /// @dev Upstream only ever incremented this. `release` (#464) decrements it,
+    ///      so that it means what its name says rather than "ever minted".
     uint256 public totalSupply;
 
     string private _tokenName;
@@ -58,6 +63,32 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
 
     /// @notice Mapping of approved registrar controllers
     mapping(address registrar => bool approved) public registrars;
+
+    /// @notice What the registry remembers about a name after `release`
+    ///         (WoCo addition, #464). One storage slot.
+    struct ReleaseRecord {
+        address previousOwner;
+        uint64 releasedAt;
+    }
+
+    /// @notice The most recent release of each node.
+    ///
+    /// @dev Written by `release`, read by nothing in this contract, and that is
+    ///      deliberate. This registry is an EIP-1167 clone and cannot be
+    ///      patched; the registrar that decides mint policy can be replaced at
+    ///      will. A policy such as "for N days after a release only the previous
+    ///      holder may take the label back" is therefore a registrar concern —
+    ///      but it can only ever be enforced ON CHAIN if the frozen layer kept
+    ///      the two facts it needs, because `release` is holder-only and never
+    ///      passes through a registrar. A burn that forgot who it burned would
+    ///      close that door permanently, to save one slot per release.
+    ///
+    ///      FOOTGUN FOR A FUTURE READER: this record SURVIVES a re-mint of the
+    ///      same label, on purpose — it is history, and `createSubnode` is
+    ///      upstream code left untouched. "Currently released" is
+    ///      `owner(node) == address(0)`; check that first, and read this only
+    ///      for who held it last and when they let go.
+    mapping(bytes32 node => ReleaseRecord) public lastRelease;
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -88,6 +119,16 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         address indexed newOwner
     );
 
+    /// @notice A name was given back by its holder (WoCo addition, #464).
+    ///         `operator` is the account that sent the transaction: the holder
+    ///         themselves, or an ERC-721 approvee acting for them. Kept apart
+    ///         from `previousOwner` so a dispute can tell the two cases apart.
+    event Released(
+        bytes32 indexed node,
+        address indexed previousOwner,
+        address indexed operator
+    );
+
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -99,6 +140,8 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     error AdminTransferBaseNode();
     error AdminTransferUnregistered(bytes32 node);
     error AdminTransferSameOwner();
+    error ReleaseBaseNode();
+    error ReleaseUnregistered(bytes32 node);
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -327,6 +370,79 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         emit VersionChanged(node, recordVersions[node]);
 
         emit AdminTransfer(node, previousOwner, newOwner);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            HOLDER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Give a name back. Burns the token, wipes its records, and
+    ///         remembers who let go of it and when. Afterwards the label is
+    ///         available to anyone through the ordinary mint path.
+    ///
+    /// @dev WoCo addition to the vendored Durin registry (WoCo-Event-App #464).
+    ///      Upstream has no burn: `transferFrom` refuses the zero address and
+    ///      `adminTransfer` does so by design, so without this a name could
+    ///      only ever change hands, never return to the pool — and since the
+    ///      registry is an unpatchable clone, that had to be decided before the
+    ///      mainnet deploy or never.
+    ///
+    ///      WHO MAY CALL IT: the holder, or an address the holder has approved
+    ///      under ERC-721 — the same set that may transfer the token, checked
+    ///      by the same OpenZeppelin predicate. NOT registrars and NOT the
+    ///      registry admin: this function adds no platform power. The admin
+    ///      already has `adminTransfer`; a platform-side burn would be the
+    ///      takedown capability that design deliberately excluded.
+    ///
+    ///      WHY BURN RATHER THAN PARK: availability throughout this contract and
+    ///      the registrar is exactly `owner(node) == address(0)`, so a burn makes
+    ///      `createSubnode` and `available()` re-issue the label with no change
+    ///      to either. Parking the token anywhere would have needed a second
+    ///      mint path in the frozen layer.
+    ///
+    ///      WHY THE RECORD VERSION IS BUMPED HERE: `createSubnode` does not bump
+    ///      it, so without this the next holder of the label would inherit the
+    ///      previous holder's records — an `addr(60)` that is also a payment
+    ///      alias, text records, a contenthash — until each was overwritten.
+    ///      The same mechanism `adminTransfer` uses, for the same reason.
+    ///
+    ///      WHY `names[node]` IS LEFT IN PLACE: it is only read by `tokenURI`,
+    ///      which refuses a burned token first, and by `createSubnode` for the
+    ///      PARENT of a new name — and a re-mint of this label writes the same
+    ///      bytes back. Clearing it would erase the only on-chain map from a
+    ///      released node to its label, for a gas refund nobody needs.
+    ///
+    ///      RESIDUAL, stated so it is not rediscovered: names BENEATH a released
+    ///      name are untouched. They keep their own holders and their own
+    ///      records, and resolve exactly as before; what the next holder of the
+    ///      parent gains is the ability to create NEW children beside them, not
+    ///      control of the existing ones. The registry cannot enumerate
+    ///      children, so this cannot be refused here; policy has to say it.
+    ///
+    /// @param node The namehash of the name to release.
+    function release(bytes32 node) external {
+        // The base name IS the registry: `owner()` is whoever holds it. Burning
+        // it would leave no admin, forever.
+        if (node == baseNode) revert ReleaseBaseNode();
+
+        address holder = owner(node);
+        if (holder == address(0)) revert ReleaseUnregistered(node);
+        if (!_isAuthorized(holder, msg.sender, uint256(node))) {
+            revert Unauthorized(node);
+        }
+
+        _burn(uint256(node));
+        totalSupply--;
+
+        recordVersions[node]++;
+        emit VersionChanged(node, recordVersions[node]);
+
+        lastRelease[node] = ReleaseRecord({
+            previousOwner: holder,
+            releasedAt: uint64(block.timestamp)
+        });
+
+        emit Released(node, holder, msg.sender);
     }
 
     /*//////////////////////////////////////////////////////////////
