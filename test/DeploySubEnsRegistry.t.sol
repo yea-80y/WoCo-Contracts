@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ScriptEnvFixture} from "./ScriptEnvFixture.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {DeploySubEnsRegistry} from "../script/DeploySubEnsRegistry.s.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
@@ -22,11 +23,9 @@ import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
  * assert facts about what it actually put on chain, and they prove each clause of
  * the tripwire fires on its own by substituting a deployment it must reject.
  */
-contract DeploySubEnsRegistryTest is Test {
+contract DeploySubEnsRegistryTest is ScriptEnvFixture {
     DeploySubEnsRegistry script;
     MockSafe safe;
-
-    uint256 constant DEPLOYER_PK = 0xA11CE;
 
     function setUp() public {
         script = new DeploySubEnsRegistry();
@@ -34,17 +33,13 @@ contract DeploySubEnsRegistryTest is Test {
         _setEnv();
     }
 
-    /// @dev `vm.setEnv` writes the OS environment of the whole forge process and
-    ///      Foundry runs test functions in parallel, so every test in this file
-    ///      must write the SAME values — concurrent writers are then
-    ///      indistinguishable from one. Varying the environment per test races,
-    ///      visibly and intermittently. Anything that needs a different
-    ///      configuration varies it through a `_deployRegistryClone` override
-    ///      instead. See the handover note on the two `REGISTRY_ADMIN` guards
-    ///      that are consequently still untested.
+    /// @dev Shared keys come from ScriptEnvFixture — read its header before
+    ///      adding any `vm.setEnv` here. Everything that needs to VARY per test
+    ///      varies through a `_deployRegistryClone` override instead, never
+    ///      through the environment. See the handover note on the two
+    ///      `REGISTRY_ADMIN` guards that are consequently still untested.
     function _setEnv() internal {
-        vm.setEnv("DEPLOYER_PRIVATE_KEY", vm.toString(bytes32(DEPLOYER_PK)));
-        vm.setEnv("SPONSOR_ADDRESS", vm.toString(makeAddr("sponsor")));
+        _setSharedScriptEnv();
         vm.setEnv("REGISTRY_ADMIN", vm.toString(address(safe)));
         vm.setEnv("PARENT_NAME", "woco.eth");
     }
@@ -81,7 +76,7 @@ contract DeploySubEnsRegistryTest is Test {
 
         string[] memory keys = new string[](0);
         string[] memory vals = new string[](0);
-        vm.prank(vm.envAddress("SPONSOR_ADDRESS"));
+        vm.prank(SCRIPT_SPONSOR);
         bytes32 node = registrar.register("venue", organiser, hex"e301", keys, vals);
 
         vm.prank(address(safe));

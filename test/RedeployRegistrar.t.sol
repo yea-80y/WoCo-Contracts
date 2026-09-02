@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ScriptEnvFixture} from "./ScriptEnvFixture.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {RedeployRegistrar} from "../script/RedeployRegistrar.s.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
@@ -23,27 +24,24 @@ import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
  * `addRegistrar`, so the script has to stop assuming it can — and must not
  * report success for a registrar that cannot mint.
  */
-contract RedeployRegistrarTest is Test {
-    uint256 constant DEPLOYER_PK = 0xB0B;
-
+contract RedeployRegistrarTest is ScriptEnvFixture {
     L2Registry registry;
     MockSafe safe;
     address deployer;
-    address sponsor = makeAddr("sponsor");
+    address sponsor = SCRIPT_SPONSOR;
 
     function setUp() public {
-        deployer = vm.addr(DEPLOYER_PK);
+        deployer = vm.addr(SCRIPT_DEPLOYER_PK);
         safe = new MockSafe();
 
         L2Registry impl = new L2Registry();
         registry = L2Registry(Clones.clone(address(impl)));
         registry.initialize("woco.eth", "WoCo Names", "", deployer);
 
-        // Fixed for every test in this file: `vm.setEnv` is process-global and
-        // forge runs tests in parallel, so all writers must write the same
-        // values. Variation goes through a `_config()` override instead.
-        vm.setEnv("DEPLOYER_PRIVATE_KEY", vm.toString(bytes32(DEPLOYER_PK)));
-        vm.setEnv("SPONSOR_ADDRESS", vm.toString(sponsor));
+        // Shared keys come from ScriptEnvFixture - read its header before adding
+        // any `vm.setEnv` here. Anything that must VARY per test varies through a
+        // `_config()` override instead, never through the environment.
+        _setSharedScriptEnv();
         vm.setEnv("L2_REGISTRY_ADDRESS", vm.toString(address(registry)));
         vm.setEnv("REGISTRAR_ADMIN", vm.toString(address(safe)));
     }
