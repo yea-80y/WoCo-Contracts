@@ -8,5 +8,7 @@ cache/
 # Deploy logs (contain deployer addresses + tx data)
 broadcast/
 
-# Dependencies (fetched via forge install)
-lib/
+# lib/ is NOT ignored: the four dependencies are git SUBMODULES, pinned by commit
+# so CI and a fresh clone compile exactly what this machine compiles. Ignoring
+# lib/ is what silently left forge-std and openzeppelin-contracts unrecorded —
+# the repo built here and nowhere else, which CI (#4) found on its first run.
