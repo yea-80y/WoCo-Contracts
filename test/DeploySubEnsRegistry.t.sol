@@ -6,6 +6,7 @@ import {ScriptEnvFixture} from "./ScriptEnvFixture.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {DeploySubEnsRegistry} from "../script/DeploySubEnsRegistry.s.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
+import {L2Resolver} from "../src/durin/L2Resolver.sol";
 import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 
@@ -118,11 +119,57 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
 
     /// Clause 3. An implementation at an address of its own, correctly cloned,
     /// that simply is not our source — upstream Durin's shape. Clauses 1 and 2
-    /// pass; only the bytecode check catches it. This is the clause that survives
-    /// someone shuffling addresses to satisfy the other two.
+    /// pass; only the behaviour check catches it. This is the clause that
+    /// survives someone shuffling addresses to satisfy the other two.
     function test_Tripwire_RejectsAnUpstreamShapedImplementation() public {
         ClonesUpstreamShape bad = new ClonesUpstreamShape();
-        vm.expectRevert("registry implementation lacks WoCo's adminTransfer - it is not our bytecode");
+        vm.expectRevert("registry implementation does not run WoCo's adminTransfer - it is not our bytecode");
+        bad.run();
+    }
+
+    /// Clause 3, the case the previous bytecode scan got wrong: a contract whose
+    /// runtime code CONTAINS the `adminTransfer` selector — as a constant — but
+    /// has no such function. Asserted both ways: the old scan would have passed
+    /// it, and the behavioural probe does not.
+    function test_Tripwire_RejectsAnImplementationThatMerelyMentionsTheSelector() public {
+        address impostor = address(new MentionsTheSelector());
+        assertTrue(
+            _codeContainsSelector(impostor, L2Registry.adminTransfer.selector),
+            "precondition: the selector bytes are present, so a byte scan would accept this"
+        );
+
+        ClonesTheSelectorMentioner bad = new ClonesTheSelectorMentioner();
+        vm.expectRevert("registry implementation does not run WoCo's adminTransfer - it is not our bytecode");
+        bad.run();
+    }
+
+    /// Clause 3 is a REVERT match, not a return match. A contract that answers
+    /// every call successfully with the expected error's bytes as return data
+    /// is not our code either — and a probe that only inspected the bytes would
+    /// have accepted it.
+    function test_Tripwire_RejectsAnImplementationThatAnswersWithoutReverting() public {
+        ClonesTheEchoer bad = new ClonesTheEchoer();
+        vm.expectRevert("registry implementation does not run WoCo's adminTransfer - it is not our bytecode");
+        bad.run();
+    }
+
+    /// Clause 3 matches the ERROR, not merely a revert. A contract that has both
+    /// functions and reverts from each with some other custom error is not our
+    /// code, and a probe that only checked "did it revert with data" would
+    /// have accepted it.
+    function test_Tripwire_RejectsAnImplementationThatRevertsWithTheWrongError() public {
+        ClonesTheWrongErrors bad = new ClonesTheWrongErrors();
+        vm.expectRevert("registry implementation does not run WoCo's adminTransfer - it is not our bytecode");
+        bad.run();
+    }
+
+    /// Clause 3 covers BOTH WoCo additions. An implementation built from a
+    /// branch that has #422 but not #464 — `adminTransfer` present, `release`
+    /// absent — is rejected by the second probe. This is the regression a
+    /// mainnet deploy from a stale branch would be.
+    function test_Tripwire_RejectsAnImplementationWithoutRelease() public {
+        ClonesAdminTransferOnly bad = new ClonesAdminTransferOnly();
+        vm.expectRevert("registry implementation does not run WoCo's release - it is not our bytecode");
         bad.run();
     }
 
@@ -179,6 +226,20 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
             impl := shr(96, mload(add(code, 0x2a)))
         }
     }
+
+    /// @dev The scan the tripwire used to run, kept here only to demonstrate
+    ///      what it accepts.
+    function _codeContainsSelector(address target, bytes4 selector) internal view returns (bool) {
+        bytes memory code = target.code;
+        if (code.length < 4) return false;
+        for (uint256 i; i <= code.length - 4; ++i) {
+            if (
+                code[i] == selector[0] && code[i + 1] == selector[1] && code[i + 2] == selector[2]
+                    && code[i + 3] == selector[3]
+            ) return true;
+        }
+        return false;
+    }
 }
 
 /*//////////////////////////////////////////////////////////////
@@ -223,6 +284,54 @@ contract ClonesUpstreamShape is DeploySubEnsRegistry {
         implAddr = address(new UpstreamShapedRegistry());
         registryAddr = Clones.clone(implAddr);
         UpstreamShapedRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+contract ClonesTheSelectorMentioner is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new MentionsTheSelector());
+        registryAddr = Clones.clone(implAddr);
+        MentionsTheSelector(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+contract ClonesTheEchoer is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new EchoesTheExpectedError());
+        registryAddr = Clones.clone(implAddr);
+        EchoesTheExpectedError(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+contract ClonesTheWrongErrors is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new WrongErrorRegistry());
+        registryAddr = Clones.clone(implAddr);
+        WrongErrorRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+contract ClonesAdminTransferOnly is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new AdminTransferOnlyRegistry());
+        registryAddr = Clones.clone(implAddr);
+        AdminTransferOnlyRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
     }
 }
 
@@ -279,6 +388,51 @@ contract UpstreamShapedRegistry {
 
     function initialize(string calldata, string memory, string memory, address admin_) external {
         admin = admin_;
+    }
+}
+
+/// @dev Upstream's shape plus the four bytes of `adminTransfer`'s selector as a
+///      public constant, so they appear verbatim in the runtime bytecode. No
+///      such function exists. A right-aligned `uint32`, not a `bytes4`: solc's
+///      constant optimiser re-encodes a left-aligned four-byte value without
+///      its literal bytes, which is its own argument against scanning for them.
+contract MentionsTheSelector is UpstreamShapedRegistry {
+    uint32 public constant LOOKS_LIKE_ADMIN_TRANSFER = uint32(L2Registry.adminTransfer.selector);
+}
+
+/// @dev Initialises like a registry; every other call SUCCEEDS and returns the
+///      `Unauthorized(bytes32)` selector as data. Never reverts.
+contract EchoesTheExpectedError is UpstreamShapedRegistry {
+    fallback() external {
+        bytes4 sel = L2Resolver.Unauthorized.selector;
+        assembly {
+            mstore(0, sel)
+            return(0, 32)
+        }
+    }
+}
+
+/// @dev Has both WoCo entry points, and reverts from each with an error that
+///      is not ours.
+contract WrongErrorRegistry is UpstreamShapedRegistry {
+    error NotOurs(bytes32 node);
+
+    function adminTransfer(bytes32 node, address) external pure {
+        revert NotOurs(node);
+    }
+
+    function release(bytes32 node) external pure {
+        revert NotOurs(node);
+    }
+}
+
+/// @dev A registry from a branch with #422 but without #464: `adminTransfer`
+///      answers exactly as ours does, `release` does not exist.
+contract AdminTransferOnlyRegistry is UpstreamShapedRegistry {
+    error Unauthorized(bytes32 node);
+
+    function adminTransfer(bytes32, address) external view {
+        if (admin != msg.sender) revert Unauthorized(bytes32(0));
     }
 }
 

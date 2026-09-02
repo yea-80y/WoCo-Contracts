@@ -5,6 +5,7 @@ import {Script, console} from "forge-std/Script.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
+import {L2Resolver} from "../src/durin/L2Resolver.sol";
 import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
 
 /// @title DeploySubEnsRegistry
@@ -84,6 +85,11 @@ contract DeploySubEnsRegistry is Script {
     bytes10 constant CLONE_PREFIX = 0x363d3d373d3d3d363d73;
     bytes15 constant CLONE_SUFFIX = 0x5af43d82803e903d91602b57fd5bf3;
     uint256 constant CLONE_RUNTIME_LENGTH = 45;
+
+    /// @dev A node that is registered nowhere: not the zero node the
+    ///      uninitialised implementation calls `baseNode`, and not a namehash
+    ///      anything could mint. Used only to make WoCo's functions answer.
+    bytes32 constant PROBE_NODE = keccak256("woco/deploy/tripwire-probe");
 
     /// @return registryAddress The initialised registry clone now owned by `REGISTRY_ADMIN`.
     /// @return registrarAddress The `WoCoRegistrar` wired into it.
@@ -219,14 +225,27 @@ contract DeploySubEnsRegistry is Script {
     ///            address. Redundant with (1) by construction; kept because it
     ///            names the failure the operator actually cares about.
     ///
-    ///        (3) OUR CODE — the implementation's runtime bytecode contains the
-    ///            dispatcher entry for `adminTransfer(bytes32,address)`, a WoCo
-    ///            addition upstream Durin does not have. This is the check that
-    ///            survives address substitution: (1) and (2) both compare
-    ///            addresses, and an address proves nothing about the code behind
-    ///            it. If `adminTransfer` is ever removed from `L2Registry`, this
-    ///            must be re-pointed at whatever WoCo addition replaces it —
-    ///            deleting it is not the fix.
+    ///        (3) OUR CODE — the implementation ANSWERS as ours does. Each WoCo
+    ///            addition is called on the implementation with arguments that
+    ///            make our source revert with one of our own custom errors, and
+    ///            the revert data is matched against that error's selector. A
+    ///            contract without the function reverts with empty data; one
+    ///            that merely mentions the selector somewhere in its bytecode
+    ///            — a constant, an unrelated PUSH — does the same. This is the
+    ///            check that survives address substitution: (1) and (2) both
+    ///            compare addresses, and an address proves nothing about the
+    ///            code behind it.
+    ///
+    ///            An earlier version scanned the runtime bytecode for the
+    ///            selector's four bytes. That is a positive signal only that
+    ///            those bytes occur SOMEWHERE — inside a PUSH32 constant as
+    ///            readily as in the dispatcher — and it is defeated by any
+    ///            contract that names the selector. Behaviour is not.
+    ///
+    ///            If a WoCo addition is ever removed from `L2Registry`, its
+    ///            probe must be re-pointed at whatever replaces it; deleting the
+    ///            probe is not the fix. If the error vocabulary changes, the
+    ///            expected selectors change with it.
     function _assertRegistryRunsOurImplementation(address registryAddr, address implAddr) internal view {
         address embedded = _cloneImplementationOf(registryAddr);
         require(embedded == implAddr, "registry is not a clone of the implementation this script deployed");
@@ -234,9 +253,25 @@ contract DeploySubEnsRegistry is Script {
             implAddr != NAMESTONE_REGISTRY_IMPLEMENTATION,
             "registry implementation is NameStone's - the factory path is back"
         );
+        // #422. On the uninitialised implementation `owner()` is the zero
+        // address, so `onlyOwner` refuses us before the body runs.
         require(
-            _codeContainsSelector(implAddr, L2Registry.adminTransfer.selector),
-            "registry implementation lacks WoCo's adminTransfer - it is not our bytecode"
+            _revertsWith(
+                implAddr,
+                abi.encodeCall(L2Registry.adminTransfer, (PROBE_NODE, address(1))),
+                L2Resolver.Unauthorized.selector
+            ),
+            "registry implementation does not run WoCo's adminTransfer - it is not our bytecode"
+        );
+        // #464. PROBE_NODE is not the base node and is owned by nobody, so our
+        // source refuses it as unregistered whichever guard it checks first.
+        require(
+            _revertsWith(
+                implAddr,
+                abi.encodeCall(L2Registry.release, (PROBE_NODE)),
+                L2Registry.ReleaseUnregistered.selector
+            ),
+            "registry implementation does not run WoCo's release - it is not our bytecode"
         );
     }
 
@@ -259,18 +294,22 @@ contract DeploySubEnsRegistry is Script {
         require(prefix == CLONE_PREFIX && suffix == CLONE_SUFFIX, "registry is not an EIP-1167 clone");
     }
 
-    /// @dev True if `target`'s runtime bytecode contains `selector`. solc emits
-    ///      every external function's selector verbatim in the dispatcher, so
-    ///      presence is a reliable positive signal that the function is there.
-    function _codeContainsSelector(address target, bytes4 selector) internal view returns (bool) {
-        bytes memory code = target.code;
-        if (code.length < 4) return false;
-        for (uint256 i; i <= code.length - 4; ++i) {
-            if (code[i] == selector[0] && code[i + 1] == selector[1] && code[i + 2] == selector[2]
-                && code[i + 3] == selector[3]) {
-                return true;
-            }
-        }
-        return false;
+    /// @dev True if a STATICCALL of `callData` on `target` reverts with data
+    ///      whose first four bytes are `expectedError`. A static call so that
+    ///      nothing here can be a transaction, and so that a probe which
+    ///      somehow got past a guard would fail on its first state write
+    ///      rather than succeed.
+    function _revertsWith(address target, bytes memory callData, bytes4 expectedError)
+        internal
+        view
+        returns (bool)
+    {
+        (bool ok, bytes memory ret) = target.staticcall(callData);
+        if (ok) return false;
+        // Truncating to the first four bytes IS the comparison: a custom
+        // error's selector, with whatever arguments follow it ignored. A
+        // shorter or empty revert zero-pads and so never matches.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return bytes4(ret) == expectedError;
     }
 }
