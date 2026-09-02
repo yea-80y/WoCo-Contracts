@@ -5,7 +5,8 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 
 /**
  * @title WoCoTicketLedger
- * @notice Allocation ledger for event tickets. Mints slots; never holds funds.
+ * @notice Allocation ledger for event tickets. Mints slots and lets their
+ *         owners move them; never holds funds.
  *
  * This contract is the successor to WoCoEventV2 with all payment handling
  * removed. Money lives in a separate, independently-audited and independently
@@ -58,6 +59,14 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
  * `cancelled` as NECESSARY BUT NOT SUFFICIENT for a refund and gate on its own
  * withdrawn/balance state. `cancelled` opens refunds only out of escrow that
  * payments still holds.
+ *
+ * ALSO FOR THE PAYMENTS SPEC — newly load-bearing since `transferSlot`: a
+ * refund MUST bind to payments' OWN record of who paid, NEVER to a slot's
+ * CURRENT owner. `owner` used to be immutable, so keying on it was merely
+ * unusual; now a holder can move it, and a payments contract that read
+ * `getSlotData(...).owner` to pick a payee would let a ledger transition
+ * redirect money — the one thing the rule above forbids. WoCoEventV2 already
+ * got this right by paying `batchClaimer` (WoCoEventV2.sol:537); keep that shape.
  *
  * ── Why there is no drop gate ────────────────────────────────────────────────
  *
@@ -167,6 +176,19 @@ contract WoCoTicketLedger is Ownable2Step {
         bytes32 orderRef
     );
 
+    /// @notice A claimed slot changed hands. Emitted ONLY by `transferSlot`.
+    /// @dev Indexers MUST fold this over `SlotClaimed`: after a transfer the
+    ///      current holder is no longer the address in the original claim log.
+    ///      It is also the invalidation signal for anything holding a SNAPSHOT
+    ///      of slot owners — the offline check-in pack above all, which is
+    ///      sound only as of the block it was built at.
+    event SlotTransferred(
+        bytes32 indexed eventId,
+        uint256 indexed slot,
+        address indexed from,
+        address to
+    );
+
     event EventCancelled(bytes32 indexed eventId, address indexed by);
 
     event SponsorAdded(address indexed sponsor);
@@ -186,6 +208,9 @@ contract WoCoTicketLedger is Ownable2Step {
     error AlreadyCancelled();
     error InvalidEventEnd();
     error SalesClosed();
+    error SlotUnclaimed();
+    error NotSlotOwner();
+    error TransferToSelf();
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -350,6 +375,97 @@ contract WoCoTicketLedger is Ownable2Step {
     }
 
     // ── Cancellation ──────────────────────────────────────────────────────────
+
+    /**
+     * @notice Move a claimed slot to a new owner. THE SLOT'S OWNER ONLY.
+     *
+     * @dev Without this a slot's owner is permanent, so a ticket can never
+     *      change hands — no resale, no gifting, no correcting a mis-delivered
+     *      ticket — and this contract cannot be upgraded after deploy. That is
+     *      why it is here rather than in a successor.
+     *
+     *      HOLDER-ONLY, AND THAT IS THE POINT. No sponsor path, no
+     *      operator/approval model, no batch form. The sponsor is a hot key
+     *      that mints on every sale, and the guarantee this contract is built
+     *      to keep is that such a key can only ever APPEND. A transfer the
+     *      current owner authorises does not touch that: `msg.sender` is the
+     *      only authority consulted, and the sponsor gains nothing here.
+     *
+     *      A PLATFORM-AUTHORISED TRANSFER WAS CONSIDERED AND REJECTED. It would
+     *      let the platform move a ticket for a buyer whose key it had
+     *      discarded — convenient, and the reason it was raised — but it grants
+     *      custody of every ticket ever minted to the most exposed key in the
+     *      system, permanently and unrevokeably. The same outcome is reachable
+     *      off chain by RETAINING the buyer's key until they claim it, which is
+     *      bounded, deletable, and leaves this contract saying only "the owner
+     *      may move it".
+     *
+     *      ⚠️ THIS SHRINKS THE OFFLINE CHECK-IN PACK'S SOUNDNESS WINDOW, and
+     *      the door is the consumer that assumed permanence. The pack snapshots
+     *      slot owners and verifies offline against that snapshot, so a slot
+     *      transferred AFTER a pack was built still passes the door with the
+     *      seller's old QR. `SlotTransferred` exists to be subscribed to for
+     *      exactly this: a resale surface MUST invalidate or refresh affected
+     *      packs. The contract cannot enforce that; the door is off chain.
+     *
+     *      PROVENANCE IS NOT REWRITTEN. `getSlotData` keeps returning the
+     *      original `claimer` and `orderRef` for the batch this slot was minted
+     *      in; only `owner` moves. Anything asking "who holds this now" must
+     *      read `owner`/`slotOwner`, never `claimer`.
+     *
+     *      NOT BLOCKED BY CANCELLATION OR BY `eventEndTs`. Those govern
+     *      CLAIMING — whether new slots may be handed out. A slot already
+     *      claimed is the holder's, and a ticket outlives its event as a record
+     *      of attendance. Blocking either would make cancellation reach into
+     *      existing slots' capabilities, which is exactly the coupling this
+     *      split removed. A cancelled event's slot conveys nothing claimable;
+     *      whether it is worth having is visible on chain and is the resale
+     *      surface's problem, not this contract's.
+     *
+     *      NOTE ON CONTRACT RECIPIENTS: door verification is plain `ecrecover`
+     *      with no ERC-1271 path, so a slot transferred to a smart-contract
+     *      address cannot pass the door under the current scheme. Not blocked
+     *      here — that is a scheme limitation, and the ledger should not encode
+     *      it — but callers should warn.
+     *
+     * @param eventId  The event the slot belongs to.
+     * @param slot     Zero-based slot index.
+     * @param newOwner The address that will hold it. Cannot be zero: `owner ==
+     *                 address(0)` is how this contract encodes "never claimed"
+     *                 (see `getSlotData`), so burning would make a sold slot
+     *                 read as available to every consumer. Burn is deliberately
+     *                 impossible.
+     */
+    function transferSlot(bytes32 eventId, uint256 slot, address newOwner) external {
+        if (newOwner == address(0)) revert ZeroAddress();
+
+        Slot storage sd = slots[eventId][slot];
+        address previousOwner = sd.owner;
+
+        // Distinct selector from NotSlotOwner on purpose. Holder-only auth
+        // already subsumes this (address(0) can never be msg.sender), but a
+        // guard no test can tell apart from another is a guard that reads as
+        // deletable. Separate errors keep each one independently killable.
+        if (previousOwner == address(0)) revert SlotUnclaimed();
+        if (msg.sender != previousOwner) revert NotSlotOwner();
+
+        // `from == to` writes nothing yet would still emit SlotTransferred —
+        // and the log shape IS the API here, so a phantom transfer is something
+        // indexers and the resale surface would act on. (The sibling registry
+        // in this repo shipped this same shape as a real defect, where a
+        // self-"transfer" moved nothing but still bumped record versions. The
+        // harm differs — there it wiped state, here it is a false event — but
+        // the omission is identical, so it is refused rather than tolerated.)
+        if (newOwner == previousOwner) revert TransferToSelf();
+
+        // ONLY the owner field. Never reconstruct the struct: writing
+        // `Slot({owner: newOwner, batchFirstSlot: 0})` compiles and silently
+        // re-points this slot's claimer/orderRef at batch 0's real data — a
+        // live misattribution, not zero values.
+        sd.owner = newOwner;
+
+        emit SlotTransferred(eventId, slot, previousOwner, newOwner);
+    }
 
     /**
      * @notice Cancel an event. One-way. Stops all further minting, and lets a

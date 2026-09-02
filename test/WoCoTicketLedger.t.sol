@@ -27,6 +27,7 @@ contract WoCoTicketLedgerTest is Test {
     address recipient = address(0x8);
     address daoAuth   = address(0x9);
     address stranger  = address(0xBEEF);
+    address newHolder = address(0xA11CE);
 
     bytes32 constant MANIFEST = keccak256("manifest");
     uint64  constant SUPPLY   = 10;
@@ -821,4 +822,175 @@ contract WoCoTicketLedgerTest is Test {
         vm.prank(buyer);
         ledger.setDisputeAuthority(daoAuth);
     }
+    // ── transferSlot ──────────────────────────────────────────────────────────
+    //
+    // Slots used to be permanent, which foreclosed resale entirely. The guard
+    // that matters is that opening transfer did NOT open it to the sponsor: the
+    // contract's guarantee is that a sponsor can only append, and the negative
+    // tests below are what keep that true under mutation.
+
+    /// Claim one slot to `buyer` and hand back its index.
+    function _claimOne() internal returns (bytes32 eventId, uint256 slot) {
+        eventId = _register();
+        vm.prank(sponsor);
+        slot = ledger.claimFor(eventId, buyer, keccak256("stripe-ref"));
+    }
+
+    function test_TransferSlot_OwnerCanMoveIt() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+
+        vm.expectEmit(true, true, true, true);
+        emit WoCoTicketLedger.SlotTransferred(eventId, slot, buyer, newHolder);
+
+        vm.prank(buyer);
+        ledger.transferSlot(eventId, slot, newHolder);
+
+        assertEq(ledger.slotOwner(eventId, slot), newHolder, "slot did not move");
+    }
+
+    /// Batch attribution must survive untouched. Reconstructing the struct
+    /// instead of writing the owner field compiles fine and silently re-points
+    /// claimer/orderRef at batch 0's real data — a live misattribution.
+    ///
+    /// THE SLOT MUST NOT BE IN BATCH 0. The first version of this test used
+    /// slot 0, whose `batchFirstSlot` is already 0 — so the misattribution
+    /// mutation was a no-op there and the test passed against it. Two separate
+    /// claims with DIFFERENT orderRefs, transferring one from the second batch,
+    /// is what actually distinguishes the two implementations.
+    function test_TransferSlot_PreservesBatchAttribution() public {
+        bytes32 eventId = _register();
+        bytes32 refA = keccak256("order-A");
+        bytes32 refB = keccak256("order-B");
+
+        vm.prank(sponsor);
+        uint256 slotA = ledger.claimFor(eventId, buyer, refA);
+        vm.prank(sponsor);
+        uint256 slotB = ledger.claimFor(eventId, buyer, refB);
+
+        assertTrue(slotB != 0, "second slot must not be batch 0, or this test is vacuous");
+        (, address claimerBefore, bytes32 orderRefBefore) = ledger.getSlotData(eventId, slotB);
+        assertEq(orderRefBefore, refB, "precondition: slotB carries its own batch's ref");
+
+        vm.prank(buyer);
+        ledger.transferSlot(eventId, slotB, newHolder);
+
+        (address ownerAfter, address claimerAfter, bytes32 orderRefAfter) =
+            ledger.getSlotData(eventId, slotB);
+        assertEq(ownerAfter, newHolder, "owner should move");
+        assertEq(claimerAfter, claimerBefore, "claimer is mint-time provenance and must not move");
+        assertEq(orderRefAfter, refB, "orderRef was re-pointed at another batch");
+        // And the slot it would have been misattributed to is untouched.
+        (, , bytes32 refOfSlotA) = ledger.getSlotData(eventId, slotA);
+        assertEq(refOfSlotA, refA, "batch 0's own attribution must be unchanged");
+    }
+
+    // ── the sponsor guarantee, still true ────────────────────────────────────
+
+    function test_TransferSlot_SponsorCannot() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlot(eventId, slot, newHolder);
+    }
+
+    function test_TransferSlot_OrganiserCannot() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.prank(organiser);
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlot(eventId, slot, newHolder);
+    }
+
+    function test_TransferSlot_DisputeAuthorityCannot() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        // The dispute authority can force-cancel an event; it still cannot move
+        // a ticket it does not hold.
+        vm.prank(ledger.disputeAuthority());
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlot(eventId, slot, newHolder);
+    }
+
+    function test_TransferSlot_StrangerCannot() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.prank(stranger);
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlot(eventId, slot, newHolder);
+    }
+
+    // ── guards ───────────────────────────────────────────────────────────────
+
+    /// Burn must stay impossible: `owner == 0` is how this contract encodes
+    /// "never claimed", so a zeroed slot would read as available.
+    function test_TransferSlot_RejectsZeroAddress() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.prank(buyer);
+        vm.expectRevert(WoCoTicketLedger.ZeroAddress.selector);
+        ledger.transferSlot(eventId, slot, address(0));
+        assertEq(ledger.slotOwner(eventId, slot), buyer, "slot must be untouched");
+    }
+
+    /// Its own selector, distinct from NotSlotOwner — otherwise the guard is
+    /// indistinguishable from holder-only auth and reads as deletable.
+    function test_TransferSlot_RejectsUnclaimedSlot() public {
+        bytes32 eventId = _register();
+        vm.prank(buyer);
+        vm.expectRevert(WoCoTicketLedger.SlotUnclaimed.selector);
+        ledger.transferSlot(eventId, 0, newHolder);
+    }
+
+    /// A no-op that still emits SlotTransferred would put a phantom change of
+    /// hands on chain, and the log shape is the API.
+    function test_TransferSlot_RejectsSelfTransfer() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.prank(buyer);
+        vm.expectRevert(WoCoTicketLedger.TransferToSelf.selector);
+        ledger.transferSlot(eventId, slot, buyer);
+    }
+
+    /// Cancellation and the sales cutoff govern CLAIMING, not ownership of a
+    /// slot already claimed. Pinned so the decision stays deliberate.
+    function test_TransferSlot_AllowedAfterCancellation() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.prank(organiser);
+        ledger.cancelEvent(eventId);
+
+        vm.prank(buyer);
+        ledger.transferSlot(eventId, slot, newHolder);
+        assertEq(ledger.slotOwner(eventId, slot), newHolder);
+    }
+
+    function test_TransferSlot_AllowedAfterEventEnd() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.warp(END_TS + 1);
+
+        vm.prank(buyer);
+        ledger.transferSlot(eventId, slot, newHolder);
+        assertEq(ledger.slotOwner(eventId, slot), newHolder);
+    }
+
+    /// A transfer moves a slot; it does not mint or burn one.
+    function test_TransferSlot_DoesNotChangeSupply() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        uint256 remainingBefore = ledger.remaining(eventId);
+
+        vm.prank(buyer);
+        ledger.transferSlot(eventId, slot, newHolder);
+
+        assertEq(ledger.remaining(eventId), remainingBefore, "transfer must not change supply");
+    }
+
+    /// Authority follows the slot: the new holder can move it on, the old cannot.
+    function test_TransferSlot_AuthorityFollowsTheSlot() public {
+        (bytes32 eventId, uint256 slot) = _claimOne();
+        vm.prank(buyer);
+        ledger.transferSlot(eventId, slot, newHolder);
+
+        vm.prank(buyer);
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlot(eventId, slot, stranger);
+
+        vm.prank(newHolder);
+        ledger.transferSlot(eventId, slot, stranger);
+        assertEq(ledger.slotOwner(eventId, slot), stranger);
+    }
+
 }

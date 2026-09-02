@@ -8,8 +8,14 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * Invariant tests for WoCoTicketLedger.
  *
  * These exist to test the guarantee the contract's natspec makes, rather than
- * individual guards: allocation is append-only, within stamped supply, and
+ * individual guards: ALLOCATION is append-only (a slot, once handed out, is
+ * never un-handed-out and `nextSlot` only grows), within stamped supply, and
  * stamped terms never move.
+ *
+ * OWNERSHIP is a separate matter and is NOT permanent: `transferSlot` lets a
+ * slot's holder move it. What stays true — and what the campaign proves — is
+ * that nothing BUT the holder can, which is the sponsor-boundary guarantee the
+ * split exists for.
  *
  * The handler is an authorised sponsor AND the stamped organiser of every
  * event it registers, so it holds strictly MORE power than a real payments
@@ -42,6 +48,13 @@ contract LedgerHandler is Test {
 
     /// Slot owners observed at mint time, to prove slots are never rewritten.
     mapping(bytes32 => mapping(uint256 => address)) public seenSlotOwner;
+    /// Coverage witnesses. Both handler actions early-return on unusable input,
+    /// so "the flag stayed false" is only meaningful if attempts were actually
+    /// made — without these the new invariant passes vacuously.
+    uint256 public transfersMade;
+    uint256 public unauthorisedAttempts;
+    /// Set if a non-holder ever moved a slot. Must stay false.
+    bool public unauthorisedTransferSucceeded;
     mapping(bytes32 => uint256) public seenSlotCount;
 
     constructor(WoCoTicketLedger _ledger) {
@@ -100,6 +113,50 @@ contract LedgerHandler is Test {
         } catch {
             // See claimFor.
         }
+    }
+
+    /// Move a slot, pranking as its current owner — the only authority the
+    /// contract accepts. Ownership is tracked through the move so the invariant
+    /// asserts "changed only by its owner", not "never changed".
+    function transferSlot(uint256 eventIndex, uint256 slotSeed, address newOwner) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        uint256 count = seenSlotCount[id];
+        if (count == 0) return;
+
+        uint256 slot = bound(slotSeed, 0, count - 1);
+        address current = seenSlotOwner[id][slot];
+        if (current == address(0)) return;
+        if (newOwner == address(0) || newOwner == current) return;
+
+        vm.prank(current);
+        try ledger.transferSlot(id, slot, newOwner) {
+            seenSlotOwner[id][slot] = newOwner;
+            transfersMade++;
+        } catch {
+            // See claimFor.
+        }
+    }
+
+    /// A transfer attempted by someone who is NOT the holder. Must always
+    /// revert; the invariant's job is to prove no state moved when it did.
+    function transferSlotUnauthorised(uint256 eventIndex, uint256 slotSeed, address caller) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        uint256 count = seenSlotCount[id];
+        if (count == 0) return;
+
+        uint256 slot = bound(slotSeed, 0, count - 1);
+        address current = seenSlotOwner[id][slot];
+        if (current == address(0) || caller == current || caller == address(0)) return;
+
+        unauthorisedAttempts++;
+        vm.prank(caller);
+        try ledger.transferSlot(id, slot, caller) {
+            // A success here is the failure: it means someone who does not hold
+            // the slot moved it. Recorded so the invariant reports it.
+            unauthorisedTransferSucceeded = true;
+        } catch {}
     }
 
     function cancelEvent(uint256 eventIndex) external {
@@ -184,10 +241,43 @@ contract WoCoTicketLedgerInvariantTest is Test {
         }
     }
 
-    /// Slots are append-only: once a slot has an owner, that owner never
-    /// changes. This is the property the whole split exists to protect.
+    /// Coverage, not correctness — and it has to live here rather than in the
+    /// invariant body, because an invariant is also evaluated at SETUP, when no
+    /// handler call has run and every counter is legitimately zero.
+    ///
+    /// Without this, `invariant_SlotsAreOnlyMovedByTheirOwner` would pass
+    /// trivially in any campaign that never managed a transfer: the handler
+    /// early-returns on unusable input, so "no unauthorised move succeeded" is
+    /// only evidence if unauthorised moves were actually attempted.
+    function afterInvariant() public view {
+        assertGt(handler.transfersMade(), 0, "campaign never exercised transferSlot");
+        assertGt(
+            handler.unauthorisedAttempts(),
+            0,
+            "campaign never attempted an unauthorised move"
+        );
+    }
+
+    /// A slot's owner changes ONLY through a transfer its own owner authorised.
+    ///
+    /// This used to read "once a slot has an owner, that owner never changes",
+    /// and that literal form is no longer true — `transferSlot` exists so a
+    /// ticket can change hands. The sentence overstated its own purpose. What
+    /// the split protects (see the contract header) is that SPONSOR authority
+    /// grants exactly one power: appending new slots, never touching existing
+    /// ones. A transfer the holder authorises does not cross that boundary, and
+    /// the handler holds strictly more power than a real payments contract, so
+    /// if no sponsor/organiser/clock action rewrites a slot here, none can.
+    ///
+    /// The handler tracks ownership THROUGH transfers, so this still fails on
+    /// any rewrite that did not come from the holder — which is the property
+    /// that was actually load-bearing all along.
     /// forge-config: default.invariant.runs = 64
-    function invariant_SlotsAreAppendOnly() public view {
+    function invariant_SlotsAreOnlyMovedByTheirOwner() public view {
+        assertFalse(
+            handler.unauthorisedTransferSucceeded(),
+            "a slot was moved by someone who did not hold it"
+        );
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
             bytes32 id = handler.eventIds(i);
