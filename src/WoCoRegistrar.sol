@@ -50,6 +50,49 @@ contract WoCoRegistrar is Ownable {
     /// @notice Reserved labels (keyed by labelhash) that can never be minted.
     mapping(bytes32 labelhash => bool reserved) public reserved;
 
+    /// @notice Per-recipient mint accounting for the rate cap. One slot.
+    struct MintWindow {
+        uint64 start;
+        uint32 count;
+    }
+
+    /// @notice How many names each RECIPIENT has been minted in its current
+    ///         window, and when that window began.
+    ///
+    /// @dev Keyed on the address that RECEIVES the name, never on
+    ///      `msg.sender`. Both mint paths are submitted by someone other than
+    ///      the organiser — the sponsor key for `register`, the organiser's
+    ///      Kernel or a paymaster for `registerWithPermit` — so a cap keyed on
+    ///      the sender would cap the sponsor, i.e. the whole platform, at one
+    ///      organiser's allowance.
+    ///
+    ///      WHAT THIS BOUNDS, stated honestly (WoCo-Event-App #464): a server
+    ///      bug that mints for the same account in a loop, and an account that
+    ///      churns names through the product. It does NOT bound an attacker
+    ///      holding the permit key or the sponsor key, who chooses the
+    ///      recipient and can use a fresh one per mint; bounding that needs a
+    ///      cap on the registrar as a whole, which is a separate decision with
+    ///      a launch-day sizing question attached. This contract is replaceable
+    ///      (`addRegistrar` / `removeRegistrar`), so that can follow.
+    ///
+    ///      Fixed window, anchored at the recipient's first mint in it. At the
+    ///      boundary a recipient can therefore mint up to twice the cap across a
+    ///      few seconds; accepted for a backstop, in exchange for one slot per
+    ///      recipient and no loops.
+    mapping(address recipient => MintWindow) public mintWindow;
+
+    /// @notice Names one recipient may be minted per window. Owner-tunable.
+    /// @dev Default 30 per 30 days. Sized so no legitimate organiser meets it —
+    ///      a profile name, a name per site and a name per event is the intended
+    ///      use — and erring HIGH deliberately: the owner is a multisig after
+    ///      deploy, so a cap set too low fails a real organiser at the worst
+    ///      moment and needs a multisig round to fix, while a cap set high
+    ///      costs nothing until abuse that this cap does not bound anyway.
+    uint32 public maxMintsPerWindow;
+
+    /// @notice Length of the window in seconds. Owner-tunable.
+    uint64 public mintWindowSeconds;
+
     uint256 public constant MIN_LABEL_LENGTH = 3;
     uint256 public constant MAX_LABEL_LENGTH = 63;
 
@@ -64,6 +107,7 @@ contract WoCoRegistrar is Ownable {
     event LabelReservedSet(string label, bool reserved);
     event NameRegistered(string indexed label, address indexed owner, bytes contenthash);
     event ContenthashUpdated(string indexed label, bytes contenthash);
+    event MintRateCapSet(uint32 maxMintsPerWindow, uint64 mintWindowSeconds);
 
     error NotAuthorisedSponsor(address caller);
     error LabelIsReserved(string label);
@@ -73,6 +117,8 @@ contract WoCoRegistrar is Ownable {
     error PermitExpired();
     error PermitAlreadyUsed();
     error PermitInvalid();
+    error MintRateCapExceeded(address recipient, uint64 windowResetsAt);
+    error InvalidMintRateCap();
 
     modifier onlySponsor() {
         if (!authorisedSponsors[msg.sender]) revert NotAuthorisedSponsor(msg.sender);
@@ -84,6 +130,10 @@ contract WoCoRegistrar is Ownable {
         coinType = (0x80000000 | block.chainid);
         platformSigner = _platformSigner;
         DOMAIN_SEPARATOR = _buildDomainSeparator();
+
+        maxMintsPerWindow = 30;
+        mintWindowSeconds = 30 days;
+        emit MintRateCapSet(30, 30 days);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -186,11 +236,26 @@ contract WoCoRegistrar is Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice True if `label` is valid, not reserved, and unminted.
+    /// @dev Says nothing about the recipient's allowance — that is a property
+    ///      of who is receiving, not of the label. See `mintAllowance`.
     function available(string calldata label) external view returns (bool) {
         if (!_validLabel(label)) return false;
         if (reserved[keccak256(bytes(label))]) return false;
         bytes32 node = registry.makeNode(registry.baseNode(), label);
         return registry.owner(node) == address(0);
+    }
+
+    /// @notice How many more names `recipient` may be minted right now, and
+    ///         when their window resets. For the server and UI to say "you can
+    ///         register N more until <date>" instead of surfacing a failed tx.
+    function mintAllowance(address recipient) external view returns (uint32 remaining, uint64 windowResetsAt) {
+        MintWindow memory w = mintWindow[recipient];
+        uint64 nowTs = uint64(block.timestamp);
+        if (w.start == 0 || nowTs >= w.start + mintWindowSeconds) {
+            return (maxMintsPerWindow, nowTs + mintWindowSeconds);
+        }
+        remaining = w.count >= maxMintsPerWindow ? 0 : maxMintsPerWindow - w.count;
+        windowResetsAt = w.start + mintWindowSeconds;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -217,6 +282,19 @@ contract WoCoRegistrar is Ownable {
         emit LabelReservedSet(label, isReserved);
     }
 
+    /// @notice Retune the per-recipient mint cap. Takes effect for every
+    ///         recipient's NEXT mint; windows already open keep their start.
+    /// @dev Zero is refused for both: a zero cap would be a mint pause dressed
+    ///      as a tuning, and a zero window would make the cap vanish. Pausing
+    ///      already exists — `removeSponsor` and `setPlatformSigner(0)` close
+    ///      both mint paths (`ECDSA.recover` never returns the zero address).
+    function setMintRateCap(uint32 max, uint64 windowSeconds) external onlyOwner {
+        if (max == 0 || windowSeconds == 0) revert InvalidMintRateCap();
+        maxMintsPerWindow = max;
+        mintWindowSeconds = windowSeconds;
+        emit MintRateCapSet(max, windowSeconds);
+    }
+
     /*//////////////////////////////////////////////////////////////
                              INTERNAL
     //////////////////////////////////////////////////////////////*/
@@ -241,6 +319,7 @@ contract WoCoRegistrar is Ownable {
         if (!_validLabel(label)) revert InvalidLabel(label);
         if (reserved[keccak256(bytes(label))]) revert LabelIsReserved(label);
         if (textKeys.length != textValues.length) revert ArrayLengthMismatch();
+        _consumeMintAllowance(owner_);
 
         node = registry.createSubnode(registry.baseNode(), label, owner_, new bytes[](0));
 
@@ -258,6 +337,23 @@ contract WoCoRegistrar is Ownable {
         }
 
         emit NameRegistered(label, owner_, contenthash);
+    }
+
+    /// @dev Charges one mint to `recipient`'s window, opening a fresh window if
+    ///      none is open or the current one has elapsed. Reverts with the reset
+    ///      time when the window is full, so a caller can report it.
+    function _consumeMintAllowance(address recipient) internal {
+        MintWindow memory w = mintWindow[recipient];
+        uint64 nowTs = uint64(block.timestamp);
+        if (w.start == 0 || nowTs >= w.start + mintWindowSeconds) {
+            w.start = nowTs;
+            w.count = 0;
+        }
+        if (w.count >= maxMintsPerWindow) {
+            revert MintRateCapExceeded(recipient, w.start + mintWindowSeconds);
+        }
+        w.count += 1;
+        mintWindow[recipient] = w;
     }
 
     /// @dev Allowed: 3-63 chars, lowercase a-z / 0-9 / hyphen, no leading/trailing/double hyphen.
