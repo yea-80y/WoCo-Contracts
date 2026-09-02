@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Test} from "forge-std/Test.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {DeploySubEnsRegistry} from "../script/DeploySubEnsRegistry.s.sol";
+import {L2Registry} from "../src/durin/L2Registry.sol";
+import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
+import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
+
+/**
+ * Tests for the sub-ENS deploy script's clone tripwire (WoCo-Event-App #440).
+ *
+ * #440 is not a contract bug — every WoCo addition to `L2Registry` worked, and
+ * its tests passed, against a locally constructed registry. The bug was that the
+ * script deployed a DIFFERENT registry: `L2RegistryFactory.deployRegistry` clones
+ * an implementation fixed at the factory's construction, which is NameStone's.
+ * Nothing in the suite compared the deployed bytecode to ours, so the gap was
+ * invisible for as long as nobody read the factory.
+ *
+ * These tests therefore do the thing that was missing: they run the script and
+ * assert facts about what it actually put on chain, and they prove each clause of
+ * the tripwire fires on its own by substituting a deployment it must reject.
+ */
+contract DeploySubEnsRegistryTest is Test {
+    DeploySubEnsRegistry script;
+    MockSafe safe;
+
+    uint256 constant DEPLOYER_PK = 0xA11CE;
+
+    function setUp() public {
+        script = new DeploySubEnsRegistry();
+        safe = new MockSafe();
+        _setEnv();
+    }
+
+    /// @dev `vm.setEnv` writes the OS environment of the whole forge process and
+    ///      Foundry runs test functions in parallel, so every test in this file
+    ///      must write the SAME values — concurrent writers are then
+    ///      indistinguishable from one. Varying the environment per test races,
+    ///      visibly and intermittently. Anything that needs a different
+    ///      configuration varies it through a `_deployRegistryClone` override
+    ///      instead. See the handover note on the two `REGISTRY_ADMIN` guards
+    ///      that are consequently still untested.
+    function _setEnv() internal {
+        vm.setEnv("DEPLOYER_PRIVATE_KEY", vm.toString(bytes32(DEPLOYER_PK)));
+        vm.setEnv("SPONSOR_ADDRESS", vm.toString(makeAddr("sponsor")));
+        vm.setEnv("REGISTRY_ADMIN", vm.toString(address(safe)));
+        vm.setEnv("PARENT_NAME", "woco.eth");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                  THE DEPLOY PRODUCES *OUR* REGISTRY
+    //////////////////////////////////////////////////////////////*/
+
+    /// The headline #440 assertion: the registry that goes live is a clone of an
+    /// implementation this script deployed, not of anything NameStone deployed.
+    function test_Deploy_RegistryIsACloneOfOurOwnImplementation() public {
+        (address registryAddr,) = script.run();
+
+        assertEq(registryAddr.code.length, 45, "registry is not an EIP-1167 clone");
+
+        address impl = _embeddedImplementation(registryAddr);
+        assertTrue(impl.code.length > 0, "implementation has no code");
+        assertTrue(
+            impl != 0xdeB09eB3111cB75d538216e8B8fC30047d75fb34,
+            "registry still points at NameStone's implementation"
+        );
+    }
+
+    /// The capability #440 exists to protect: #422's `adminTransfer` must be
+    /// callable on the DEPLOYED registry, which was never true through the
+    /// factory. Exercised end to end rather than asserted about bytecode.
+    function test_Deploy_AdminTransferIsReachableOnTheDeployedRegistry() public {
+        (address registryAddr, address registrarAddr) = script.run();
+        L2Registry registry = L2Registry(registryAddr);
+        WoCoRegistrar registrar = WoCoRegistrar(registrarAddr);
+
+        address organiser = makeAddr("organiser");
+        address claimant = makeAddr("claimant");
+
+        string[] memory keys = new string[](0);
+        string[] memory vals = new string[](0);
+        vm.prank(vm.envAddress("SPONSOR_ADDRESS"));
+        bytes32 node = registrar.register("venue", organiser, hex"e301", keys, vals);
+
+        vm.prank(address(safe));
+        registry.adminTransfer(node, claimant);
+
+        assertEq(registry.owner(node), claimant, "adminTransfer is not reachable on the deployed registry");
+    }
+
+    /// Both admin roles end on the multisig, not the deployer key. Re-pinned here
+    /// because the deploy path changed underneath the rotation that WoCo-Contracts#1 added.
+    function test_Deploy_RotatesBothAdminRolesToTheMultisig() public {
+        (address registryAddr, address registrarAddr) = script.run();
+
+        assertEq(L2Registry(registryAddr).owner(), address(safe), "registry admin did not rotate");
+        assertEq(WoCoRegistrar(registrarAddr).owner(), address(safe), "registrar owner did not rotate");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        EACH TRIPWIRE CLAUSE FIRES
+    //////////////////////////////////////////////////////////////*/
+
+    /// Clause 1. The literal #440 regression: a registry cloned from an
+    /// implementation other than the one this script deployed. Reinstating the
+    /// factory call while leaving `new L2Registry()` in place lands exactly here.
+    function test_Tripwire_RejectsACloneOfSomethingElse() public {
+        ClonesSomethingElse bad = new ClonesSomethingElse();
+        vm.expectRevert("registry is not a clone of the implementation this script deployed");
+        bad.run();
+    }
+
+    /// Clause 2. NameStone's implementation address, named. The code behind it is
+    /// genuinely ours here, so clauses 1 and 3 both pass — this test fails the
+    /// moment clause 2 is deleted.
+    function test_Tripwire_RejectsNameStonesImplementationAddress() public {
+        ClonesNameStonesAddress bad = new ClonesNameStonesAddress();
+        vm.expectRevert("registry implementation is NameStone's - the factory path is back");
+        bad.run();
+    }
+
+    /// Clause 3. An implementation at an address of its own, correctly cloned,
+    /// that simply is not our source — upstream Durin's shape. Clauses 1 and 2
+    /// pass; only the bytecode check catches it. This is the clause that survives
+    /// someone shuffling addresses to satisfy the other two.
+    function test_Tripwire_RejectsAnUpstreamShapedImplementation() public {
+        ClonesUpstreamShape bad = new ClonesUpstreamShape();
+        vm.expectRevert("registry implementation lacks WoCo's adminTransfer - it is not our bytecode");
+        bad.run();
+    }
+
+    /// Shape, length: a proxy carrying trailing immutable args is not the clone
+    /// we reasoned about, and its extra bytes are unexamined.
+    function test_Tripwire_RejectsACloneWithTrailingBytes() public {
+        DeploysOversizedProxy bad = new DeploysOversizedProxy();
+        vm.expectRevert("registry is not an EIP-1167 clone");
+        bad.run();
+    }
+
+    /// Shape, prefix: 45 bytes of something else entirely. Without the prefix
+    /// check, `_cloneImplementationOf` would read 20 arbitrary bytes out of an
+    /// arbitrary contract and call them an implementation address.
+    function test_Tripwire_RejectsAProxyWithTheWrongPrefix() public {
+        bytes memory runtime = bytes.concat(
+            hex"00112233445566778899", // not 363d3d373d3d3d363d73
+            bytes20(makeAddr("impl")),
+            hex"5af43d82803e903d91602b57fd5bf3" // ...but a correct suffix
+        );
+        DeploysEtchedProxy bad = new DeploysEtchedProxy(runtime);
+        vm.expectRevert("registry is not an EIP-1167 clone");
+        bad.run();
+    }
+
+    /// Shape, suffix: the delegatecall-and-return tail is what makes a minimal
+    /// proxy a proxy. Rival 45-byte clone dialects share the prefix and differ
+    /// here, and one of those is not the contract this deploy was reasoned about.
+    function test_Tripwire_RejectsAProxyWithTheWrongSuffix() public {
+        bytes memory runtime = bytes.concat(
+            hex"363d3d373d3d3d363d73", // a correct prefix...
+            bytes20(makeAddr("impl")),
+            hex"00112233445566778899aabbccddee" // ...and a tail that does something else
+        );
+        DeploysEtchedProxy bad = new DeploysEtchedProxy(runtime);
+        vm.expectRevert("registry is not an EIP-1167 clone");
+        bad.run();
+    }
+
+    /// Not a proxy at all — the registry deployed directly rather than cloned.
+    function test_Tripwire_RejectsANonProxyRegistry() public {
+        DeploysDirectly bad = new DeploysDirectly();
+        vm.expectRevert("registry is not an EIP-1167 clone");
+        bad.run();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    function _embeddedImplementation(address clone) internal view returns (address impl) {
+        bytes memory code = clone.code;
+        assembly {
+            impl := shr(96, mload(add(code, 0x2a)))
+        }
+    }
+}
+
+/*//////////////////////////////////////////////////////////////
+        SUBSTITUTE DEPLOYMENTS THE TRIPWIRE MUST REJECT
+
+    Each overrides only `_deployRegistryClone`; everything else in the
+    script, the tripwire included, runs unchanged.
+//////////////////////////////////////////////////////////////*/
+
+contract ClonesSomethingElse is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new L2Registry()); // reported...
+        registryAddr = Clones.clone(address(new L2Registry())); // ...but not the one cloned
+        IL2Registry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+contract ClonesNameStonesAddress is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = NAMESTONE_REGISTRY_IMPLEMENTATION;
+        // Our real bytecode, at their address: clauses 1 and 3 are satisfied.
+        vm.etch(implAddr, address(new L2Registry()).code);
+        registryAddr = Clones.clone(implAddr);
+        IL2Registry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+contract ClonesUpstreamShape is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new UpstreamShapedRegistry());
+        registryAddr = Clones.clone(implAddr);
+        UpstreamShapedRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+contract DeploysOversizedProxy is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory, address)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new L2Registry());
+        registryAddr = Clones.clone(implAddr);
+        // A minimal proxy carrying appended immutable args.
+        vm.etch(registryAddr, bytes.concat(registryAddr.code, hex"deadbeef"));
+    }
+}
+
+/// @dev Puts arbitrary runtime bytecode where the registry should be, so the
+///      prefix and suffix halves of the shape check can be exercised separately.
+contract DeploysEtchedProxy is DeploySubEnsRegistry {
+    bytes internal runtime;
+
+    constructor(bytes memory runtime_) {
+        runtime = runtime_;
+    }
+
+    function _deployRegistryClone(string memory, address)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new L2Registry());
+        registryAddr = address(uint160(uint256(keccak256(runtime))));
+        vm.etch(registryAddr, runtime);
+    }
+}
+
+contract DeploysDirectly is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new L2Registry());
+        UpstreamShapedRegistry direct = new UpstreamShapedRegistry();
+        direct.initialize(parentName, "WoCo Names", "", admin);
+        registryAddr = address(direct);
+    }
+}
+
+/// @dev Stands in for upstream Durin: initialises like a registry, has no
+///      `adminTransfer`. Deliberately tiny — what matters is the absence.
+contract UpstreamShapedRegistry {
+    address public admin;
+
+    function initialize(string calldata, string memory, string memory, address admin_) external {
+        admin = admin_;
+    }
+}
+
+/// @dev A contract, because `REGISTRY_ADMIN` must not be a bare key.
+contract MockSafe {}

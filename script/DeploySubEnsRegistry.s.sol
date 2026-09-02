@@ -2,20 +2,16 @@
 pragma solidity ^0.8.24;
 
 import {Script, console} from "forge-std/Script.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
+import {L2Registry} from "../src/durin/L2Registry.sol";
 import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
 
-/// @notice Minimal interface to Durin's canonical L2RegistryFactory.
-interface IL2RegistryFactory {
-    function deployRegistry(string calldata name, string memory symbol, string memory baseURI, address admin)
-        external
-        returns (address);
-}
-
 /// @title DeploySubEnsRegistry
-/// @notice Creates WoCo's sub-ENS registry on an L2 via Durin's canonical factory,
-///         deploys WoCoRegistrar, wires it in, seeds sponsor + reserved names, and
-///         hands both admin roles to `REGISTRY_ADMIN` before it returns.
+/// @notice Creates WoCo's sub-ENS registry on an L2 from OUR OWN registry
+///         implementation, deploys WoCoRegistrar, wires it in, seeds sponsor +
+///         reserved names, and hands both admin roles to `REGISTRY_ADMIN`
+///         before it returns.
 ///
 /// @dev Run against Arbitrum Sepolia first:
 ///        forge script script/DeploySubEnsRegistry.s.sol --rpc-url arb_sepolia --broadcast
@@ -31,11 +27,33 @@ interface IL2RegistryFactory {
 ///        PARENT_NAME             — defaults to "woco.eth".
 ///        ALLOW_EOA_ADMIN         — testnet escape hatch; see the guard below.
 ///
+/// WHY THIS DEPLOYS ITS OWN IMPLEMENTATION (WoCo-Event-App #440)
+///
+/// This script used to create the registry through Durin's canonical
+/// `L2RegistryFactory`, which does `Clones.clone(registryImplementation)` against
+/// an implementation address fixed at the factory's own construction — NameStone's.
+/// Every WoCo addition to `L2Registry.sol` (`adminTransfer` and the #422 guards)
+/// therefore existed only in this repo: the bytecode that would have run on chain
+/// was pristine upstream Durin. The tests passed because they construct
+/// `L2Registry` locally; nothing asserted that the DEPLOYED registry was built
+/// from our source.
+///
+/// So the shape is kept (an EIP-1167 clone — every existing test and all the
+/// storage-layout reasoning still hold) and only the implementation changes hands:
+/// deploy `L2Registry` from this repo, clone THAT, initialise it. Direct
+/// construction is not an option — the vendored constructor calls
+/// `_disableInitializers()`.
+///
+/// The tripwire below is the point of the change, not the clone. It asserts, on
+/// chain, at deploy time, that the registry about to be handed to the multisig
+/// runs OUR code. Reinstating the factory call trips it three separate ways —
+/// see `_assertRegistryRunsOurImplementation`.
+///
 /// WHY THE ROTATION IS IN THE SCRIPT AND NOT A RUNBOOK STEP
 ///
 /// Registry admin is not a role flag — it is ownership of the `baseNode` ERC-721
 /// (`L2Registry.owner()` returns `owner(baseNode)`, and `initialize` mints that
-/// token to whoever the factory was handed as `admin`). Whoever holds it can call
+/// token to whoever is handed as `admin`). Whoever holds it can call
 /// `addRegistrar(itself)` and then write records — `setAddr` included — for ANY
 /// name in the registry, because `onlyOwnerOrRegistrar` scopes to registrar
 /// MEMBERSHIP, not to a node. It can also `adminTransfer` any name to itself.
@@ -45,7 +63,7 @@ interface IL2RegistryFactory {
 /// power sitting behind a multisig rather than one key. A deploy that ends with
 /// the deployer EOA still holding `baseNode` therefore does not merely leave a
 /// chore outstanding — it invalidates the premise the contract was reviewed on,
-/// silently, and the previous version of this script did exactly that.
+/// silently, and an earlier version of this script did exactly that.
 ///
 /// ⚠️ BOTH TRANSFERS BELOW ARE SINGLE-STEP AND IRREVERSIBLE. `baseNode` sent to
 /// an address that cannot transact is the whole registry lost with no recovery
@@ -55,10 +73,21 @@ interface IL2RegistryFactory {
 /// broadcasting. The guard below rejects an EOA, which catches a typo'd or
 /// forgotten value, but it CANNOT catch a well-formed address you do not control.
 contract DeploySubEnsRegistry is Script {
-    // Durin's L2RegistryFactory — same address on every supported chain (incl. Arbitrum + Arb Sepolia).
-    address constant L2_REGISTRY_FACTORY = 0xDddddDdDDD8Aa1f237b4fa0669cb46892346d22d;
+    /// @notice The implementation NameStone's canonical `L2RegistryFactory`
+    ///         clones (read from the factory on Arb Sepolia, 2026-09-02). Named
+    ///         here so that a deploy which somehow ends up pointing at upstream
+    ///         Durin fails by NAME rather than by a bytecode mismatch nobody
+    ///         reads. Never a deploy target.
+    address constant NAMESTONE_REGISTRY_IMPLEMENTATION = 0xdeB09eB3111cB75d538216e8B8fC30047d75fb34;
 
-    function run() external {
+    /// @dev EIP-1167 minimal-proxy runtime: PREFIX ‖ 20-byte impl ‖ SUFFIX.
+    bytes10 constant CLONE_PREFIX = 0x363d3d373d3d3d363d73;
+    bytes15 constant CLONE_SUFFIX = 0x5af43d82803e903d91602b57fd5bf3;
+    uint256 constant CLONE_RUNTIME_LENGTH = 45;
+
+    /// @return registryAddress The initialised registry clone now owned by `REGISTRY_ADMIN`.
+    /// @return registrarAddress The `WoCoRegistrar` wired into it.
+    function run() external returns (address registryAddress, address registrarAddress) {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPk);
         address sponsor = vm.envAddress("SPONSOR_ADDRESS");
@@ -86,15 +115,22 @@ contract DeploySubEnsRegistry is Script {
 
         vm.startBroadcast(deployerPk);
 
-        // 1. Create our registry via the canonical factory. The deployer takes
+        // 1. Create our registry from OUR implementation. The deployer takes
         //    admin only because steps 3-5 are `onlyOwner` and the multisig would
         //    otherwise have to sign each of them; step 6 hands it straight on.
-        address registryAddr =
-            IL2RegistryFactory(L2_REGISTRY_FACTORY).deployRegistry(parentName, "WoCo Names", "", deployer);
+        (address registryAddr, address implAddr) = _deployRegistryClone(parentName, deployer);
+        registryAddress = registryAddr;
+
+        // 1b. Prove it before anything else touches it. Placed here, and inside
+        //     the broadcast, so that a failure aborts the script before forge
+        //     submits ANY transaction — a wrong registry is never created.
+        _assertRegistryRunsOurImplementation(registryAddr, implAddr);
+
         IL2Registry registry = IL2Registry(registryAddr);
 
         // 2. Deploy our minting-policy layer.
         WoCoRegistrar registrar = new WoCoRegistrar(registryAddr, deployer, platformSigner);
+        registrarAddress = address(registrar);
 
         // 3. Grant the registrar record-setting + minting authority on the registry.
         registry.addRegistrar(address(registrar));
@@ -132,12 +168,109 @@ contract DeploySubEnsRegistry is Script {
         require(registrar.owner() == registryAdmin, "registrar ownership rotation did not land");
 
         console.log("Parent name:      ", parentName);
-        console.log("L2Registry:       ", registryAddr);
+        console.log("L2Registry impl:  ", implAddr);
+        console.log("L2Registry (clone):", registryAddr);
         console.log("WoCoRegistrar:    ", address(registrar));
         console.log("Registry admin:   ", registryAdmin);
         console.log("Registrar owner:  ", registryAdmin);
         console.log("Deployer (no roles retained):", deployer);
         console.log("Authorised sponsor:", sponsor);
         console.log("Platform signer:  ", platformSigner);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          REGISTRY CREATION
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Deploys our `L2Registry` implementation, clones it, initialises the clone.
+    /// @dev `virtual` ONLY so that tests can substitute a deployment the tripwire
+    ///      must reject (an upstream-shaped registry, a clone of something else).
+    ///      Production always runs this body.
+    /// @return registryAddr The initialised EIP-1167 clone.
+    /// @return implAddr     The implementation it delegates to.
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        virtual
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new L2Registry());
+        registryAddr = Clones.clone(implAddr);
+        IL2Registry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              THE TRIPWIRE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Refuses to continue unless the registry about to go live executes
+    ///         the `L2Registry` source in THIS repo.
+    ///
+    /// @dev Three independent checks, because one is not enough to survive a
+    ///      careless edit:
+    ///
+    ///        (1) SHAPE + TARGET — `registryAddr` is a canonical EIP-1167 clone
+    ///            whose embedded implementation is exactly `implAddr`. Reinstating
+    ///            `IL2RegistryFactory(...).deployRegistry(...)` while leaving the
+    ///            `new L2Registry()` line in place fails here: the factory clones
+    ///            an implementation of its own choosing. Deleting that line
+    ///            instead does not compile.
+    ///
+    ///        (2) NOT UPSTREAM — the implementation is not NameStone's known
+    ///            address. Redundant with (1) by construction; kept because it
+    ///            names the failure the operator actually cares about.
+    ///
+    ///        (3) OUR CODE — the implementation's runtime bytecode contains the
+    ///            dispatcher entry for `adminTransfer(bytes32,address)`, a WoCo
+    ///            addition upstream Durin does not have. This is the check that
+    ///            survives address substitution: (1) and (2) both compare
+    ///            addresses, and an address proves nothing about the code behind
+    ///            it. If `adminTransfer` is ever removed from `L2Registry`, this
+    ///            must be re-pointed at whatever WoCo addition replaces it —
+    ///            deleting it is not the fix.
+    function _assertRegistryRunsOurImplementation(address registryAddr, address implAddr) internal view {
+        address embedded = _cloneImplementationOf(registryAddr);
+        require(embedded == implAddr, "registry is not a clone of the implementation this script deployed");
+        require(
+            implAddr != NAMESTONE_REGISTRY_IMPLEMENTATION,
+            "registry implementation is NameStone's - the factory path is back"
+        );
+        require(
+            _codeContainsSelector(implAddr, L2Registry.adminTransfer.selector),
+            "registry implementation lacks WoCo's adminTransfer - it is not our bytecode"
+        );
+    }
+
+    /// @dev Extracts the implementation address from an EIP-1167 minimal proxy,
+    ///      reverting if `clone` is not one. The prefix/suffix are checked as
+    ///      well as the length, so a 45-byte contract that merely happens to be
+    ///      the right size cannot pass.
+    function _cloneImplementationOf(address clone) internal view returns (address impl) {
+        bytes memory code = clone.code;
+        require(code.length == CLONE_RUNTIME_LENGTH, "registry is not an EIP-1167 clone");
+
+        bytes10 prefix;
+        bytes15 suffix;
+        assembly {
+            // `code` is length-prefixed; its bytes start at code+0x20.
+            prefix := mload(add(code, 0x20))
+            impl := shr(96, mload(add(code, 0x2a))) // 0x20 + 10
+            suffix := mload(add(code, 0x3e)) // 0x20 + 30
+        }
+        require(prefix == CLONE_PREFIX && suffix == CLONE_SUFFIX, "registry is not an EIP-1167 clone");
+    }
+
+    /// @dev True if `target`'s runtime bytecode contains `selector`. solc emits
+    ///      every external function's selector verbatim in the dispatcher, so
+    ///      presence is a reliable positive signal that the function is there.
+    function _codeContainsSelector(address target, bytes4 selector) internal view returns (bool) {
+        bytes memory code = target.code;
+        if (code.length < 4) return false;
+        for (uint256 i; i <= code.length - 4; ++i) {
+            if (code[i] == selector[0] && code[i + 1] == selector[1] && code[i + 2] == selector[2]
+                && code[i + 3] == selector[3]) {
+                return true;
+            }
+        }
+        return false;
     }
 }
