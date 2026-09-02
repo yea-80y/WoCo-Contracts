@@ -40,6 +40,22 @@ interface INameWrapper {
 /// @author NameStone
 /// @notice ENS resolver that directs all queries to a CCIP Read gateway.
 /// @dev Callers must implement EIP-3668 and ENSIP-10.
+///
+/// ┌──────────────────────────────────────────────────────────────────────────┐
+/// │ VENDORED + MODIFIED BY WOCO — this is NOT pristine upstream Durin.        │
+/// │                                                                          │
+/// │ WoCo addition (WoCo-Event-App #419), opt-in and inert until used:         │
+/// │   · `fallbackResolver` + `setFallbackResolver` + event                    │
+/// │   · the apex branch in `resolve()`                                        │
+/// │                                                                          │
+/// │ With no fallback set, `resolve()` behaves exactly as upstream does —      │
+/// │ pinned by test/L1ResolverFallback.t.sol, which compares the OffchainLookup│
+/// │ revert data byte for byte against an independently built expectation.     │
+/// │                                                                          │
+/// │ Unlike the registry this contract is REPLACEABLE: pointing a name         │
+/// │ elsewhere is one `setResolver` by the name owner and touches no name on   │
+/// │ L2. That is what makes the Unruggable-proofs upgrade a post-launch item.  │
+/// └──────────────────────────────────────────────────────────────────────────┘
 contract L1Resolver is IExtendedResolver, Ownable {
     /*//////////////////////////////////////////////////////////////
                                 STRUCTS
@@ -66,6 +82,12 @@ contract L1Resolver is IExtendedResolver, Ownable {
 
     mapping(bytes32 node => L2Registry l2Registry) public l2Registry;
 
+    /// @notice Per-name opt-in L1 resolver consulted for the name ITSELF, never
+    ///         for anything beneath it (WoCo addition, #419).
+    /// @dev Unset (the default) is upstream behaviour exactly: every query,
+    ///      including one for the name itself, becomes an OffchainLookup.
+    mapping(bytes32 node => address resolver) public fallbackResolver;
+
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -77,6 +99,7 @@ contract L1Resolver is IExtendedResolver, Ownable {
     );
     event GatewayChanged(string url);
     event SignerChanged(address signer);
+    event FallbackResolverSet(bytes32 node, address fallbackResolver);
 
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
@@ -125,18 +148,42 @@ contract L1Resolver is IExtendedResolver, Ownable {
         uint64 targetChainId,
         address targetRegistryAddress
     ) external {
-        address owner = ens.owner(node);
-
-        if (owner == address(nameWrapper)) {
-            owner = nameWrapper.ownerOf(uint256(node));
-        }
-
-        if (owner != msg.sender) {
-            revert Unauthorized();
-        }
+        _requireNameOwner(node);
 
         l2Registry[node] = L2Registry(targetChainId, targetRegistryAddress);
         emit L2RegistrySet(node, targetChainId, targetRegistryAddress);
+    }
+
+    /// @notice Point queries for `node` ITSELF at an ordinary L1 resolver,
+    ///         instead of sending them offchain. Set `r` to the zero address to
+    ///         undo it. Should only be used with 2LDs, e.g. "nick.eth".
+    ///
+    /// @dev WoCo addition (#419). It exists for one problem: `resolve()` takes
+    ///      the last two labels of any name as the parent, so once a 2LD points
+    ///      here, a query for the 2LD itself is forwarded offchain like a
+    ///      subname would be — and `woco.eth`'s own contenthash, which is the
+    ///      WoCo app, stops resolving. Mirroring that record into L2 was the
+    ///      alternative, and it would have made the app's address depend on a
+    ///      hot signer, an L2 RPC and an API server: a trust AND availability
+    ///      regression from a static L1 record.
+    ///
+    ///      Pointed at the ENS Public Resolver, the apex keeps answering from
+    ///      the L1 storage that already holds every record — `setResolver` on
+    ///      the ENS registry changes a pointer, it does not move records — so
+    ///      there is nothing to migrate and nothing to keep in sync.
+    ///
+    ///      SCOPE, deliberately narrow: `resolve()` consults this ONLY when the
+    ///      queried name is the parent itself. Subnames are unaffected, which is
+    ///      the property the whole design rests on and is pinned by its own test.
+    ///
+    ///      Authorisation is the ENS name owner, exactly as `setL2Registry` —
+    ///      NOT this contract's `owner()`. Whoever controls the name decides
+    ///      where the name answers from.
+    function setFallbackResolver(bytes32 node, address r) external {
+        _requireNameOwner(node);
+
+        fallbackResolver[node] = r;
+        emit FallbackResolverSet(node, r);
     }
 
     /// @notice Resolves a name, as specified by ENSIP 10.
@@ -166,6 +213,16 @@ contract L1Resolver is IExtendedResolver, Ownable {
 
         // Encode the parent name
         (, bytes32 parentNode) = NameEncoder.dnsEncodeName(parentName);
+
+        // The queried name IS the parent (`parts` is ['woco','eth'], not
+        // ['sub','woco','eth']). If its owner has opted in, answer from L1 and
+        // never reach the gateway — see `setFallbackResolver`.
+        if (parts.length == 2) {
+            address l1Fallback = fallbackResolver[parentNode];
+            if (l1Fallback != address(0)) {
+                return _resolveOnFallback(l1Fallback, data);
+            }
+        }
 
         L2Registry memory targetL2Registry = l2Registry[parentNode];
 
@@ -220,6 +277,49 @@ contract L1Resolver is IExtendedResolver, Ownable {
     /*//////////////////////////////////////////////////////////////
                            INTERNAL FUNCTIONS
     //////////////////////////////////////////////////////////////*/
+
+    /// @dev Reverts unless `msg.sender` owns `node` in the ENS registry,
+    ///      unwrapping through the NameWrapper when it holds the name.
+    function _requireNameOwner(bytes32 node) internal view {
+        address owner = ens.owner(node);
+
+        if (owner == address(nameWrapper)) {
+            owner = nameWrapper.ownerOf(uint256(node));
+        }
+
+        if (owner != msg.sender) {
+            revert Unauthorized();
+        }
+    }
+
+    /// @dev Forwards the ENSIP-10 inner call to an ordinary L1 resolver and
+    ///      returns its answer as `resolve()`'s return data.
+    ///
+    ///      A failure is bubbled, never swallowed. Returning empty bytes on
+    ///      revert would turn "this resolver could not answer" into a confident
+    ///      "there is no record", which for a contenthash query is the app
+    ///      silently disappearing rather than visibly erroring.
+    ///
+    ///      RESIDUAL, stated so it is not rediscovered: the inner `data` is
+    ///      passed through unexamined, so a caller that hand-builds a query can
+    ///      have this contract read a record for a node OTHER than the name it
+    ///      asked about. It grants no access — the fallback is a public resolver
+    ///      anyone may call directly for the same answer — and honest clients
+    ///      (the Universal Resolver, ethers, viem, eth.limo) build `data` from
+    ///      the name they are resolving. The gateway performs the equivalent
+    ///      node check on the offchain path, where a signature makes it matter.
+    function _resolveOnFallback(
+        address l1Fallback,
+        bytes calldata data
+    ) internal view returns (bytes memory) {
+        (bool ok, bytes memory result) = l1Fallback.staticcall(data);
+        if (!ok) {
+            assembly {
+                revert(add(result, 0x20), mload(result))
+            }
+        }
+        return result;
+    }
 
     /// @dev Add target registry info to the CCIP Read error.
     function stuffedResolveCall(
