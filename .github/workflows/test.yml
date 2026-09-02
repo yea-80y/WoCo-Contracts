@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    # This name is the required status check on `master`. Changing it silently
+    # un-protects the branch: the old context stays required, nothing reports it,
+    # and every PR waits forever on a check that no longer exists.
+    name: forge test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # lib/ are git submodules (forge-std, openzeppelin-contracts,
+          # ens-contracts, solidity-stringutils) — without this nothing compiles.
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pinned to the version this repo is developed against so CI cannot
+          # drift from local results. solc 0.8.24 comes from foundry.toml.
+          version: 1.5.1
+
+      - name: Show versions
+        run: forge --version
+
+      - name: Build
+        run: forge build --sizes
+
+      # ~6 minutes: the invariant suites dominate it. Do NOT lower `runs` to make
+      # this faster — src/durin/L2Registry.sol ships as an EIP-1167 clone and
+      # cannot be patched after the mainnet deploy, so these tests are the only
+      # thing between a wrong edit and a permanent one.
+      - name: Test
+        run: forge test -vvv
