@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {NameEncoder} from "@ensdomains/ens-contracts/utils/NameEncoder.sol";
 import {L1Resolver, IResolverService} from "../src/durin/L1Resolver.sol";
+import {MockENS, MockAddrResolver, MockNameWrapper, MockPublicResolver, RevertingResolver} from "./mocks/L1Mocks.sol";
 
 /**
  * Tests for `L1Resolver.fallbackResolver` — the apex passthrough added for
@@ -284,85 +285,5 @@ contract L1ResolverFallbackTest is Test {
             L1Resolver.resolveWithProof.selector,
             callData
         );
-    }
-}
-
-/*//////////////////////////////////////////////////////////////
-                              MOCKS
-//////////////////////////////////////////////////////////////*/
-
-contract MockENS {
-    mapping(bytes32 => address) internal _owner;
-    mapping(bytes32 => address) internal _resolver;
-
-    function owner(bytes32 node) external view returns (address) {
-        return _owner[node];
-    }
-
-    function resolver(bytes32 node) external view returns (address) {
-        return _resolver[node];
-    }
-
-    function setOwner(bytes32 node, address o) external {
-        _owner[node] = o;
-    }
-
-    function setResolver(bytes32 node, address r) external {
-        _resolver[node] = r;
-    }
-}
-
-/// @dev Answers the one `addr()` the L1Resolver constructor asks for.
-contract MockAddrResolver {
-    address internal immutable wrapper;
-
-    constructor(address wrapper_) {
-        wrapper = wrapper_;
-    }
-
-    function addr(bytes32) external view returns (address) {
-        return wrapper;
-    }
-}
-
-contract MockNameWrapper {
-    mapping(uint256 => address) internal _owner;
-
-    function ownerOf(uint256 id) external view returns (address) {
-        return _owner[id];
-    }
-
-    function setOwner(uint256 id, address o) external {
-        _owner[id] = o;
-    }
-}
-
-/// @dev Stands in for the ENS Public Resolver `0x231b0Ee1…8E63`.
-contract MockPublicResolver {
-    mapping(bytes32 => bytes) internal _contenthash;
-    mapping(bytes32 => mapping(string => string)) internal _text;
-
-    function contenthash(bytes32 node) external view returns (bytes memory) {
-        return _contenthash[node];
-    }
-
-    function text(bytes32 node, string calldata key) external view returns (string memory) {
-        return _text[node][key];
-    }
-
-    function setContenthash(bytes32 node, bytes calldata h) external {
-        _contenthash[node] = h;
-    }
-
-    function setText(bytes32 node, string calldata key, string calldata value) external {
-        _text[node][key] = value;
-    }
-}
-
-contract RevertingResolver {
-    error Nope();
-
-    fallback() external {
-        revert Nope();
     }
 }
