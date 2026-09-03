@@ -494,6 +494,27 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         script.run();
     }
 
+    /// G17. Plan-only mode, rerun after the swap has already happened, with
+    /// the fallback-mismatch override on (the only way past G12 in that state):
+    /// the "rollback" would point the name at the resolver it already uses.
+    function test_Refuses_PlanWhoseRollbackWouldBeANoOp() public {
+        TestableDeployL1Resolver first = _newScript();
+        DeployL1Resolver.Plan memory firstPlan = first.run();
+        vm.prank(nameOwner);
+        (bool ok,) = firstPlan.swapTarget.call(firstPlan.swapCall);
+        assertTrue(ok, "swap call failed");
+
+        TestableDeployL1Resolver second = _newScript();
+        second.setExistingResolver(firstPlan.resolver);
+        second.setAllowFallbackMismatch(true);
+        vm.expectRevert(
+            bytes(
+                "PARENT_NAME already points at this resolver - the printed rollback would be a no-op; take the rollback target from the record of the run that preceded the swap"
+            )
+        );
+        second.run();
+    }
+
     function test_Refuses_NameOwnerMismatch_TheCustodyGuard() public {
         TestableDeployL1Resolver script = _newScript();
         script.setExpectNameOwner(makeAddr("wrong-expected-owner"));

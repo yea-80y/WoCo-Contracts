@@ -341,6 +341,17 @@ contract DeployL1Resolver is Script {
             "#420 custody: PARENT_NAME's effective owner does not match EXPECT_NAME_OWNER - the printed transactions are for this signer, and on mainnet it must be the Safe, not the hot key"
         );
 
+        // G17. The rollback is `setResolver(node, currentResolver)`. If the name
+        // ALREADY points at this resolver — a rerun after the swap, reachable
+        // only with ALLOW_FALLBACK_MISMATCH set — that calldata is a no-op that
+        // would print under the heading "ROLLBACK" and be trusted at the worst
+        // possible moment. Refuse: the rollback target belongs to the run that
+        // preceded the swap, and lives in that run's record.
+        require(
+            currentResolver != address(resolver),
+            "PARENT_NAME already points at this resolver - the printed rollback would be a no-op; take the rollback target from the record of the run that preceded the swap"
+        );
+
         // Post-conditions, deploy mode only. Pure re-assertions of the
         // constructor arguments this same script just passed in - there is no
         // input this script could be given that makes them fail without also
