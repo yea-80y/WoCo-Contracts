@@ -52,6 +52,13 @@ interface IL2Registry is IL2Resolver, IERC721 {
     // read release history when deciding mint policy — the registry itself
     // never reads it.
     function release(bytes32 node) external;
+    function releaseWithSignature(
+        bytes32 node,
+        uint256 expiration,
+        address signer,
+        bytes calldata signature
+    ) external;
+    function releaseDigest(bytes32 node, uint256 expiration) external view returns (bytes32);
     function lastRelease(
         bytes32 node
     ) external view returns (address previousOwner, uint64 releasedAt);

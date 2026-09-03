@@ -273,6 +273,20 @@ contract DeploySubEnsRegistry is Script {
             ),
             "registry implementation does not run WoCo's release - it is not our bytecode"
         );
+        // #464, the signature rail. Same unregistered probe node; `expiration`
+        // is max so the expiry modifier passes and the body's own guard is what
+        // answers. No signature is examined before that guard, so the validator
+        // (absent on a fork, real on chain) is never reached.
+        require(
+            _revertsWith(
+                implAddr,
+                abi.encodeCall(
+                    L2Registry.releaseWithSignature, (PROBE_NODE, type(uint256).max, address(1), bytes(""))
+                ),
+                L2Registry.ReleaseUnregistered.selector
+            ),
+            "registry implementation does not run WoCo's releaseWithSignature - it is not our bytecode"
+        );
     }
 
     /// @dev Extracts the implementation address from an EIP-1167 minimal proxy,

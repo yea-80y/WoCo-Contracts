@@ -37,8 +37,11 @@ contract L2Resolver is
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev ERC-6492: Signature Validation for Predeploy Contracts
-    IUniversalSignatureValidator private immutable universalSignatureValidator =
+    /// @dev ERC-6492: Signature Validation for Predeploy Contracts.
+    ///      WoCo modification (WoCo-Event-App #464): `private` → `internal` so the
+    ///      inheriting `L2Registry` can run `releaseWithSignature` through the
+    ///      same validator these setters use. No other change to this file.
+    IUniversalSignatureValidator internal immutable universalSignatureValidator =
         IUniversalSignatureValidator(
             0x164af34fAF9879394370C7f09064127C043A35E9
         );

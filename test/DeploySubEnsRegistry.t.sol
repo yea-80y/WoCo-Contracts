@@ -173,6 +173,16 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         bad.run();
     }
 
+    /// Clause 3 covers the signature rail too. An implementation from the
+    /// branch that had `release` but not `releaseWithSignature` — the registry
+    /// deployed on 2026-09-02 is exactly this shape — is rejected by the third
+    /// probe. Without it, a mainnet deploy from that commit would pass.
+    function test_Tripwire_RejectsAnImplementationWithoutReleaseWithSignature() public {
+        ClonesReleaseOnly bad = new ClonesReleaseOnly();
+        vm.expectRevert("registry implementation does not run WoCo's releaseWithSignature - it is not our bytecode");
+        bad.run();
+    }
+
     /// Shape, length: a proxy carrying trailing immutable args is not the clone
     /// we reasoned about, and its extra bytes are unexamined.
     function test_Tripwire_RejectsACloneWithTrailingBytes() public {
@@ -433,6 +443,33 @@ contract AdminTransferOnlyRegistry is UpstreamShapedRegistry {
 
     function adminTransfer(bytes32, address) external view {
         if (admin != msg.sender) revert Unauthorized(bytes32(0));
+    }
+}
+
+contract ClonesReleaseOnly is DeploySubEnsRegistry {
+    function _deployRegistryClone(string memory parentName, address admin)
+        internal
+        override
+        returns (address registryAddr, address implAddr)
+    {
+        implAddr = address(new ReleaseOnlyRegistry());
+        registryAddr = Clones.clone(implAddr);
+        ReleaseOnlyRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+    }
+}
+
+/// @dev A registry with #422 and the first half of #464 — `adminTransfer` and
+///      `release` answer exactly as ours do — but no `releaseWithSignature`.
+contract ReleaseOnlyRegistry is UpstreamShapedRegistry {
+    error Unauthorized(bytes32 node);
+    error ReleaseUnregistered(bytes32 node);
+
+    function adminTransfer(bytes32, address) external view {
+        if (admin != msg.sender) revert Unauthorized(bytes32(0));
+    }
+
+    function release(bytes32 node) external pure {
+        revert ReleaseUnregistered(node);
     }
 }
 

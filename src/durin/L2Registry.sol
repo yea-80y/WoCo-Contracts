@@ -9,6 +9,7 @@ pragma solidity ^0.8.20;
 // ***********************************************
 
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {NameEncoder} from "@ensdomains/ens-contracts/utils/NameEncoder.sol";
@@ -30,6 +31,10 @@ import {L2Resolver} from "./L2Resolver.sol";
 /// │   #464 · `release(node)` + `lastRelease[node]` · event `Released`        │
 /// │        · errors ReleaseBaseNode / ReleaseUnregistered                    │
 /// │        · `totalSupply` now counts LIVE names (decremented on release)    │
+/// │        · `releaseWithSignature(node, expiration, signer, sig)` — the     │
+/// │          same burn, authorised by the holder's signature so ANYONE may   │
+/// │          submit and pay; `releaseDigest` + `RELEASE_TYPEHASH` pin the    │
+/// │          message; `L2Resolver`'s validator opened `private`→`internal`   │
 /// │                                                                          │
 /// │ DO NOT resync this file from upstream without re-applying them. The      │
 /// │ tripwires are test/L2RegistryAdminTransfer.t.sol and                     │
@@ -40,6 +45,7 @@ import {L2Resolver} from "./L2Resolver.sol";
 /// │ Anything wrong here is permanent from the mainnet deploy onward.         │
 /// └──────────────────────────────────────────────────────────────────────────┘
 contract L2Registry is ERC721, Initializable, L2Resolver {
+    using MessageHashUtils for bytes32;
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -90,6 +96,14 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      for who held it last and when they let go.
     mapping(bytes32 node => ReleaseRecord) public lastRelease;
 
+    /// @notice Domain tag of the message `releaseWithSignature` verifies (WoCo
+    ///         addition, #464). Named fields, so a client can rebuild the
+    ///         digest — but `releaseDigest` is the reference and clients should
+    ///         read it rather than re-derive it.
+    bytes32 public constant RELEASE_TYPEHASH = keccak256(
+        "WoCoRelease(address registry,uint256 chainId,bytes32 node,uint64 recordVersion,uint256 expiration)"
+    );
+
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -120,9 +134,13 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     );
 
     /// @notice A name was given back by its holder (WoCo addition, #464).
-    ///         `operator` is the account that sent the transaction: the holder
-    ///         themselves, or an ERC-721 approvee acting for them. Kept apart
-    ///         from `previousOwner` so a dispute can tell the two cases apart.
+    ///         `operator` is the account that AUTHORISED it — the holder, or an
+    ///         ERC-721 approvee acting for them: `msg.sender` under `release`,
+    ///         the signer under `releaseWithSignature`. Kept apart from
+    ///         `previousOwner` so a dispute can tell the two cases apart. The
+    ///         relayer that merely paid for a signed release is on the
+    ///         transaction, deliberately not here: this event answers "who let
+    ///         go", and a relayer never did.
     event Released(
         bytes32 indexed node,
         address indexed previousOwner,
@@ -431,6 +449,88 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
             revert Unauthorized(node);
         }
 
+        _release(node, holder, msg.sender);
+    }
+
+    /// @notice The exact 32 bytes a holder signs to authorise `releaseWithSignature`
+    ///         for `node` until `expiration`. EIP-191 personal-sign shape (the
+    ///         same shape as the `*WithSignature` setters), so a plain wallet
+    ///         signs it with `personal_sign` and a contract wallet answers for it
+    ///         through ERC-1271 / ERC-6492.
+    ///
+    /// @dev Everything that makes the signature single-purpose is in here:
+    ///      `RELEASE_TYPEHASH` (never the same bytes as a setter's packed hash —
+    ///      in particular a signature that CLEARS a contenthash, whose packed
+    ///      payload is `(registry, node, "", expiration)`, cannot double as a
+    ///      release), `address(this)` + `block.chainid` (not another registry,
+    ///      not the same registry on another chain — the deploy script gives
+    ///      clones the same address across chains), and `recordVersions[node]`,
+    ///      which `_release` bumps: one signature releases at most once, and a
+    ///      re-mint of the same label to the same holder does not revive it.
+    function releaseDigest(bytes32 node, uint256 expiration) public view returns (bytes32) {
+        return keccak256(
+            abi.encode(RELEASE_TYPEHASH, address(this), block.chainid, node, recordVersions[node], expiration)
+        ).toEthSignedMessageHash();
+    }
+
+    /// @notice `release`, authorised by a signature instead of by `msg.sender`,
+    ///         so that whoever submits the transaction need not be the holder.
+    ///
+    /// @dev WoCo addition (WoCo-Event-App #464, decided 2026-09-03). WHY IT
+    ///      EXISTS: `release` is holder-only by `msg.sender`, which means a
+    ///      holder with a plain wallet pays gas for it and a holder with no gas
+    ///      at all cannot release. A paymaster solves that only for smart
+    ///      accounts. This function is the same burn, gated on the holder's
+    ///      SIGNATURE, so the platform (or anyone) can submit it and pay — and
+    ///      it works for every kind of holder the platform mints for: a plain
+    ///      wallet signs with `personal_sign`, a smart account answers via
+    ///      ERC-1271, a not-yet-deployed one via ERC-6492. The registry is an
+    ///      unpatchable clone, so this had to exist before the mainnet deploy
+    ///      or never.
+    ///
+    ///      WHAT IT DOES NOT ADD: platform power. The relayer submits only what
+    ///      the holder signed, for the node and the deadline the holder chose,
+    ///      and can refuse to relay but never forge; the holder can always call
+    ///      `release` directly instead. The same OpenZeppelin predicate as
+    ///      `release` decides WHO may sign — the holder or an ERC-721 approvee —
+    ///      and it is checked BEFORE the signature is examined, so a stranger's
+    ///      perfectly valid signature is refused without reaching the validator
+    ///      (which, for an ERC-6492 wrapper, would deploy the signer's account).
+    ///
+    ///      The message is `releaseDigest(node, expiration)`; see there for why
+    ///      it can be used once, here, and for nothing else.
+    ///
+    /// @param node       The namehash of the name to release.
+    /// @param expiration Unix seconds; the signature is void after it.
+    /// @param signer     Who signed: the holder or an approvee.
+    /// @param signature  Their signature over `releaseDigest(node, expiration)`.
+    function releaseWithSignature(
+        bytes32 node,
+        uint256 expiration,
+        address signer,
+        bytes calldata signature
+    ) external unexpiredSignature(expiration) {
+        if (node == baseNode) revert ReleaseBaseNode();
+
+        address holder = owner(node);
+        if (holder == address(0)) revert ReleaseUnregistered(node);
+        if (!_isAuthorized(holder, signer, uint256(node))) {
+            revert Unauthorized(node);
+        }
+        if (!universalSignatureValidator.isValidSig(signer, releaseDigest(node, expiration), signature)) {
+            revert Unauthorized(node);
+        }
+
+        _release(node, holder, signer);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                           INTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev The burn both release paths share. Callers have already decided
+    ///      that `holder` owns `node` and that `operator` may act for them.
+    function _release(bytes32 node, address holder, address operator) internal {
         _burn(uint256(node));
         totalSupply--;
 
@@ -442,12 +542,8 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
             releasedAt: uint64(block.timestamp)
         });
 
-        emit Released(node, holder, msg.sender);
+        emit Released(node, holder, operator);
     }
-
-    /*//////////////////////////////////////////////////////////////
-                           INTERNAL FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
 
     function _setBaseURI(string calldata baseURI) private {
         _tokenBaseURI = baseURI;
