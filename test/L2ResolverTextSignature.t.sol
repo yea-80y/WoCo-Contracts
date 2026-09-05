@@ -78,13 +78,19 @@ contract L2ResolverTextSignatureTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    /// The preimage the contract builds today.
+    /// The preimage the contract builds today. Reads the node's nonce AT SIGNING
+    /// TIME, exactly as a client must (#10) — a signature is made against the
+    /// counter value standing when it is made, and is dead once that value moves.
     function _textDigest(bytes32 node, string memory key, string memory value, uint256 expiration)
         internal
         view
         returns (bytes32)
     {
-        return keccak256(abi.encode(address(registry), node, key, value, expiration)).toEthSignedMessageHash();
+        return keccak256(
+            abi.encode(
+                address(registry), block.chainid, node, key, value, registry.nonces(node), expiration
+            )
+        ).toEthSignedMessageHash();
     }
 
     /// The preimage the contract built BEFORE this fix.
@@ -196,13 +202,15 @@ contract L2ResolverTextSignatureTest is Test {
     }
 
     /// The digest a client must rebuild. Frozen with the registry: a different
-    /// formula here is a different contract.
+    /// formula here is a different contract. Spelled literally — chain id and
+    /// the node's nonce (0 for a freshly registered name) included, per #10.
     function test_SetTextWithSignature_DigestFormulaIsPinned() public {
         bytes32 node = _register("venue", holder);
         string memory key = "url";
         string memory value = "https://a";
-        bytes32 expected =
-            keccak256(abi.encode(address(registry), node, key, value, EXPIRY)).toEthSignedMessageHash();
+        bytes32 expected = keccak256(
+            abi.encode(address(registry), block.chainid, node, key, value, uint256(0), EXPIRY)
+        ).toEthSignedMessageHash();
 
         bytes memory sig = _sign(HOLDER_KEY, expected);
         vm.prank(relayer);
