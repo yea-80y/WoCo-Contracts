@@ -107,9 +107,11 @@ contract L2Resolver is
     ///            nonces[node], expiration
     ///        )).toEthSignedMessageHash()
     ///
-    ///      `block.chainid`: the deploy script gives clones the same address on
-    ///      every chain, so `address(this)` alone does not say WHICH chain — a
-    ///      signature made on testnet would otherwise be submittable on mainnet.
+    ///      `block.chainid`: a CREATE address is a function of the deployer and
+    ///      its nonce only, so the same deployer can land a clone at the same
+    ///      address on two chains — `address(this)` alone does not say WHICH
+    ///      chain, and a signature made on testnet would otherwise be
+    ///      submittable on mainnet.
     ///      `nonces[node]`: see the mapping above; it is what kills a used
     ///      signature. `abi.encode` rather than `abi.encodePacked` for all four:
     ///      packing gives dynamic fields no boundary (the text setter's finding,
