@@ -54,6 +54,9 @@ contract L2ResolverSignatureNonceTest is Test {
     /// Coin type BTC — deliberately one `_register` does not write, so "empty"
     /// in an assertion below means the call really wrote nothing.
     uint256 constant COIN_BTC = 0;
+    /// The one coin type `setAddr` treats specially: it emits the legacy
+    /// `AddrChanged` alongside `AddressChanged`.
+    uint256 constant COIN_ETH = 60;
     uint256 constant ABI_JSON = 1;
 
     bytes constant SWARM_HASH =
@@ -66,6 +69,11 @@ contract L2ResolverSignatureNonceTest is Test {
 
     bytes constant ABI_A = hex"5b7b2261223a317d5d";
     bytes constant ABI_B = hex"5b7b2262223a327d5d";
+
+    /// Redeclared locally so `vm.expectEmit` can name them; the definitions live
+    /// in IAddressResolver / IAddrResolver upstream.
+    event AddressChanged(bytes32 indexed node, uint256 coinType, bytes newAddress);
+    event AddrChanged(bytes32 indexed node, address a);
 
     function setUp() public {
         vm.etch(Validator.ADDR, Validator.CODE);
@@ -145,22 +153,17 @@ contract L2ResolverSignatureNonceTest is Test {
                                   ADDR
     //////////////////////////////////////////////////////////////*/
 
-    /// WHY THE HOLDER SUBMITS THESE AND THE RELAYER SUBMITS THE OTHER THREE.
-    /// `setAddrWithSignature` ends by calling the inherited `setAddr`, which
-    /// carries `authorised(node)` — and that modifier tests `msg.sender`, not the
-    /// signer. So this setter, alone of the four, refuses a submitter who is not
-    /// themselves authorised for the name, whatever the holder signed. That is
-    /// pre-existing behaviour, untouched by #10 (the other three sidestep it by
-    /// writing storage directly, each with a comment saying so), and it is
-    /// reported rather than fixed here. These tests submit as the holder so that
-    /// what they measure is the nonce and the chain id, and not that.
+    /// The relayer submits these, as it does for the other three setters: #13
+    /// made this one write storage directly instead of calling the inherited
+    /// `setAddr`, whose `authorised(node)` tested the SUBMITTER and so refused a
+    /// relayer whatever the holder had signed.
 
     function test_SetAddrWithSignature_WritesAtNonceZeroAndSpendsIt() public {
         bytes32 node = _register("venue", holder);
         assertEq(registry.nonces(node), 0, "a fresh name starts at zero");
 
         bytes memory sig = _sign(HOLDER_KEY, _addrDigest(node, COIN_BTC, BTC_A, 0, EXPIRY));
-        vm.prank(holder);
+        vm.prank(relayer);
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig);
 
         assertEq(registry.addr(node, COIN_BTC), BTC_A);
@@ -173,10 +176,10 @@ contract L2ResolverSignatureNonceTest is Test {
         bytes32 node = _register("venue", holder);
         bytes memory sig = _sign(HOLDER_KEY, _addrDigest(node, COIN_BTC, BTC_A, 0, EXPIRY));
 
-        vm.prank(holder);
+        vm.prank(relayer);
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig);
 
-        vm.prank(holder);
+        vm.prank(relayer);
         vm.expectRevert(_unauthorized(node));
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig);
 
@@ -185,7 +188,7 @@ contract L2ResolverSignatureNonceTest is Test {
         vm.prank(holder);
         registry.setAddr(node, COIN_BTC, BTC_B);
 
-        vm.prank(holder);
+        vm.prank(relayer);
         vm.expectRevert(_unauthorized(node));
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig);
 
@@ -198,15 +201,15 @@ contract L2ResolverSignatureNonceTest is Test {
         bytes memory sig0 = _sign(HOLDER_KEY, _addrDigest(node, COIN_BTC, BTC_A, 0, EXPIRY));
         bytes memory sig1 = _sign(HOLDER_KEY, _addrDigest(node, COIN_BTC, BTC_B, 1, EXPIRY));
 
-        vm.prank(holder);
+        vm.prank(relayer);
         vm.expectRevert(_unauthorized(node));
         registry.setAddrWithSignature(node, COIN_BTC, BTC_B, EXPIRY, holder, sig1);
         assertEq(registry.addr(node, COIN_BTC), "", "nothing written ahead of its turn");
 
-        vm.prank(holder);
+        vm.prank(relayer);
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig0);
 
-        vm.prank(holder);
+        vm.prank(relayer);
         registry.setAddrWithSignature(node, COIN_BTC, BTC_B, EXPIRY, holder, sig1);
 
         assertEq(registry.addr(node, COIN_BTC), BTC_B);
@@ -224,14 +227,14 @@ contract L2ResolverSignatureNonceTest is Test {
         bytes memory sig = _sign(HOLDER_KEY, _addrDigest(node, COIN_BTC, BTC_A, 0, EXPIRY));
 
         vm.chainId(OTHER_CHAIN_ID);
-        vm.prank(holder);
+        vm.prank(relayer);
         vm.expectRevert(_unauthorized(node));
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig);
         assertEq(registry.addr(node, COIN_BTC), "", "nothing written on the wrong chain");
         assertEq(registry.nonces(node), 0, "and nothing spent");
 
         vm.chainId(homeChain);
-        vm.prank(holder);
+        vm.prank(relayer);
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig);
         assertEq(registry.addr(node, COIN_BTC), BTC_A, "the same signature, on the chain it names");
         assertEq(registry.nonces(node), 1);
@@ -246,9 +249,52 @@ contract L2ResolverSignatureNonceTest is Test {
         ).toEthSignedMessageHash();
 
         bytes memory sig = _sign(HOLDER_KEY, expected);
-        vm.prank(holder);
+        vm.prank(relayer);
         registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, holder, sig);
         assertEq(registry.addr(node, COIN_BTC), BTC_A);
+    }
+
+    /// THE #13 FINDING. A signed setter exists so that someone ELSE can pay for
+    /// the write; this one used to refuse exactly that, because the inherited
+    /// `setAddr` it called authorises `msg.sender`. Pinned on the ETH coin type,
+    /// which is the only one that emits a second event — so this also holds the
+    /// pair, and their order, against the hand-written storage write replacing
+    /// the inherited call.
+    function test_SetAddrWithSignature_ARelayerMaySubmitWhatTheHolderSigned() public {
+        bytes32 node = _register("venue", holder);
+        address target = makeAddr("target");
+        bytes memory a = abi.encodePacked(target);
+
+        bytes memory sig = _sign(HOLDER_KEY, _addrDigest(node, COIN_ETH, a, 0, EXPIRY));
+
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit AddressChanged(node, COIN_ETH, a);
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit AddrChanged(node, target);
+
+        vm.prank(relayer);
+        registry.setAddrWithSignature(node, COIN_ETH, a, EXPIRY, holder, sig);
+
+        assertEq(registry.addr(node), target, "the legacy ETH-only reader sees it");
+        assertEq(registry.addr(node, COIN_ETH), a, "and so does the multicoin one");
+        assertEq(registry.nonces(node), 1, "the relayer's write spent the nonce");
+    }
+
+    /// The control on the one above. #13 removed a check on the SUBMITTER, not
+    /// the check on the SIGNER: a stranger who signs for their own key is still
+    /// refused, because the signature is what authorises the write.
+    function test_SetAddrWithSignature_AStrangerSubmitterIsStillRefusedWithoutTheHoldersSignature() public {
+        bytes32 node = _register("venue", holder);
+        (address stranger, uint256 strangerKey) = makeAddrAndKey("stranger");
+
+        bytes memory sig = _sign(strangerKey, _addrDigest(node, COIN_BTC, BTC_A, 0, EXPIRY));
+
+        vm.prank(stranger);
+        vm.expectRevert(_unauthorized(node));
+        registry.setAddrWithSignature(node, COIN_BTC, BTC_A, EXPIRY, stranger, sig);
+
+        assertEq(registry.addr(node, COIN_BTC), "", "nothing written");
+        assertEq(registry.nonces(node), 0, "and nothing spent");
     }
 
     /*//////////////////////////////////////////////////////////////
