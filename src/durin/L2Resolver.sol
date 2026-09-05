@@ -98,8 +98,14 @@ contract L2Resolver is
         address signer,
         bytes calldata signature
     ) public unexpiredSignature(expiration) {
+        // WoCo modification (found reviewing PR #8): this is the only one of the four
+        // signed setters that packs TWO dynamic fields, and `abi.encodePacked` records
+        // no boundary between them — a signature over ("url", "https://a") is byte-for-byte
+        // a signature over ("ur", "lhttps://a"), so a holder's signature for one key could
+        // be replayed to write any key formed by sliding that split. `abi.encode` length-
+        // prefixes each string, which pins the split the holder actually signed.
         bytes32 sigHash = keccak256(
-            abi.encodePacked(address(this), node, key, value, expiration)
+            abi.encode(address(this), node, key, value, expiration)
         ).toEthSignedMessageHash();
 
         if (
