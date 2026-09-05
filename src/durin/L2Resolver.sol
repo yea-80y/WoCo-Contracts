@@ -162,7 +162,18 @@ contract L2Resolver is
             nonces[node]++;
         }
 
-        setAddr(node, coinType, a);
+        // Manually update storage since `setAddr()` on the inherited contract
+        // carries `authorised(node)`, which checks `msg.sender` — the relayer —
+        // and not the signer; #13. Mirrors `AddrResolver.setAddr` exactly,
+        // event order included, so a relayed write is indistinguishable from a
+        // direct one to any indexer.
+        emit AddressChanged(node, coinType, a);
+        // 60 is `COIN_TYPE_ETH`, which is `private` in `AddrResolver` and so
+        // cannot be named from here.
+        if (coinType == 60) {
+            emit AddrChanged(node, bytesToAddress(a));
+        }
+        versionable_addresses[recordVersions[node]][node][coinType] = a;
     }
 
     function setTextWithSignature(
