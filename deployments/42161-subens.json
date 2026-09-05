@@ -1,0 +1,16 @@
+{
+  "contract": "SubENSRegistry",
+  "chainId": 42161,
+  "parentName": "woco.eth",
+  "baseNode": "0x616c19dee44e200629c0e4918ca0fe2f6e85100ea0b354c4f888e11c07a9006f",
+  "l2Registry": "0x8630000177d44ec12e4752Ae0C8b26390d30A2B6",
+  "l2RegistryImpl": "0x172031e6a8428617b05f2002e0e278bb8fb3ed8a",
+  "wocoRegistrar": "0xACfe7c02909a5c1eB64aE5aA10D18618323403a2",
+  "registryAdmin": "0xD26abFb5fBd37eFBD876e87cB169286eF0f14BA2",
+  "registrarOwner": "0xD26abFb5fBd37eFBD876e87cB169286eF0f14BA2",
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "authorisedSponsor": "0x7b318c46a6FDC544212ebd83335f6b7414A97925",
+  "platformSigner": "0x7b318c46a6FDC544212ebd83335f6b7414A97925",
+  "arbiscan": "https://arbiscan.io/address/0x8630000177d44ec12e4752ae0c8b26390d30a2b6",
+  "note": "MAINNET woco.eth registry (Arbitrum One), deployed from OUR L2Registry impl (#440 tripwire); admin roles on the #420 Safe, no ALLOW_EOA_ADMIN. Receipts: broadcast/DeploySubEnsRegistry.s.sol/42161/"
+}
