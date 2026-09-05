@@ -345,14 +345,19 @@ contract L2RegistryReleaseWithSignatureTest is Test {
     }
 
     /// The one collision that would have been real without a domain tag: a
-    /// holder who signs "clear my contenthash" (empty bytes) packs exactly
-    /// `(registry, node, expiration)` — the same bytes a naive release message
-    /// would have. Proven both ways: the setter accepts that signature, the
-    /// release refuses it; and a release signature cannot clear a contenthash.
+    /// holder who signs "clear my contenthash" (empty bytes) once PACKED to
+    /// exactly `(registry, node, expiration)` — the same bytes a naive release
+    /// message would have. WoCo-Contracts #10 has since moved that setter to
+    /// `abi.encode` with the chain id and the node's nonce folded in, so the two
+    /// messages no longer come close; the digest below is rebuilt to the setter's
+    /// current formula, and the property it pins is unchanged. Proven both ways:
+    /// the setter accepts that signature, the release refuses it; and a release
+    /// signature cannot clear a contenthash.
     function test_ReleaseWithSignature_AContenthashClearSignatureCannotRelease() public {
         bytes32 node = _register("venue", holder);
-        bytes32 clearDigest = keccak256(abi.encodePacked(address(registry), node, bytes(""), EXPIRY))
-            .toEthSignedMessageHash();
+        bytes32 clearDigest = keccak256(
+            abi.encode(address(registry), block.chainid, node, bytes(""), registry.nonces(node), EXPIRY)
+        ).toEthSignedMessageHash();
         bytes memory clearSig = _sign(HOLDER_KEY, clearDigest);
 
         vm.prank(relayer);

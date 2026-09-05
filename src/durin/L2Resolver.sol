@@ -47,6 +47,36 @@ contract L2Resolver is
         );
 
     /*//////////////////////////////////////////////////////////////
+                            STATE VARIABLES
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice How many signed record writes a name has already consumed. Part
+    ///         of the message every `*WithSignature` setter verifies, and bumped
+    ///         by each of them.
+    ///
+    /// @dev WoCo addition (WoCo-Contracts #10). WHY IT EXISTS: without it a
+    ///      signature stayed valid until its `expiration`, and the calldata that
+    ///      carried it is public — so anyone could resubmit a used signature and
+    ///      re-apply the record the holder had since changed. Folding this
+    ///      counter into the preimage is what makes a used signature dead: the
+    ///      message the holder signed names the counter value it was signed at,
+    ///      and that value is gone the moment the signature lands.
+    ///
+    ///      WHY PER NAME rather than per signer: the history being protected
+    ///      belongs to the NAME. A name changes hands — sold, released and
+    ///      re-minted, reassigned by `adminTransfer` — and its records travel
+    ///      with it, so the replay window that matters is "against this node",
+    ///      not "by this key". A per-signer counter would leave a previous
+    ///      holder's unspent signatures live against the name after it moved.
+    ///
+    ///      WHY IT IS NEVER RESET — not by `release`, not by a re-mint of the
+    ///      same label, not by `clearRecords`: monotonic is the whole guarantee.
+    ///      If any of those put it back to zero, a signature from a previous
+    ///      holder's era would line up with a later counter value and become
+    ///      live again against a name they no longer hold. Only ever `++`.
+    mapping(bytes32 node => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
 
@@ -68,6 +98,35 @@ contract L2Resolver is
                             PUBLIC FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev THE PREIMAGE ALL FOUR SIGNED SETTERS SHARE, stated once here rather
+    ///      than four times below (WoCo, WoCo-Contracts #10):
+    ///
+    ///        keccak256(abi.encode(
+    ///            address(this), block.chainid, node,
+    ///            <this setter's record fields, in its parameter order>,
+    ///            nonces[node], expiration
+    ///        )).toEthSignedMessageHash()
+    ///
+    ///      `block.chainid`: a CREATE address is a function of the deployer and
+    ///      its nonce only, so the same deployer can land a clone at the same
+    ///      address on two chains — `address(this)` alone does not say WHICH
+    ///      chain, and a signature made on testnet would otherwise be
+    ///      submittable on mainnet.
+    ///      `nonces[node]`: see the mapping above; it is what kills a used
+    ///      signature. `abi.encode` rather than `abi.encodePacked` for all four:
+    ///      packing gives dynamic fields no boundary (the text setter's finding,
+    ///      documented at that setter), and one uniform formula is one thing for
+    ///      every client to implement rather than four near-misses.
+    ///
+    ///      All four read the counter into a local `nonce` before hashing, which
+    ///      is the same value in the same position — two of them are otherwise
+    ///      one stack slot too deep for the legacy codegen pipeline, and having
+    ///      the four differ in shape would invite the reader to look for a
+    ///      difference in meaning.
+    ///
+    ///      This contract is deployed as an unpatchable EIP-1167 clone, so this
+    ///      formula is frozen from the mainnet deploy onward. The pinned-digest
+    ///      tests in test/L2ResolverSignatureNonce.t.sol are the reference.
     function setAddrWithSignature(
         bytes32 node,
         uint256 coinType,
@@ -76,8 +135,17 @@ contract L2Resolver is
         address signer,
         bytes calldata signature
     ) public unexpiredSignature(expiration) {
+        uint256 nonce = nonces[node];
         bytes32 sigHash = keccak256(
-            abi.encodePacked(address(this), node, coinType, a, expiration)
+            abi.encode(
+                address(this),
+                block.chainid,
+                node,
+                coinType,
+                a,
+                nonce,
+                expiration
+            )
         ).toEthSignedMessageHash();
 
         if (
@@ -85,6 +153,13 @@ contract L2Resolver is
             !universalSignatureValidator.isValidSig(signer, sigHash, signature)
         ) {
             revert Unauthorized(node);
+        }
+
+        // Spend the nonce the signature named. No separate "nonce used" error:
+        // a stale or wrong-nonce signature simply hashes to a different message,
+        // fails `isValidSig` above, and comes out as `Unauthorized(node)`.
+        unchecked {
+            nonces[node]++;
         }
 
         setAddr(node, coinType, a);
@@ -98,14 +173,26 @@ contract L2Resolver is
         address signer,
         bytes calldata signature
     ) public unexpiredSignature(expiration) {
-        // WoCo modification (found reviewing PR #8): this is the only one of the four
-        // signed setters that packs TWO dynamic fields, and `abi.encodePacked` records
-        // no boundary between them — a signature over ("url", "https://a") is byte-for-byte
-        // a signature over ("ur", "lhttps://a"), so a holder's signature for one key could
-        // be replayed to write any key formed by sliding that split. `abi.encode` length-
-        // prefixes each string, which pins the split the holder actually signed.
+        // WoCo modification (found reviewing PR #8): this setter is the sharpest
+        // case for `abi.encode`, because it is the only one of the four that puts
+        // TWO dynamic fields in the preimage, and `abi.encodePacked` records no
+        // boundary between them — a signature over ("url", "https://a") is
+        // byte-for-byte a signature over ("ur", "lhttps://a"), so a holder's
+        // signature for one key could be replayed to write any key formed by
+        // sliding that split. `abi.encode` length-prefixes each string, which pins
+        // the split the holder actually signed. All four setters encode this way
+        // now (#10); see the formula above `setAddrWithSignature`.
+        uint256 nonce = nonces[node];
         bytes32 sigHash = keccak256(
-            abi.encode(address(this), node, key, value, expiration)
+            abi.encode(
+                address(this),
+                block.chainid,
+                node,
+                key,
+                value,
+                nonce,
+                expiration
+            )
         ).toEthSignedMessageHash();
 
         if (
@@ -113,6 +200,12 @@ contract L2Resolver is
             !universalSignatureValidator.isValidSig(signer, sigHash, signature)
         ) {
             revert Unauthorized(node);
+        }
+
+        // Spend the nonce the signature named; a stale one now reverts
+        // `Unauthorized(node)` from the check above.
+        unchecked {
+            nonces[node]++;
         }
 
         // Manually update storage since `setText()` on the inherited contract cannot be called internally
@@ -127,8 +220,16 @@ contract L2Resolver is
         address signer,
         bytes calldata signature
     ) public unexpiredSignature(expiration) {
+        uint256 nonce = nonces[node];
         bytes32 sigHash = keccak256(
-            abi.encodePacked(address(this), node, hash, expiration)
+            abi.encode(
+                address(this),
+                block.chainid,
+                node,
+                hash,
+                nonce,
+                expiration
+            )
         ).toEthSignedMessageHash();
 
         if (
@@ -136,6 +237,12 @@ contract L2Resolver is
             !universalSignatureValidator.isValidSig(signer, sigHash, signature)
         ) {
             revert Unauthorized(node);
+        }
+
+        // Spend the nonce the signature named; a stale one now reverts
+        // `Unauthorized(node)` from the check above.
+        unchecked {
+            nonces[node]++;
         }
 
         // Manually update storage since `setContenthash()` on the inherited contract cannot be called internally
@@ -151,8 +258,17 @@ contract L2Resolver is
         address signer,
         bytes calldata signature
     ) public unexpiredSignature(expiration) {
+        uint256 nonce = nonces[node];
         bytes32 sigHash = keccak256(
-            abi.encodePacked(address(this), node, contentType, data, expiration)
+            abi.encode(
+                address(this),
+                block.chainid,
+                node,
+                contentType,
+                data,
+                nonce,
+                expiration
+            )
         ).toEthSignedMessageHash();
 
         if (
@@ -160,6 +276,12 @@ contract L2Resolver is
             !universalSignatureValidator.isValidSig(signer, sigHash, signature)
         ) {
             revert Unauthorized(node);
+        }
+
+        // Spend the nonce the signature named; a stale one now reverts
+        // `Unauthorized(node)` from the check above.
+        unchecked {
+            nonces[node]++;
         }
 
         // Content types must be powers of 2
