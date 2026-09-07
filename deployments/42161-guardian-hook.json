@@ -1,0 +1,16 @@
+{
+  "contract": "WoCoGuardianHook",
+  "chainId": 42161,
+  "address": "0xF43524473EBC651969BeCc748462ED27ed39d4Db",
+  "deployedVia": "CREATE2 deterministic-deployment proxy 0x4e59b44847b379578588920cA78FbF26c0B4956C",
+  "salt": "0x768b330ef2688febb8545cb54b3f30bd9e0b8ac11f6a5cc864ed272de4f43a9c",
+  "saltPreimage": "woco/recovery/guardian-hook/v1",
+  "creationCodeHash": "0xfb995fafc78ca4198ffe4f6f26319789e50703b4630173137acb2c7ea353e057",
+  "deployTx": "0xcb5d5bfdb6693b4e9c4f78e5fe33a5eedc72b1ecd010ed90b3fd0053c2642051",
+  "deployBlock": 502832530,
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "deployerRole": "gas only — the contract has no owner, admin or upgrade path",
+  "arbiscan": "https://arbiscan.io/address/0xf43524473ebc651969becc748462ed27ed39d4db",
+  "verified": true,
+  "note": "MAINNET twin of the 421614 singleton — same salt + creationCode hash → same address; runtime codehash checked identical on both chains at deploy (2026-09-07 23:16 UTC). Deployed for WoCo-Event-App #489 (Kernel move to Arbitrum One); security review verdict on #489 = deploy as-is. Bytecode unchanged since the 2026-08-22 Sepolia deploy (#164)."
+}
