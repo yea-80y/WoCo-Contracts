@@ -279,19 +279,43 @@ contract LedgerHandler is Test {
 
     /// The replay that isolates the nonce. `replaySpentSignature` is mostly refused
     /// because the slot's owner has changed, which says nothing about the nonce.
-    /// Here the recipient hands the slot BACK to the signer through the holder path
-    /// while the deadline still holds, so the spent signature differs from a valid
-    /// one ONLY in its consumed nonce.
-    function replayAfterRoundTrip(address submitter) external {
-        if (!hasSpent) return;
-        SpentSignature memory s = lastSpent;
-        if (block.timestamp > s.deadline) return;
-        if (seenSlotOwner[s.eventId][s.slot] != s.to) return;
+    /// Here a fresh signed move is spent, the recipient hands the slot BACK to the
+    /// signer through the holder path, and the spent signature is handed in again
+    /// inside its deadline — so it differs from a valid one ONLY in its consumed nonce.
+    ///
+    /// The whole sequence runs in this one call (WoCo-Contracts #18). Built from
+    /// `lastSpent`, it needed a signed move whose 1-hour deadline and slot both
+    /// survived until this action was picked, while `warp` jumps up to 30 days — and
+    /// some seeds never got one in 64 runs, failing the coverage check in afterInvariant.
+    function replayAfterRoundTrip(uint256 pick, uint256 toSeed, address submitter) external {
+        uint256 n = actorSlotEvent.length;
+        if (n == 0) return;
+        uint256 i = bound(pick, 0, n - 1);
+        bytes32 id = actorSlotEvent[i];
+        uint256 slot = actorSlotIndex[i];
+
+        address from = seenSlotOwner[id][slot];
+        uint256 key = keyOf[from];
+        if (key == 0) return; // moved to a fuzzed owner by the holder path
+        uint256 t = bound(toSeed, 0, actorKeys.length - 1);
+        address to = vm.addr(actorKeys[t]);
+        if (to == from) to = vm.addr(actorKeys[(t + 1) % actorKeys.length]);
         if (submitter == address(0)) submitter = address(0xCAFE);
 
-        vm.prank(s.to);
-        try ledger.transferSlot(s.eventId, s.slot, s.from) {
-            seenSlotOwner[s.eventId][s.slot] = s.from;
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _sign(key, ledger.transferSlotDigest(id, slot, to, deadline));
+
+        vm.prank(submitter);
+        try ledger.transferSlotWithSignature(id, slot, to, deadline, sig) {
+            seenSlotOwner[id][slot] = to;
+            signedTransfersMade++;
+        } catch {
+            return;
+        }
+
+        vm.prank(to);
+        try ledger.transferSlot(id, slot, from) {
+            seenSlotOwner[id][slot] = from;
             transfersMade++;
         } catch {
             return;
@@ -299,7 +323,7 @@ contract LedgerHandler is Test {
 
         nonceOnlyReplays++;
         vm.prank(submitter);
-        try ledger.transferSlotWithSignature(s.eventId, s.slot, s.to, s.deadline, s.sig) {
+        try ledger.transferSlotWithSignature(id, slot, to, deadline, sig) {
             unauthorisedTransferSucceeded = true;
         } catch {}
     }
