@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /**
  * @title WoCoTicketLedger
@@ -103,16 +105,22 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
  *
  * ── No reentrancy guard, deliberately ────────────────────────────────────────
  *
- * There is not a single external call in this contract — no token transfers,
- * no gate callback, no hook. Nothing here can re-enter, so there is no guard,
- * and its absence is the accurate signal. WoCoEventV2 needed `ReentrancyGuard`
- * because it moved ERC-20 and invoked an organiser-supplied gate; both are
- * gone. Carrying the guard anyway would cost gas on the hottest path and imply
- * a hazard an auditor would then waste time hunting for.
+ * This contract never calls another contract — no token transfers, no gate
+ * callback, no hook. Nothing here can re-enter, so there is no guard, and its
+ * absence is the accurate signal. WoCoEventV2 needed `ReentrancyGuard` because
+ * it moved ERC-20 and invoked an organiser-supplied gate; both are gone.
+ * Carrying the guard anyway would cost gas on the hottest path and imply a
+ * hazard an auditor would then waste time hunting for.
+ *
+ * The one call of any kind is the `ecrecover` precompile inside the signature
+ * check of `transferSlotWithSignature`. A precompile runs no contract code and
+ * cannot re-enter. Keeping it that way is why that function accepts plain
+ * (EOA) signatures only: an ERC-1271 path would have to call the signer's
+ * contract, and would be the first call out of this ledger.
  *
  * Slot indices are 0-based (matches v1 and V2).
  */
-contract WoCoTicketLedger is Ownable2Step {
+contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// Packed layout — 3 storage slots (V2 used 5).
     ///
     /// Slot 0: totalSupply(64) + nextSlot(64) + eventEndTs(64) + exists(8) + cancelled(8)
@@ -157,6 +165,20 @@ contract WoCoTicketLedger is Ownable2Step {
     /// WoCoPayments once it ships; any future sponsor contract after that.
     mapping(address => bool) public authorisedSponsors;
 
+    /// Per-slot counter consumed by EVERY ownership change, on either transfer
+    /// path. A signed transfer commits to its current value, so a signature is
+    /// dead once used and dead once the slot moves any other way — including a
+    /// round trip back to the signer, after which (from, to, deadline) alone
+    /// would validate again.
+    mapping(bytes32 => mapping(uint256 => uint256)) public transferNonces;
+
+    /// EIP-712 type a holder signs to move a slot (domain: "WoCoTicketLedger",
+    /// version "1", this chain, this contract). `from` and `nonce` are read from
+    /// storage at submission, never supplied by the submitter.
+    bytes32 public constant TRANSFER_SLOT_TYPEHASH = keccak256(
+        "TransferSlot(bytes32 eventId,uint256 slot,address from,address to,uint256 nonce,uint256 deadline)"
+    );
+
     // ── Events ────────────────────────────────────────────────────────────────
 
     event Registered(
@@ -176,7 +198,8 @@ contract WoCoTicketLedger is Ownable2Step {
         bytes32 orderRef
     );
 
-    /// @notice A claimed slot changed hands. Emitted ONLY by `transferSlot`.
+    /// @notice A claimed slot changed hands. Emitted ONLY by the two transfer
+    ///         paths, `transferSlot` and `transferSlotWithSignature`, identically.
     /// @dev Indexers MUST fold this over `SlotClaimed`: after a transfer the
     ///      current holder is no longer the address in the original claim log.
     ///      It is also the invalidation signal for anything holding a SNAPSHOT
@@ -211,6 +234,7 @@ contract WoCoTicketLedger is Ownable2Step {
     error SlotUnclaimed();
     error NotSlotOwner();
     error TransferToSelf();
+    error SignatureExpired();
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -226,7 +250,10 @@ contract WoCoTicketLedger is Ownable2Step {
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
-    constructor(address initialOwner, address initialSponsor) Ownable(initialOwner) {
+    constructor(address initialOwner, address initialSponsor)
+        Ownable(initialOwner)
+        EIP712("WoCoTicketLedger", "1")
+    {
         if (initialSponsor == address(0)) revert ZeroAddress();
 
         disputeAuthority = initialOwner;
@@ -377,28 +404,36 @@ contract WoCoTicketLedger is Ownable2Step {
     // ── Cancellation ──────────────────────────────────────────────────────────
 
     /**
-     * @notice Move a claimed slot to a new owner. THE SLOT'S OWNER ONLY.
+     * @notice Move a claimed slot to a new owner. THE SLOT'S OWNER ONLY — who
+     *         either sends this call, or signs a message naming the recipient
+     *         that anyone may submit (`transferSlotWithSignature`).
      *
      * @dev Without this a slot's owner is permanent, so a ticket can never
      *      change hands — no resale, no gifting, no correcting a mis-delivered
      *      ticket — and this contract cannot be upgraded after deploy. That is
      *      why it is here rather than in a successor.
      *
-     *      HOLDER-ONLY, AND THAT IS THE POINT. No sponsor path, no
+     *      HOLDER-AUTHORISED, AND THAT IS THE POINT. No sponsor path, no
      *      operator/approval model, no batch form. The sponsor is a hot key
      *      that mints on every sale, and the guarantee this contract is built
      *      to keep is that such a key can only ever APPEND. A transfer the
-     *      current owner authorises does not touch that: `msg.sender` is the
-     *      only authority consulted, and the sponsor gains nothing here.
+     *      current owner authorises does not touch that. The holder is the only
+     *      authority either path consults — here as `msg.sender`; in
+     *      `transferSlotWithSignature` as the signer of a message that NAMES
+     *      the recipient — so whoever submits gains nothing: it cannot choose
+     *      the recipient, reuse the signature, or act without one. A "to
+     *      whoever pays" form, in which the submitter picks the recipient, is
+     *      the approval model this contract deliberately omits.
      *
      *      A PLATFORM-AUTHORISED TRANSFER WAS CONSIDERED AND REJECTED. It would
      *      let the platform move a ticket for a buyer whose key it had
      *      discarded — convenient, and the reason it was raised — but it grants
      *      custody of every ticket ever minted to the most exposed key in the
-     *      system, permanently and unrevokeably. The same outcome is reachable
-     *      off chain by RETAINING the buyer's key until they claim it, which is
-     *      bounded, deletable, and leaves this contract saying only "the owner
-     *      may move it".
+     *      system, permanently and unrevokeably. Retaining buyers' keys to reach
+     *      the same outcome off chain was rejected too (WoCo-Event-App #298,
+     *      owner decision 2026-09-13): a ticket minted to a key nobody holds
+     *      stays where it is. Tickets meant to move must be minted to a key
+     *      their holder controls.
      *
      *      ⚠️ THIS SHRINKS THE OFFLINE CHECK-IN PACK'S SOUNDNESS WINDOW, and
      *      the door is the consumer that assumed permanence. The pack snapshots
@@ -437,17 +472,121 @@ contract WoCoTicketLedger is Ownable2Step {
      *                 impossible.
      */
     function transferSlot(bytes32 eventId, uint256 slot, address newOwner) external {
+        _transfer(eventId, slot, msg.sender, newOwner);
+    }
+
+    /**
+     * @notice Move a claimed slot on its owner's SIGNATURE, so that whoever
+     *         submits the transaction — the platform, or anyone — pays the gas.
+     *
+     * @dev WHY IT EXISTS. `transferSlot` authorises by `msg.sender`, so the
+     *      holder must send it and pay for it. Ticket-holding keys are plain
+     *      EOAs — the door verifies with `ecrecover`, which a smart account
+     *      cannot satisfy — and a paymaster sponsors smart-account operations,
+     *      not a plain key's transaction. A holder with no gas could therefore
+     *      never move a ticket. Same reason as `L2Registry.releaseWithSignature`
+     *      (WoCo-Event-App #464). This contract is immutable, so it had to
+     *      exist before deploy or never.
+     *
+     *      WHAT IT DOES NOT ADD: power for the submitter. The signed message
+     *      names the recipient; a submitter can deliver exactly what the holder
+     *      signed or decline to, never redirect it. See `transferSlot` for why
+     *      there is no form in which the submitter picks the recipient.
+     *
+     *      WHAT THE SIGNATURE COMMITS TO: `TransferSlot(eventId, slot, from, to,
+     *      nonce, deadline)` under the EIP-712 domain ("WoCoTicketLedger", "1",
+     *      chain id, this contract). `from` and `nonce` come from storage, so a
+     *      signature counts only while its signer holds the slot, and only
+     *      until the slot next moves by EITHER path (`transferNonces`). The
+     *      domain stops it being replayed on another chain or deployment.
+     *
+     *      EOA SIGNATURES ONLY, deliberately — see "No reentrancy guard" in the
+     *      contract header. A slot held by a contract account moves through
+     *      `transferSlot`, called by that account. OpenZeppelin's
+     *      `ECDSA.recoverCalldata` (reads the signature straight from calldata,
+     *      no memory copy) rejects malformed and malleable (high-s) signatures
+     *      and never returns address(0), which no slot owner can be.
+     *
+     *      ERRORS. A wrong field, a wrong domain, a stale nonce or a non-holder's
+     *      key all recover to some other address and revert `NotSlotOwner`; there
+     *      is no separate invalid-signature error. A client can check before
+     *      submitting by recovering its signature locally against
+     *      `transferSlotDigest`. Malformed and high-s signatures revert with
+     *      OpenZeppelin's `ECDSAInvalidSignature*` errors.
+     *
+     *      NO REVOCATION, deliberately (owner decision 2026-09-13). An unsubmitted
+     *      signature cannot be cancelled on chain except by moving the slot, which
+     *      consumes the nonce. Signatures are meant to be created at the moment of
+     *      use, submitted straight away, and given short deadlines, so an unused
+     *      one simply lapses. Do not build a flow in which someone holds a
+     *      signature to submit later.
+     *
+     *      Everything `transferSlot` documents — the check-in pack window,
+     *      provenance, cancellation and `eventEndTs`, contract recipients —
+     *      applies unchanged: both paths share `_transfer`.
+     *
+     * @param eventId   The event the slot belongs to.
+     * @param slot      Zero-based slot index.
+     * @param newOwner  The recipient named in the signed message.
+     * @param deadline  Unix seconds; the signature is void after it.
+     * @param signature The holder's signature over
+     *                  `transferSlotDigest(eventId, slot, newOwner, deadline)`.
+     */
+    function transferSlotWithSignature(
+        bytes32 eventId,
+        uint256 slot,
+        address newOwner,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        if (block.timestamp > deadline) revert SignatureExpired();
+        address signer = ECDSA.recoverCalldata(transferSlotDigest(eventId, slot, newOwner, deadline), signature);
+        _transfer(eventId, slot, signer, newOwner);
+    }
+
+    /**
+     * @notice The EIP-712 digest a holder signs to authorise
+     *         `transferSlotWithSignature(eventId, slot, newOwner, deadline, …)`.
+     * @dev Bound to the slot's CURRENT owner and nonce, so it changes whenever
+     *      the slot moves. Wallets that sign typed data build the same struct
+     *      themselves; this view serves signers of a raw digest and lets tests
+     *      pin the encoding.
+     */
+    function transferSlotDigest(bytes32 eventId, uint256 slot, address newOwner, uint256 deadline)
+        public
+        view
+        returns (bytes32)
+    {
+        return _hashTypedDataV4(
+            keccak256(
+                abi.encode(
+                    TRANSFER_SLOT_TYPEHASH,
+                    eventId,
+                    slot,
+                    slots[eventId][slot].owner,
+                    newOwner,
+                    transferNonces[eventId][slot],
+                    deadline
+                )
+            )
+        );
+    }
+
+    /// @dev The move both transfer paths share. `authority` is what the calling
+    ///      path proved: `msg.sender` for `transferSlot`, the recovered signer
+    ///      for `transferSlotWithSignature`. Neither can be address(0).
+    function _transfer(bytes32 eventId, uint256 slot, address authority, address newOwner) internal {
         if (newOwner == address(0)) revert ZeroAddress();
 
         Slot storage sd = slots[eventId][slot];
         address previousOwner = sd.owner;
 
         // Distinct selector from NotSlotOwner on purpose. Holder-only auth
-        // already subsumes this (address(0) can never be msg.sender), but a
+        // already subsumes this (address(0) is never an authority), but a
         // guard no test can tell apart from another is a guard that reads as
         // deletable. Separate errors keep each one independently killable.
         if (previousOwner == address(0)) revert SlotUnclaimed();
-        if (msg.sender != previousOwner) revert NotSlotOwner();
+        if (authority != previousOwner) revert NotSlotOwner();
 
         // `from == to` writes nothing yet would still emit SlotTransferred —
         // and the log shape IS the API here, so a phantom transfer is something
@@ -463,6 +602,8 @@ contract WoCoTicketLedger is Ownable2Step {
         // re-points this slot's claimer/orderRef at batch 0's real data — a
         // live misattribution, not zero values.
         sd.owner = newOwner;
+        // Consumed by every move, on either path — see `transferNonces`.
+        unchecked { ++transferNonces[eventId][slot]; }
 
         emit SlotTransferred(eventId, slot, previousOwner, newOwner);
     }
