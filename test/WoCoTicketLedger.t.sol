@@ -827,7 +827,9 @@ contract WoCoTicketLedgerTest is Test {
     // Slots used to be permanent, which foreclosed resale entirely. The guard
     // that matters is that opening transfer did NOT open it to the sponsor: the
     // contract's guarantee is that a sponsor can only append, and the negative
-    // tests below are what keep that true under mutation.
+    // tests below are what keep that true under mutation. The signature path,
+    // `transferSlotWithSignature`, has its own suite:
+    // WoCoTicketLedgerSignedTransfer.t.sol.
 
     /// Claim one slot to `buyer` and hand back its index.
     function _claimOne() internal returns (bytes32 eventId, uint256 slot) {

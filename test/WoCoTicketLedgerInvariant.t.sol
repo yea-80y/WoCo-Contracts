@@ -12,10 +12,12 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * never un-handed-out and `nextSlot` only grows), within stamped supply, and
  * stamped terms never move.
  *
- * OWNERSHIP is a separate matter and is NOT permanent: `transferSlot` lets a
- * slot's holder move it. What stays true — and what the campaign proves — is
- * that nothing BUT the holder can, which is the sponsor-boundary guarantee the
- * split exists for.
+ * OWNERSHIP is a separate matter and is NOT permanent: a slot's holder can move
+ * it — by sending `transferSlot`, or by signing a move that anyone submits
+ * through `transferSlotWithSignature`. What stays true — and what the campaign
+ * proves — is that nothing BUT the holder's authority can: not a non-holder
+ * caller, not a non-holder's signature, and not a signature already spent.
+ * That is the sponsor-boundary guarantee the split exists for.
  *
  * The handler is an authorised sponsor AND the stamped organiser of every
  * event it registers, so it holds strictly MORE power than a real payments
@@ -25,10 +27,12 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * WHAT THIS CAMPAIGN DOES NOT COVER: the handler never calls
  * `forceCancelEvent`, `addSponsor`/`removeSponsor`, or `setDisputeAuthority`,
  * so these invariants say nothing about admin churn. Those paths are covered
- * by the unit suite instead.
+ * by the unit suite instead. The signature ENCODING (domain, typehash, field
+ * order) is pinned by WoCoTicketLedgerSignedTransfer.t.sol, not here: the
+ * handler signs `transferSlotDigest` exactly as the contract computes it.
  *
- * Kept in its own file because invariant campaigns are slow; the unit suite in
- * WoCoTicketLedger.t.sol runs in milliseconds and stays the fast feedback loop.
+ * Kept in its own file because invariant campaigns are slow; the unit suites
+ * run in milliseconds and stay the fast feedback loop.
  */
 contract LedgerHandler is Test {
     WoCoTicketLedger internal ledger;
@@ -48,17 +52,44 @@ contract LedgerHandler is Test {
 
     /// Slot owners observed at mint time, to prove slots are never rewritten.
     mapping(bytes32 => mapping(uint256 => address)) public seenSlotOwner;
-    /// Coverage witnesses. Both handler actions early-return on unusable input,
+    /// Coverage witnesses. Every handler action early-returns on unusable input,
     /// so "the flag stayed false" is only meaningful if attempts were actually
-    /// made — without these the new invariant passes vacuously.
+    /// made — without these the invariant passes vacuously.
     uint256 public transfersMade;
     uint256 public unauthorisedAttempts;
-    /// Set if a non-holder ever moved a slot. Must stay false.
+    uint256 public signedTransfersMade;
+    uint256 public signedUnauthorisedAttempts;
+    uint256 public replayAttempts;
+    /// Set if anything but the holder's authority ever moved a slot. Must stay false.
     bool public unauthorisedTransferSucceeded;
     mapping(bytes32 => uint256) public seenSlotCount;
 
+    /// Keys the handler can sign with. The signature path can only be exercised
+    /// on slots minted to these, so their (event, slot) pairs are kept rather
+    /// than leaving the fuzzer to find one among the fuzzed owners.
+    uint256[] internal actorKeys;
+    mapping(address => uint256) internal keyOf;
+    bytes32[] internal actorSlotEvent;
+    uint256[] internal actorSlotIndex;
+
+    /// The last signature that moved a slot, kept to replay.
+    struct SpentSignature {
+        bytes32 eventId;
+        uint256 slot;
+        address to;
+        uint256 deadline;
+        bytes   sig;
+    }
+
+    SpentSignature internal lastSpent;
+    bool internal hasSpent;
+
     constructor(WoCoTicketLedger _ledger) {
         ledger = _ledger;
+        for (uint256 k = 0xA1; k <= 0xA4; ++k) {
+            actorKeys.push(k);
+            keyOf[vm.addr(k)] = k;
+        }
     }
 
     function eventCount() external view returns (uint256) {
@@ -99,6 +130,21 @@ contract LedgerHandler is Test {
         }
     }
 
+    /// Mint to a key the handler holds, so the signature path has slots to act on.
+    function claimForActor(uint256 eventIndex, uint256 actorSeed, bytes32 orderRef) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        address actor = vm.addr(actorKeys[bound(actorSeed, 0, actorKeys.length - 1)]);
+
+        try ledger.claimFor(id, actor, orderRef) returns (uint256 slot) {
+            _recordSlot(id, slot, actor);
+            actorSlotEvent.push(id);
+            actorSlotIndex.push(slot);
+        } catch {
+            // See claimFor.
+        }
+    }
+
     function batchClaimFor(uint256 eventIndex, uint256 n, address owner, bytes32 orderRef) external {
         if (eventIds.length == 0) return;
         bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
@@ -115,7 +161,7 @@ contract LedgerHandler is Test {
         }
     }
 
-    /// Move a slot, pranking as its current owner — the only authority the
+    /// Move a slot, pranking as its current owner — the only caller the
     /// contract accepts. Ownership is tracked through the move so the invariant
     /// asserts "changed only by its owner", not "never changed".
     function transferSlot(uint256 eventIndex, uint256 slotSeed, address newOwner) external {
@@ -159,6 +205,74 @@ contract LedgerHandler is Test {
         } catch {}
     }
 
+    /// A move the current holder SIGNED, handed in by an arbitrary submitter.
+    function transferSlotSigned(uint256 pick, uint256 toSeed, address submitter) external {
+        uint256 n = actorSlotEvent.length;
+        if (n == 0) return;
+        uint256 i = bound(pick, 0, n - 1);
+        bytes32 id = actorSlotEvent[i];
+        uint256 slot = actorSlotIndex[i];
+
+        address current = seenSlotOwner[id][slot];
+        uint256 key = keyOf[current];
+        if (key == 0) return; // moved to a fuzzed owner by the holder path
+        address to = vm.addr(actorKeys[bound(toSeed, 0, actorKeys.length - 1)]);
+        if (to == current) return;
+        if (submitter == address(0)) submitter = address(0xCAFE);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _sign(key, ledger.transferSlotDigest(id, slot, to, deadline));
+
+        vm.prank(submitter);
+        try ledger.transferSlotWithSignature(id, slot, to, deadline, sig) {
+            seenSlotOwner[id][slot] = to;
+            signedTransfersMade++;
+            lastSpent = SpentSignature({eventId: id, slot: slot, to: to, deadline: deadline, sig: sig});
+            hasSpent = true;
+        } catch {
+            // See claimFor.
+        }
+    }
+
+    /// A signature from a key that does NOT hold the slot, naming itself as
+    /// recipient. Must always revert.
+    function transferSlotSignedUnauthorised(uint256 pick, uint256 signerSeed, address submitter) external {
+        uint256 n = actorSlotEvent.length;
+        if (n == 0) return;
+        uint256 i = bound(pick, 0, n - 1);
+        bytes32 id = actorSlotEvent[i];
+        uint256 slot = actorSlotIndex[i];
+
+        address current = seenSlotOwner[id][slot];
+        uint256 key = actorKeys[bound(signerSeed, 0, actorKeys.length - 1)];
+        address signer = vm.addr(key);
+        if (current == address(0) || signer == current) return;
+        if (submitter == address(0)) submitter = address(0xCAFE);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _sign(key, ledger.transferSlotDigest(id, slot, signer, deadline));
+
+        signedUnauthorisedAttempts++;
+        vm.prank(submitter);
+        try ledger.transferSlotWithSignature(id, slot, signer, deadline, sig) {
+            unauthorisedTransferSucceeded = true;
+        } catch {}
+    }
+
+    /// Hand in again the last signature that already moved a slot. The nonce it
+    /// committed to has been consumed, so it must never land a second time.
+    function replaySpentSignature(address submitter) external {
+        if (!hasSpent) return;
+        if (submitter == address(0)) submitter = address(0xCAFE);
+        SpentSignature memory s = lastSpent;
+
+        replayAttempts++;
+        vm.prank(submitter);
+        try ledger.transferSlotWithSignature(s.eventId, s.slot, s.to, s.deadline, s.sig) {
+            unauthorisedTransferSucceeded = true;
+        } catch {}
+    }
+
     function cancelEvent(uint256 eventIndex) external {
         if (eventIds.length == 0) return;
         bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
@@ -176,6 +290,11 @@ contract LedgerHandler is Test {
         seenSlotOwner[id][slot] = owner;
         uint256 c = seenSlotCount[id];
         if (slot + 1 > c) seenSlotCount[id] = slot + 1;
+    }
+
+    function _sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
+        return abi.encodePacked(r, s, v);
     }
 }
 
@@ -248,7 +367,8 @@ contract WoCoTicketLedgerInvariantTest is Test {
     /// Without this, `invariant_SlotsAreOnlyMovedByTheirOwner` would pass
     /// trivially in any campaign that never managed a transfer: the handler
     /// early-returns on unusable input, so "no unauthorised move succeeded" is
-    /// only evidence if unauthorised moves were actually attempted.
+    /// only evidence if unauthorised moves were actually attempted — on both
+    /// paths, and as a replay.
     function afterInvariant() public view {
         assertGt(handler.transfersMade(), 0, "campaign never exercised transferSlot");
         assertGt(
@@ -256,27 +376,36 @@ contract WoCoTicketLedgerInvariantTest is Test {
             0,
             "campaign never attempted an unauthorised move"
         );
+        assertGt(handler.signedTransfersMade(), 0, "campaign never exercised transferSlotWithSignature");
+        assertGt(
+            handler.signedUnauthorisedAttempts(),
+            0,
+            "campaign never attempted a signature from a non-holder"
+        );
+        assertGt(handler.replayAttempts(), 0, "campaign never replayed a spent signature");
     }
 
-    /// A slot's owner changes ONLY through a transfer its own owner authorised.
+    /// A slot's owner changes ONLY through a transfer its own owner authorised —
+    /// by sending it, or by signing it.
     ///
     /// This used to read "once a slot has an owner, that owner never changes",
-    /// and that literal form is no longer true — `transferSlot` exists so a
-    /// ticket can change hands. The sentence overstated its own purpose. What
-    /// the split protects (see the contract header) is that SPONSOR authority
+    /// and that literal form is no longer true — transfers exist so a ticket
+    /// can change hands. The sentence overstated its own purpose. What the
+    /// split protects (see the contract header) is that SPONSOR authority
     /// grants exactly one power: appending new slots, never touching existing
     /// ones. A transfer the holder authorises does not cross that boundary, and
     /// the handler holds strictly more power than a real payments contract, so
-    /// if no sponsor/organiser/clock action rewrites a slot here, none can.
+    /// if no sponsor/organiser/clock/submitter action rewrites a slot here,
+    /// none can.
     ///
-    /// The handler tracks ownership THROUGH transfers, so this still fails on
-    /// any rewrite that did not come from the holder — which is the property
-    /// that was actually load-bearing all along.
+    /// The handler tracks ownership THROUGH both transfer paths, so this still
+    /// fails on any rewrite that did not come from the holder — which is the
+    /// property that was actually load-bearing all along.
     /// forge-config: default.invariant.runs = 64
     function invariant_SlotsAreOnlyMovedByTheirOwner() public view {
         assertFalse(
             handler.unauthorisedTransferSucceeded(),
-            "a slot was moved by someone who did not hold it"
+            "a slot was moved without its holder's authority"
         );
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
