@@ -171,6 +171,8 @@ contract WoCoGuardianHookKernelTest is Test {
 
     /// @dev The fixtures ARE the code on Arbitrum One (keccak256 of `cast code <address> --block
     ///      504856734`), and the hook at its address IS this repo's source, byte for byte.
+    ///      That second assert freezes src/recovery/WoCoGuardianHook.sol, natspec included (it
+    ///      feeds the metadata hash): the deployed singleton cannot change, so its source must not.
     function test_fixtures_areTheDeployedCode() public view {
         assertEq(KERNEL_IMPL.codehash, 0xcc67e791036a8f3df40d3d0f840e7df67f3c69eae9da0a8bffec9e0f91a8db7b);
         assertEq(KERNEL_FACTORY.codehash, 0xeecde6f459d0ecadbd5b76e89de74d8187b52d5c71651fdfc007c45d4f2f3ca0);
@@ -285,8 +287,9 @@ contract WoCoGuardianHookKernelTest is Test {
 
         vm.mockCallRevert(HOOK, abi.encodeCall(WoCoGuardianHook.clearGuardians, ()), "clear refused");
         vm.prank(ENTRYPOINT);
-        (bool ok,) = KERNEL.call(APP_REMOVAL);
+        (bool ok, bytes memory ret) = KERNEL.call(APP_REMOVAL);
         assertFalse(ok);
+        assertEq(ret, bytes("clear refused"), "the clear's own revert, bubbled out of the batch");
         vm.clearMockedCalls();
 
         assertEq(_routeHook(), HOOK);
@@ -319,9 +322,10 @@ contract WoCoGuardianHookKernelTest is Test {
         _asEntryPoint(abi.encodeCall(IKernel.execute, (bytes32(0), abi.encodePacked(stranger, uint256(0), bytes("")))));
     }
 
-    /// @dev Audit Low 2 (payable hook functions): Kernel's pre-hook call forwards no value
-    ///      (HookManager.sol:18-20), and the action is non-payable under delegatecall, so ETH sent
-    ///      with a recovery call is refused outright and never reaches the hook.
+    /// @dev Audit Low 2 (payable hook functions): Kernel's preCheck receives the value only as an
+    ///      argument, with no ETH attached (HookManager.sol:18-20); the action's non-payable check
+    ///      then reverts the delegatecall (msg.value survives a delegatecall), so the ETH never
+    ///      leaves the caller and the hook never holds any.
     function test_etherSentWithRecovery_isRefused_andNeverReachesTheHook() public {
         _asEntryPoint(APP_INSTALL_G1);
         vm.deal(G1, 1 ether);

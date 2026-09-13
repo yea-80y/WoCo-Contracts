@@ -3,6 +3,10 @@ src = "src"
 out = "out"
 libs = ["lib"]
 solc = "0.8.24"
+# Pinned to the default every deployed contract here was built with, so a Foundry upgrade
+# that moves the default cannot change their bytecode (WoCoGuardianHookKernel.t.sol asserts
+# the live hook's codehash).
+evm_version = "cancun"
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "@ensdomains/ens-contracts/=lib/ens-contracts/contracts/",
