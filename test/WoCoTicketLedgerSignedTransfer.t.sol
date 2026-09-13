@@ -182,6 +182,28 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
         ledger.transferSlotWithSignature(eventId, slot2, recipient, DEADLINE, sig);
     }
 
+    /// The behavioural twin of the digest pin for `eventId`: same holder, same slot
+    /// index, a different event. The positive control proves the refusal came from
+    /// the event and nothing else.
+    function test_SubmitterCannotApplyItToAnotherEvent() public {
+        (bytes32 eventA, uint256 slotA) = _claimToHolder();
+        vm.prank(sponsor);
+        bytes32 eventB = ledger.registerEvent(organiser, SUPPLY, keccak256("manifest-B"), END_TS);
+        vm.prank(sponsor);
+        uint256 slotB = ledger.claimFor(eventB, holder, keccak256("stripe-ref-B"));
+        assertEq(slotA, slotB, "precondition: same slot index in both events");
+
+        bytes memory sig = _holderSigns(eventA, slotA, recipient, DEADLINE);
+
+        vm.prank(relayer);
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlotWithSignature(eventB, slotB, recipient, DEADLINE, sig);
+
+        vm.prank(relayer);
+        ledger.transferSlotWithSignature(eventA, slotA, recipient, DEADLINE, sig);
+        assertEq(ledger.slotOwner(eventA, slotA), recipient, "positive control");
+    }
+
     // ── only the current holder's signature counts ────────────────────────────
 
     function test_StrangerSignatureRejected() public {

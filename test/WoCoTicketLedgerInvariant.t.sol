@@ -60,6 +60,9 @@ contract LedgerHandler is Test {
     uint256 public signedTransfersMade;
     uint256 public signedUnauthorisedAttempts;
     uint256 public replayAttempts;
+    /// Replays made after the slot was handed BACK to its signer, before the
+    /// deadline — so the consumed nonce is the only thing that can refuse them.
+    uint256 public nonceOnlyReplays;
     /// Set if anything but the holder's authority ever moved a slot. Must stay false.
     bool public unauthorisedTransferSucceeded;
     mapping(bytes32 => uint256) public seenSlotCount;
@@ -76,6 +79,7 @@ contract LedgerHandler is Test {
     struct SpentSignature {
         bytes32 eventId;
         uint256 slot;
+        address from;
         address to;
         uint256 deadline;
         bytes   sig;
@@ -227,7 +231,7 @@ contract LedgerHandler is Test {
         try ledger.transferSlotWithSignature(id, slot, to, deadline, sig) {
             seenSlotOwner[id][slot] = to;
             signedTransfersMade++;
-            lastSpent = SpentSignature({eventId: id, slot: slot, to: to, deadline: deadline, sig: sig});
+            lastSpent = SpentSignature({eventId: id, slot: slot, from: current, to: to, deadline: deadline, sig: sig});
             hasSpent = true;
         } catch {
             // See claimFor.
@@ -267,6 +271,33 @@ contract LedgerHandler is Test {
         SpentSignature memory s = lastSpent;
 
         replayAttempts++;
+        vm.prank(submitter);
+        try ledger.transferSlotWithSignature(s.eventId, s.slot, s.to, s.deadline, s.sig) {
+            unauthorisedTransferSucceeded = true;
+        } catch {}
+    }
+
+    /// The replay that isolates the nonce. `replaySpentSignature` is mostly refused
+    /// because the slot's owner has changed, which says nothing about the nonce.
+    /// Here the recipient hands the slot BACK to the signer through the holder path
+    /// while the deadline still holds, so the spent signature differs from a valid
+    /// one ONLY in its consumed nonce.
+    function replayAfterRoundTrip(address submitter) external {
+        if (!hasSpent) return;
+        SpentSignature memory s = lastSpent;
+        if (block.timestamp > s.deadline) return;
+        if (seenSlotOwner[s.eventId][s.slot] != s.to) return;
+        if (submitter == address(0)) submitter = address(0xCAFE);
+
+        vm.prank(s.to);
+        try ledger.transferSlot(s.eventId, s.slot, s.from) {
+            seenSlotOwner[s.eventId][s.slot] = s.from;
+            transfersMade++;
+        } catch {
+            return;
+        }
+
+        nonceOnlyReplays++;
         vm.prank(submitter);
         try ledger.transferSlotWithSignature(s.eventId, s.slot, s.to, s.deadline, s.sig) {
             unauthorisedTransferSucceeded = true;
@@ -383,6 +414,11 @@ contract WoCoTicketLedgerInvariantTest is Test {
             "campaign never attempted a signature from a non-holder"
         );
         assertGt(handler.replayAttempts(), 0, "campaign never replayed a spent signature");
+        assertGt(
+            handler.nonceOnlyReplays(),
+            0,
+            "campaign never replayed a spent signature with only the nonce standing"
+        );
     }
 
     /// A slot's owner changes ONLY through a transfer its own owner authorised —

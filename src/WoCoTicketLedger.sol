@@ -432,8 +432,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      system, permanently and unrevokeably. Retaining buyers' keys to reach
      *      the same outcome off chain was rejected too (WoCo-Event-App #298,
      *      owner decision 2026-09-13): a ticket minted to a key nobody holds
-     *      stays where it is. Tickets meant to move are minted to a key their
-     *      holder controls.
+     *      stays where it is. Tickets meant to move must be minted to a key
+     *      their holder controls.
      *
      *      ⚠️ THIS SHRINKS THE OFFLINE CHECK-IN PACK'S SOUNDNESS WINDOW, and
      *      the door is the consumer that assumed permanence. The pack snapshots
@@ -503,8 +503,23 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      EOA SIGNATURES ONLY, deliberately — see "No reentrancy guard" in the
      *      contract header. A slot held by a contract account moves through
      *      `transferSlot`, called by that account. OpenZeppelin's
-     *      `ECDSA.recover` rejects malformed and malleable (high-s) signatures
+     *      `ECDSA.recoverCalldata` (reads the signature straight from calldata,
+     *      no memory copy) rejects malformed and malleable (high-s) signatures
      *      and never returns address(0), which no slot owner can be.
+     *
+     *      ERRORS. A wrong field, a wrong domain, a stale nonce or a non-holder's
+     *      key all recover to some other address and revert `NotSlotOwner`; there
+     *      is no separate invalid-signature error. A client can check before
+     *      submitting by recovering its signature locally against
+     *      `transferSlotDigest`. Malformed and high-s signatures revert with
+     *      OpenZeppelin's `ECDSAInvalidSignature*` errors.
+     *
+     *      NO REVOCATION, deliberately (owner decision 2026-09-13). An unsubmitted
+     *      signature cannot be cancelled on chain except by moving the slot, which
+     *      consumes the nonce. Signatures are meant to be created at the moment of
+     *      use, submitted straight away, and given short deadlines, so an unused
+     *      one simply lapses. Do not build a flow in which someone holds a
+     *      signature to submit later.
      *
      *      Everything `transferSlot` documents — the check-in pack window,
      *      provenance, cancellation and `eventEndTs`, contract recipients —
@@ -525,7 +540,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         bytes calldata signature
     ) external {
         if (block.timestamp > deadline) revert SignatureExpired();
-        address signer = ECDSA.recover(transferSlotDigest(eventId, slot, newOwner, deadline), signature);
+        address signer = ECDSA.recoverCalldata(transferSlotDigest(eventId, slot, newOwner, deadline), signature);
         _transfer(eventId, slot, signer, newOwner);
     }
 
