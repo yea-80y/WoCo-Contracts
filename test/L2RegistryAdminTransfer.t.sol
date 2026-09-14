@@ -2,9 +2,9 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
-import {L2RegistryFactory} from "../src/durin/L2RegistryFactory.sol";
 
 /**
  * Tests for `L2Registry.adminTransfer` — the governed reassignment added to the
@@ -20,9 +20,8 @@ import {L2RegistryFactory} from "../src/durin/L2RegistryFactory.sol";
  *    under a published policy."
  */
 contract L2RegistryAdminTransferTest is Test {
-    L2RegistryFactory factory;
-    L2Registry        registry;
-    WoCoRegistrar     registrar;
+    L2Registry    registry;
+    WoCoRegistrar registrar;
 
     address admin     = makeAddr("admin");
     address sponsor   = makeAddr("sponsor");
@@ -39,11 +38,9 @@ contract L2RegistryAdminTransferTest is Test {
     event VersionChanged(bytes32 indexed node, uint64 newVersion);
 
     function setUp() public {
-        L2Registry impl = new L2Registry();
-        factory = new L2RegistryFactory(address(impl));
-
-        vm.prank(admin);
-        registry = L2Registry(factory.deployRegistry("woco.eth", "WoCo Names", "", admin));
+        // The production shape: our implementation, cloned, initialised.
+        registry = L2Registry(Clones.clone(address(new L2Registry())));
+        registry.initialize("woco.eth", "WoCo Names", "", admin);
 
         registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
 

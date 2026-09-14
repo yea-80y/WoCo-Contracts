@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Script, console} from "forge-std/Script.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
 
@@ -21,12 +22,16 @@ import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
 ///        REGISTRAR_ADMIN       — the Safe. Owns the registrar from construction.
 ///      Optional env:
 ///        PREVIOUS_REGISTRAR    — the registrar being replaced. When set it must
-///                                be enrolled in this registry, and its
-///                                retirement is part of the printed batch.
+///                                be enrolled in this registry and owned by the
+///                                registry admin, and its retirement is part of
+///                                the printed batch.
 ///
 /// WHY THE RETIREMENT IS PART OF THE BATCH (audit 927 M2). v1 only printed a
-/// reminder to remove the previous registrar, so a redeploy could leave it — and
-/// its sponsor — able to mint and repoint names indefinitely.
+/// reminder to remove the previous registrar, so a redeploy could leave it able to
+/// mint and repoint names indefinitely. `removeRegistrar` is the retirement:
+/// afterwards the previous registrar can neither mint nor repoint. Removing its
+/// sponsor too is hygiene — it keeps a later re-enrolment of that registrar from
+/// bringing its sponsor straight back with it.
 ///
 /// WHY THERE IS NO WIRING HERE. The registrar is owned by the Safe from its first
 /// block and the registry admin is the Safe, so no deployer key can call
@@ -83,15 +88,19 @@ contract RedeployRegistrar is Script {
             c.previousRegistrar == address(0) || registry.registrars(c.previousRegistrar),
             "PREVIOUS_REGISTRAR is not enrolled in this registry"
         );
+        // The batch is sent by the registry admin, and `removeSponsor` succeeds
+        // only from the previous registrar's owner: if the two differ, the batch
+        // reverts as a unit. The registrar admin may legitimately differ from the
+        // registry admin, so only the previous registrar's owner is checked.
+        require(
+            c.previousRegistrar == address(0) || Ownable(c.previousRegistrar).owner() == registry.owner(),
+            "PREVIOUS_REGISTRAR is not owned by the registry admin - retire its sponsor separately"
+        );
 
         vm.startBroadcast(c.deployerPk);
         WoCoRegistrar registrar = new WoCoRegistrar(c.registryAddress, c.registrarAdmin, c.sponsor, reservedLabels());
         vm.stopBroadcast();
         registrarAddress = address(registrar);
-
-        require(registrar.owner() == c.registrarAdmin, "registrar is not owned by REGISTRAR_ADMIN");
-        require(address(registrar.registry()) == c.registryAddress, "registrar mints into a different registry");
-        require(registrar.authorisedSponsors(c.sponsor), "SPONSOR_ADDRESS is not an authorised sponsor");
 
         console.log("L2Registry (existing):", c.registryAddress);
         console.log("WoCoRegistrar (new):  ", registrarAddress);
@@ -120,9 +129,11 @@ contract RedeployRegistrar is Script {
         labels[7] = "mail";
     }
 
-    /// @notice The admin batch that swaps the new registrar in. Enrolment comes
-    ///         first, so that at no point in the batch is there no registrar.
-    ///         Public so the tests execute exactly what is printed.
+    /// @notice The admin batch that swaps the new registrar in. A Safe batch is
+    ///         atomic, so the order matters only to an operator who sends the
+    ///         calls one by one: enrolling the new registrar first means there is
+    ///         never a moment with no registrar. Public so the tests execute
+    ///         exactly what is printed.
     /// @param previousRegistrar Zero for a first registrar; otherwise its sponsor
     ///                          is removed and it is unenrolled.
     function adminBatch(address registry, address newRegistrar, address previousRegistrar, address sponsor)

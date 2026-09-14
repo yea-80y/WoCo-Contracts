@@ -39,7 +39,6 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         // the script's `_registryAdmin` / `_deploy` seams, never the environment.
         _setSharedScriptEnv();
         vm.setEnv("REGISTRY_ADMIN", vm.toString(address(safe)));
-        vm.setEnv("PARENT_NAME", "woco.eth");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -274,6 +273,21 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         DeploysWithoutReservedLabels bad = new DeploysWithoutReservedLabels();
         vm.expectRevert("a reserved label is not reserved");
         bad.run();
+    }
+
+    /// A registry under a mistyped parent mints normally and resolves nothing
+    /// once L1 points at it, so the parent is checked by its node, pinned as a
+    /// literal rather than recomputed from the same string.
+    function test_State_RefusesARegistryForAnotherParent() public {
+        DeploysUnderAnotherParent bad = new DeploysUnderAnotherParent();
+        vm.expectRevert("registry is not woco.eth - its base node is not namehash(woco.eth)");
+        bad.run();
+    }
+
+    function test_State_TheParentNodeIsNamehashOfWocoEth() public {
+        (address registryAddr,) = script.run();
+        assertEq(L2Registry(registryAddr).baseNode(), vm.ensNamehash("woco.eth"));
+        assertEq(L2Registry(registryAddr).baseNode(), 0x616c19dee44e200629c0e4918ca0fe2f6e85100ea0b354c4f888e11c07a9006f);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -523,6 +537,17 @@ contract DeploysWithoutReservedLabels is BuildsAGenuineRegistry {
     {
         (registryAddr, implAddr) = _genuineRegistry(parentName, admin);
         registrarAddr = address(new WoCoRegistrar(registryAddr, admin, sponsor, new string[](0)));
+    }
+}
+
+contract DeploysUnderAnotherParent is BuildsAGenuineRegistry {
+    function _deploy(string memory, address admin, address sponsor, string[] memory labels)
+        internal
+        override
+        returns (address registryAddr, address implAddr, address registrarAddr)
+    {
+        (registryAddr, implAddr) = _genuineRegistry("wocoo.eth", admin);
+        registrarAddr = address(new WoCoRegistrar(registryAddr, admin, sponsor, labels));
     }
 }
 

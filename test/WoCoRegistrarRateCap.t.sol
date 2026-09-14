@@ -146,7 +146,9 @@ contract WoCoRegistrarRateCapTest is Test {
         _mintN(alice, DEFAULT_MAX, 0);
 
         vm.warp(T0 + DEFAULT_WINDOW - 1);
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
+        );
         _mint("still-inside", alice);
 
         vm.warp(T0 + DEFAULT_WINDOW);
@@ -230,7 +232,9 @@ contract WoCoRegistrarRateCapTest is Test {
 
         (uint32 remaining,) = registrar.mintAllowance(alice);
         assertEq(remaining, 0);
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
+        );
         _mint("over-the-new-line", alice);
     }
 
@@ -310,7 +314,9 @@ contract WoCoRegistrarRateCapTest is Test {
             registry.release(node);
         }
 
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
+        );
         _mint("churn", alice);
     }
 }

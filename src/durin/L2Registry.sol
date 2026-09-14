@@ -594,7 +594,7 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      `release` decides WHO may sign — the holder or an ERC-721 approvee —
     ///      and it is checked BEFORE the signature is examined, so a stranger's
     ///      perfectly valid signature is refused without reaching the validator
-    ///      (which, for an ERC-6492 wrapper, would deploy the signer's account).
+    ///      (which, for an ERC-6492 wrapper, would run the wrapper's factory call).
     ///
     ///      HOW THE SIGNATURE IS CHECKED. Plain ECDSA first: if `signature`
     ///      recovers to `signer`, the key behind `signer` signed, and the
@@ -679,9 +679,12 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      authority to operators-for-all, as the ENS PublicResolver does; an
     ///      operator can already transfer or release the name.
     ///
-    ///      Existence is required of registrars too, so nothing can be written to
-    ///      a label before it is minted and reach its first holder (audit 927
-    ///      H2 / 924 F-3); `_updateAndBumpVersion` covers every later holder.
+    ///      Existence is required of registrars too, so a registrar cannot write
+    ///      records under a node that does not exist at all, where `resolve`
+    ///      would still read them back. That records written before a mint never
+    ///      reach the first holder is the mint's own version bump
+    ///      (`_updateAndBumpVersion`, audit 927 H2 / 924 F-3), the same bump
+    ///      every later change of holder makes.
     ///
     ///      The registry admin needs no branch here: it can enrol itself with
     ///      `addRegistrar`. That is accepted; see `adminTransfer`.

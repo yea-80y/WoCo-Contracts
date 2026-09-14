@@ -83,6 +83,31 @@ contract WoCoRegistrarTest is Test {
         new WoCoRegistrar(address(registry), address(0), sponsor, _reserved());
     }
 
+    /// No transaction comes from the zero address, so a zero sponsor authorises
+    /// nobody — but `authorisedSponsors(0)` reading true would let a deploy with
+    /// an unset sponsor pass its checks with no working one.
+    function test_constructor_refusesTheZeroSponsor() public {
+        vm.expectRevert(WoCoRegistrar.SponsorIsZeroAddress.selector);
+        new WoCoRegistrar(address(registry), admin, address(0), _reserved());
+    }
+
+    function test_addSponsor_refusesTheZeroAddress() public {
+        vm.expectRevert(WoCoRegistrar.SponsorIsZeroAddress.selector);
+        vm.prank(admin);
+        registrar.addSponsor(address(0));
+        assertFalse(registrar.authorisedSponsors(address(0)));
+    }
+
+    /// Nor through the registrar can a name be minted to the zero address:
+    /// "held by nobody" is what `available` and `setContenthash` read as free.
+    function test_register_refusesTheZeroAddressAsHolder() public {
+        (string[] memory keys, string[] memory vals) = _emptyText();
+        vm.expectRevert(abi.encodeWithSelector(bytes4(keccak256("ERC721InvalidReceiver(address)")), address(0)));
+        vm.prank(sponsor);
+        registrar.register("myband", address(0), SWARM_HASH, keys, vals);
+        assertTrue(registrar.available("myband"));
+    }
+
     /*//////////////////////////////////////////////////////////////
                           register() — sponsor path
     //////////////////////////////////////////////////////////////*/

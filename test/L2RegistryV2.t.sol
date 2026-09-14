@@ -456,6 +456,22 @@ contract L2RegistryV2Test is Test {
         assertEq(registry.recordVersions(venue), 1, "a refused mint moved the version");
     }
 
+    /// A name cannot be minted to the zero address. `owner(node) == 0` is what
+    /// "not minted" means throughout — record authority, availability, both
+    /// release paths — so the assumption is pinned against a change of mint.
+    function test_Create_ANameCannotBeMintedToTheZeroAddress() public {
+        bytes32 base = registry.baseNode();
+        bytes32 node = registry.makeNode(base, "venue");
+        bytes[] memory none = new bytes[](0);
+
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721InvalidReceiver.selector, address(0)));
+        vm.prank(registrar);
+        registry.createSubnode(base, "venue", address(0), none);
+
+        assertEq(registry.owner(node), address(0));
+        assertEq(registry.totalSupply(), 1, "a refused mint was counted");
+    }
+
     /// Creation stays with the holder alone: approvals are for moving and
     /// writing a name, not for minting beneath it.
     function test_Create_ApproveesOperatorsAndTheAdminCannotCreate() public {
@@ -510,7 +526,7 @@ contract L2RegistryV2Test is Test {
         bytes[] memory data = new bytes[](1);
         data[0] = abi.encodeWithSignature("setContenthash(bytes32,bytes)", shop, SITE);
 
-        vm.expectRevert();
+        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
         vm.prank(holder);
         registry.createSubnode(venue, "shop", buyer, data);
         assertEq(registry.owner(shop), address(0));
@@ -715,11 +731,11 @@ contract L2RegistryV2Test is Test {
         bytes[] memory calls = new bytes[](1);
         calls[0] = abi.encodeWithSignature("setContenthash(bytes32,bytes)", node, OTHER);
 
-        vm.expectRevert();
+        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
         vm.prank(stranger);
         registry.multicall(calls);
 
-        vm.expectRevert();
+        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
         vm.prank(stranger);
         registry.multicallWithNodeCheck(node, calls);
     }

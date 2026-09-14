@@ -8,10 +8,10 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
 
 /// @title DeploySubEnsRegistry
-/// @notice Deploys WoCo's sub-ENS registry (v2) and its WoCoRegistrar in ONE
-///         transaction through `WoCoSubEnsDeployer`, with both admin roles on
-///         `REGISTRY_ADMIN` from the start, and proves the registry runs OUR
-///         implementation before anything is broadcast.
+/// @notice Deploys WoCo's sub-ENS registry (v2) for `woco.eth` and its
+///         WoCoRegistrar in ONE transaction through `WoCoSubEnsDeployer`, with
+///         both admin roles on `REGISTRY_ADMIN` from the start, and proves the
+///         registry runs OUR implementation before anything is broadcast.
 ///
 /// @dev Run against Arbitrum Sepolia first, with a Safe there as the admin:
 ///        forge script script/DeploySubEnsRegistry.s.sol --rpc-url arb_sepolia --broadcast
@@ -22,8 +22,8 @@ import {L2Resolver} from "../src/durin/L2Resolver.sol";
 ///        SPONSOR_ADDRESS      — platform gas-sponsor wallet authorised to mint.
 ///        REGISTRY_ADMIN       — the Safe. Holds the admin seat and owns the
 ///                               registrar from construction. REQUIRED.
-///      Optional env:
-///        PARENT_NAME          — defaults to "woco.eth".
+///
+///      The parent name is NOT configurable: see `PARENT_NAME`.
 ///
 ///      NOT DONE HERE, BY DESIGN: wiring the registrar in. `addRegistrar` is the
 ///      admin's own transaction; the script prints its calldata
@@ -55,6 +55,15 @@ import {L2Resolver} from "../src/durin/L2Resolver.sol";
 /// EOA carrying an EIP-7702 delegation — which is what the Safe's own signer
 /// account is — but it CANNOT catch a well-formed contract you do not control.
 contract DeploySubEnsRegistry is Script {
+    /// @notice The parent name this registry serves, and its namehash.
+    /// @dev Fixed rather than configured: a registry initialised under a
+    ///      mistyped parent mints normally and answers nothing once L1 points at
+    ///      it. The node is a literal, checked against the deployed registry,
+    ///      because comparing `baseNode()` with a namehash computed from the same
+    ///      string would check nothing.
+    string constant PARENT_NAME = "woco.eth";
+    bytes32 constant PARENT_NODE = 0x616c19dee44e200629c0e4918ca0fe2f6e85100ea0b354c4f888e11c07a9006f;
+
     /// @notice The implementation NameStone's canonical `L2RegistryFactory`
     ///         clones (read from the factory on Arb Sepolia, 2026-09-02). Named
     ///         here so that a deploy which somehow ends up pointing at upstream
@@ -82,25 +91,22 @@ contract DeploySubEnsRegistry is Script {
     function run() external returns (address registryAddress, address registrarAddress) {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address sponsor = vm.envAddress("SPONSOR_ADDRESS");
-        string memory parentName = vm.envOr("PARENT_NAME", string("woco.eth"));
         address registryAdmin = _registryAdmin();
         _requireSafeShapedAdmin(registryAdmin);
 
         vm.startBroadcast(deployerPk);
-
         address implAddr;
         (registryAddress, implAddr, registrarAddress) =
-            _deploy(parentName, registryAdmin, sponsor, reservedLabels());
-
-        // Inside the broadcast: forge simulates the whole script before it sends
-        // anything, so a failure here means the deploy transaction is never sent.
-        _assertRegistryRunsOurImplementation(registryAddress, implAddr);
-
+            _deploy(PARENT_NAME, registryAdmin, sponsor, reservedLabels());
         vm.stopBroadcast();
 
+        // Forge runs the whole of `run()` as a simulation before it broadcasts
+        // anything, so a check below that fails stops the deploy transaction from
+        // ever being sent.
+        _assertRegistryRunsOurImplementation(registryAddress, implAddr);
         _assertDeployedState(registryAddress, registrarAddress, registryAdmin, sponsor);
 
-        console.log("Parent name:        ", parentName);
+        console.log("Parent name:        ", PARENT_NAME);
         console.log("L2Registry impl:    ", implAddr);
         console.log("L2Registry (clone): ", registryAddress);
         console.log("WoCoRegistrar:      ", registrarAddress);
@@ -182,6 +188,7 @@ contract DeploySubEnsRegistry is Script {
         L2Registry registry = L2Registry(registryAddr);
         WoCoRegistrar registrar = WoCoRegistrar(registrarAddr);
 
+        require(registry.baseNode() == PARENT_NODE, "registry is not woco.eth - its base node is not namehash(woco.eth)");
         require(registry.owner() == admin, "registry admin seat is not on REGISTRY_ADMIN");
         require(registrar.owner() == admin, "registrar is not owned by REGISTRY_ADMIN");
         require(address(registrar.registry()) == registryAddr, "registrar mints into a different registry");

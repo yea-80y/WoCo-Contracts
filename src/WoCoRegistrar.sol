@@ -97,6 +97,7 @@ contract WoCoRegistrar is Ownable2Step {
     event MintRateCapSet(uint32 maxMintsPerWindow, uint64 mintWindowSeconds);
 
     error NotAuthorisedSponsor(address caller);
+    error SponsorIsZeroAddress();
     error LabelIsReserved(string label);
     error InvalidLabel(string label);
     error LabelNotRegistered(string label);
@@ -117,7 +118,7 @@ contract WoCoRegistrar is Ownable2Step {
     /// @param _owner          The owner from the first block — the Safe. Set
     ///                        here rather than transferred after setup, so no
     ///                        deployer key ever holds the role.
-    /// @param _sponsor        The first authorised sponsor.
+    /// @param _sponsor        The first authorised sponsor. Not the zero address.
     /// @param _reservedLabels Labels no one may ever mint.
     constructor(address _registry, address _owner, address _sponsor, string[] memory _reservedLabels)
         Ownable(_owner)
@@ -129,8 +130,7 @@ contract WoCoRegistrar is Ownable2Step {
         mintWindowSeconds = 30 days;
         emit MintRateCapSet(30, 30 days);
 
-        authorisedSponsors[_sponsor] = true;
-        emit SponsorAdded(_sponsor);
+        _addSponsor(_sponsor);
 
         for (uint256 i; i < _reservedLabels.length; ++i) {
             _setReserved(_reservedLabels[i], true);
@@ -141,7 +141,7 @@ contract WoCoRegistrar is Ownable2Step {
                                 MINTING
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Sponsor-submitted mint.
+    /// @notice Sponsor-submitted mint: the only way this registrar creates a name.
     function register(
         string calldata label,
         address owner_,
@@ -149,7 +149,36 @@ contract WoCoRegistrar is Ownable2Step {
         string[] calldata textKeys,
         string[] calldata textValues
     ) external onlySponsor returns (bytes32 node) {
-        return _register(label, owner_, contenthash, textKeys, textValues);
+        if (!_validLabel(label)) revert InvalidLabel(label);
+        if (reserved[keccak256(bytes(label))]) revert LabelIsReserved(label);
+        if (textKeys.length != textValues.length) revert ArrayLengthMismatch();
+        _consumeMintAllowance(owner_);
+
+        node = registry.createSubnode(registry.baseNode(), label, owner_, new bytes[](0));
+
+        // Forward address records: chain ENSIP-11 coinType + ETH (coinType 60).
+        // The sub-ENS name doubles as a USDC receive-alias for the organiser.
+        bytes memory addr = abi.encodePacked(owner_);
+        registry.setAddr(node, coinType, addr);
+        registry.setAddr(node, 60, addr);
+
+        if (contenthash.length > 0) {
+            registry.setContenthash(node, contenthash);
+        }
+        for (uint256 i; i < textKeys.length; ++i) {
+            registry.setText(node, textKeys[i], textValues[i]);
+        }
+
+        // ONE check, after the last write: the name still belongs to the
+        // address it was minted to, so every record above was written to that
+        // holder's name. The v2 registry calls nothing outside itself during a
+        // registration, so today this cannot fail; it is what keeps that true of
+        // any registry that does. In v1 a recipient released the name from its
+        // ERC-721 receiver hook, and these writes landed on the freed label for
+        // its next registrant (audit 927 H3).
+        if (registry.owner(node) != owner_) revert NameMovedDuringRegistration(node);
+
+        emit NameRegistered(label, owner_, contenthash);
     }
 
     /// @notice Updates a name's Swarm site pointer (called on each site redeploy).
@@ -196,7 +225,7 @@ contract WoCoRegistrar is Ownable2Step {
     ///      `L2Registry.adminTransfer`.
     ///
     ///      The blast radius is where a name POINTS, never what it owns or where
-    ///      its funds go: address records are written once inside `_register`
+    ///      its funds go: address records are written once inside `register`
     ///      and there is no post-mint `setAddr` on this contract.
     function setContenthash(string calldata label, bytes calldata contenthash) external onlySponsor {
         if (contenthash.length == 0) revert EmptyContenthash();
@@ -238,8 +267,7 @@ contract WoCoRegistrar is Ownable2Step {
     //////////////////////////////////////////////////////////////*/
 
     function addSponsor(address sponsor) external onlyOwner {
-        authorisedSponsors[sponsor] = true;
-        emit SponsorAdded(sponsor);
+        _addSponsor(sponsor);
     }
 
     function removeSponsor(address sponsor) external onlyOwner {
@@ -282,48 +310,20 @@ contract WoCoRegistrar is Ownable2Step {
                              INTERNAL
     //////////////////////////////////////////////////////////////*/
 
+    /// @dev The zero address is refused. No transaction comes from it, so
+    ///      enrolling it authorises nobody — but `authorisedSponsors(address(0))`
+    ///      reading true would let a deploy handed an unset sponsor pass its
+    ///      checks with no working one. The registry refuses
+    ///      `addRegistrar(address(0))` for the same reason.
+    function _addSponsor(address sponsor) internal {
+        if (sponsor == address(0)) revert SponsorIsZeroAddress();
+        authorisedSponsors[sponsor] = true;
+        emit SponsorAdded(sponsor);
+    }
+
     function _setReserved(string memory label, bool isReserved) internal {
         reserved[keccak256(bytes(label))] = isReserved;
         emit LabelReservedSet(label, isReserved);
-    }
-
-    function _register(
-        string calldata label,
-        address owner_,
-        bytes calldata contenthash,
-        string[] calldata textKeys,
-        string[] calldata textValues
-    ) internal returns (bytes32 node) {
-        if (!_validLabel(label)) revert InvalidLabel(label);
-        if (reserved[keccak256(bytes(label))]) revert LabelIsReserved(label);
-        if (textKeys.length != textValues.length) revert ArrayLengthMismatch();
-        _consumeMintAllowance(owner_);
-
-        node = registry.createSubnode(registry.baseNode(), label, owner_, new bytes[](0));
-
-        // Forward address records: chain ENSIP-11 coinType + ETH (coinType 60).
-        // The sub-ENS name doubles as a USDC receive-alias for the organiser.
-        bytes memory addr = abi.encodePacked(owner_);
-        registry.setAddr(node, coinType, addr);
-        registry.setAddr(node, 60, addr);
-
-        if (contenthash.length > 0) {
-            registry.setContenthash(node, contenthash);
-        }
-        for (uint256 i; i < textKeys.length; ++i) {
-            registry.setText(node, textKeys[i], textValues[i]);
-        }
-
-        // ONE check, after the last write: the name still belongs to the
-        // address it was minted to, so every record above was written to that
-        // holder's name. The v2 registry calls nothing outside itself during a
-        // registration, so today this cannot fail; it is what keeps that true of
-        // any registry that does. In v1 a recipient released the name from its
-        // ERC-721 receiver hook, and these writes landed on the freed label for
-        // its next registrant (audit 927 H3).
-        if (registry.owner(node) != owner_) revert NameMovedDuringRegistration(node);
-
-        emit NameRegistered(label, owner_, contenthash);
     }
 
     /// @dev Charges one mint to `recipient`'s window, opening a fresh window if

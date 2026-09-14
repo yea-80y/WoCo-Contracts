@@ -139,6 +139,21 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
         script.run();
     }
 
+    /// The batch's `removeSponsor` succeeds only from the previous registrar's
+    /// owner, and the whole batch comes from the registry admin: when they
+    /// differ, the batch would revert as a unit. Refused up front, with the way
+    /// out named — the state the Arbitrum Sepolia pair is in today.
+    function test_Redeploy_RefusesAPreviousRegistrarTheRegistryAdminDoesNotOwn() public {
+        MockSafe otherOwner = new MockSafe();
+        WoCoRegistrar foreign = new WoCoRegistrar(address(registry), address(otherOwner), sponsor, new string[](0));
+        vm.prank(address(safe));
+        registry.addRegistrar(address(foreign));
+
+        RedeployRegistrar script = new WithInputs(address(safe), address(foreign));
+        vm.expectRevert("PREVIOUS_REGISTRAR is not owned by the registry admin - retire its sponsor separately");
+        script.run();
+    }
+
     /*//////////////////////////////////////////////////////////////
                     THE ADMIN MUST BE SHAPED LIKE A SAFE
     //////////////////////////////////////////////////////////////*/

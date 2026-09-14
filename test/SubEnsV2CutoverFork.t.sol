@@ -107,7 +107,9 @@ contract SubEnsV2CutoverForkTest is Test {
         L2Registry(registry).setContenthash(nabil, hex"e301");
     }
 
-    /// C9: the Safe retires v1's registrar in one batch; its sponsor mints nothing there.
+    /// C9: the Safe retires v1's registrar — two pranked calls here; the atomic
+    /// Safe batch itself is rehearsed on Arbitrum Sepolia (plan R5). Its sponsor
+    /// mints nothing there afterwards.
     function _retireV1() internal {
         vm.startPrank(SAFE);
         WoCoRegistrar(V1_REGISTRAR).removeSponsor(SPONSOR);
