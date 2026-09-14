@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
-import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
@@ -58,12 +57,10 @@ contract L2RegistryReleaseWithSignatureTest is Test {
 
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
-        registrar = new WoCoRegistrar(address(registry), admin, makeAddr("signer"));
+        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
 
-        vm.startPrank(admin);
+        vm.prank(admin);
         registry.addRegistrar(address(registrar));
-        registrar.addSponsor(sponsor);
-        vm.stopPrank();
 
         vm.warp(NOW);
     }
@@ -130,6 +127,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         assertEq(atB, uint64(NOW));
     }
 
+    /// The mint moved the record version to 1; the burn moves it to 2.
     function test_ReleaseWithSignature_EmitsTheSameThreeEvents() public {
         bytes32 node = _register("venue", holder);
         bytes memory sig = _signRelease(HOLDER_KEY, node);
@@ -137,7 +135,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         vm.expectEmit(true, true, true, true, address(registry));
         emit Transfer(holder, address(0), uint256(node));
         vm.expectEmit(true, true, true, true, address(registry));
-        emit VersionChanged(node, 1);
+        emit VersionChanged(node, 2);
         vm.expectEmit(true, true, true, true, address(registry));
         emit Released(node, holder, holder);
 
@@ -172,7 +170,8 @@ contract L2RegistryReleaseWithSignatureTest is Test {
     }
 
     /// A smart-account holder: the validator routes to ERC-1271 and the wallet
-    /// answers for its own signature. This is the passkey / email path.
+    /// answers for its own signature. This is the passkey / email path. The
+    /// wallet implements no ERC-721 receiver: a v2 mint never asks for one.
     function test_ReleaseWithSignature_ContractWalletThroughERC1271() public {
         Wallet1271 wallet = new Wallet1271();
         bytes32 node = _register("venue", address(wallet));
@@ -197,6 +196,49 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         registry.releaseWithSignature(node, EXPIRY, address(wallet), hex"1271");
         assertEq(registry.owner(node), address(wallet), "still held");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                 PLAIN ECDSA FIRST, THE VALIDATOR ON A MISS
+    //////////////////////////////////////////////////////////////*/
+
+    /// A plain key signature is settled by ECDSA recovery alone. With the
+    /// validator made to explode, an EOA holder's release still goes through —
+    /// so the validator, and its counterfactual-deploy path, was never touched.
+    function test_ReleaseWithSignature_APlainSignatureNeverReachesTheValidator() public {
+        bytes32 node = _register("venue", holder);
+        bytes memory sig = _signRelease(HOLDER_KEY, node);
+        vm.mockCallRevert(Validator.ADDR, bytes(""), "validator must not be reached");
+
+        vm.prank(relayer);
+        registry.releaseWithSignature(node, EXPIRY, holder, sig);
+        assertEq(registry.owner(node), address(0));
+    }
+
+    /// Audit 924 F-11. An EOA with an EIP-7702 delegation has code, so the
+    /// validator asks its delegate through ERC-1271 — and a delegate need not
+    /// accept the account key's own signature. Pinned both ways: the real
+    /// validator refuses the key's signature for such an account, and the
+    /// registry accepts it, because recovery is tried first.
+    function test_ReleaseWithSignature_A7702DelegatedEoaSignsWithItsOwnKey() public {
+        uint256 key = 0x7702;
+        address account = vm.addr(key);
+        Wallet1271 delegate = new Wallet1271(); // approves nothing
+        vm.signAndAttachDelegation(address(delegate), key);
+        bytes32 node = _register("venue", account);
+        assertGt(account.code.length, 0, "premise: the delegated account has code");
+
+        bytes memory sig = _signRelease(key, node);
+        bytes32 digest = registry.releaseDigest(node, EXPIRY);
+        (bool ok, bytes memory ret) = Validator.ADDR.call(
+            abi.encodeWithSignature("isValidSig(address,bytes32,bytes)", account, digest, sig)
+        );
+        assertTrue(ok, "premise: the validator answers");
+        assertFalse(abi.decode(ret, (bool)), "premise: the validator refuses the key's signature for a delegated account");
+
+        vm.prank(relayer);
+        registry.releaseWithSignature(node, EXPIRY, account, sig);
+        assertEq(registry.owner(node), address(0), "the account's own key could not release its name");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -279,7 +321,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         vm.warp(EXPIRY + 1);
 
         vm.prank(relayer);
-        vm.expectRevert(L2Resolver.SignatureExpired.selector);
+        vm.expectRevert(L2Registry.SignatureExpired.selector);
         registry.releaseWithSignature(node, EXPIRY, holder, sig);
     }
 
@@ -313,6 +355,25 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         assertEq(registry.owner(node), holder, "the re-minted name survives the replay");
     }
 
+    /// A signature dies when the name changes hands, even if it comes straight
+    /// back: v1 bumped the version only on release, so a holder who sold a name
+    /// and bought it back found their old signature live again.
+    function test_ReleaseWithSignature_DiesWhenTheNameChangesHandsAndReturns() public {
+        bytes32 node = _register("venue", holder);
+        bytes memory sig = _signRelease(HOLDER_KEY, node);
+
+        vm.prank(holder);
+        registry.transferFrom(holder, stranger, uint256(node));
+        vm.prank(stranger);
+        registry.transferFrom(stranger, holder, uint256(node));
+        assertEq(registry.owner(node), holder, "precondition: back with the signer");
+
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
+        registry.releaseWithSignature(node, EXPIRY, holder, sig);
+        assertEq(registry.owner(node), holder);
+    }
+
     function test_ReleaseWithSignature_CannotBeReplayedOnAnotherRegistry() public {
         bytes32 node = _register("venue", holder);
         bytes memory sig = _signRelease(HOLDER_KEY, node);
@@ -320,14 +381,13 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         // A second registry with the same parent name: identical node, same holder.
         L2Registry other = L2Registry(Clones.clone(address(new L2Registry())));
         other.initialize("woco.eth", "WoCo Names", "", admin);
-        WoCoRegistrar otherRegistrar = new WoCoRegistrar(address(other), admin, makeAddr("signer"));
-        vm.startPrank(admin);
+        WoCoRegistrar otherRegistrar = new WoCoRegistrar(address(other), admin, sponsor, new string[](0));
+        vm.prank(admin);
         other.addRegistrar(address(otherRegistrar));
-        otherRegistrar.addSponsor(sponsor);
-        vm.stopPrank();
         vm.prank(sponsor);
         otherRegistrar.register("venue", holder, SWARM_HASH, new string[](0), new string[](0));
         assertEq(other.owner(node), holder, "precondition: same node, same holder, other registry");
+        assertEq(other.recordVersions(node), registry.recordVersions(node), "precondition: same record version");
 
         vm.prank(relayer);
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
@@ -344,41 +404,20 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         registry.releaseWithSignature(node, EXPIRY, holder, sig);
     }
 
-    /// The one collision that would have been real without a domain tag: a
-    /// holder who signs "clear my contenthash" (empty bytes) once PACKED to
-    /// exactly `(registry, node, expiration)` — the same bytes a naive release
-    /// message would have. WoCo-Contracts #10 has since moved that setter to
-    /// `abi.encode` with the chain id and the node's nonce folded in, so the two
-    /// messages no longer come close; the digest below is rebuilt to the setter's
-    /// current formula, and the property it pins is unchanged. Proven both ways:
-    /// the setter accepts that signature, the release refuses it; and a release
-    /// signature cannot clear a contenthash.
-    function test_ReleaseWithSignature_AContenthashClearSignatureCannotRelease() public {
+    /// The domain tag is what separates a release from any other 32-byte
+    /// personal-sign message of the holder's: the same fields signed WITHOUT
+    /// the typehash are refused.
+    function test_ReleaseWithSignature_TheSameFieldsWithoutTheTypehashAreRefused() public {
         bytes32 node = _register("venue", holder);
-        bytes32 clearDigest = keccak256(
-            abi.encode(address(registry), block.chainid, node, bytes(""), registry.nonces(node), EXPIRY)
+        bytes32 untagged = keccak256(
+            abi.encode(address(registry), block.chainid, node, registry.recordVersions(node), EXPIRY)
         ).toEthSignedMessageHash();
-        bytes memory clearSig = _sign(HOLDER_KEY, clearDigest);
+        bytes memory sig = _sign(HOLDER_KEY, untagged);
 
         vm.prank(relayer);
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
-        registry.releaseWithSignature(node, EXPIRY, holder, clearSig);
+        registry.releaseWithSignature(node, EXPIRY, holder, sig);
         assertEq(registry.owner(node), holder, "the name survives");
-
-        // The same signature is genuine for what it was signed for.
-        vm.prank(relayer);
-        registry.setContenthashWithSignature(node, "", EXPIRY, holder, clearSig);
-        assertEq(registry.contenthash(node).length, 0, "precondition holds: the setter took it");
-    }
-
-    function test_ReleaseWithSignature_AReleaseSignatureCannotClearAContenthash() public {
-        bytes32 node = _register("venue", holder);
-        bytes memory sig = _signRelease(HOLDER_KEY, node);
-
-        vm.prank(relayer);
-        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
-        registry.setContenthashWithSignature(node, "", EXPIRY, holder, sig);
-        assertEq(registry.contenthash(node), SWARM_HASH, "the pointer survives");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -409,8 +448,10 @@ contract L2RegistryReleaseWithSignatureTest is Test {
 
     /// A client that rebuilds the digest instead of reading it must land on
     /// the same bytes; and the typehash string is frozen with the registry.
+    /// The record version at mint is 1: the mint is an ownership change.
     function test_ReleaseWithSignature_DigestFormulaIsPinned() public {
         bytes32 node = _register("venue", holder);
+        assertEq(registry.recordVersions(node), 1, "a fresh name's record version");
         bytes32 expected = keccak256(
             abi.encode(
                 keccak256(
@@ -419,7 +460,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
                 address(registry),
                 block.chainid,
                 node,
-                uint64(0),
+                uint64(1),
                 EXPIRY
             )
         ).toEthSignedMessageHash();
@@ -429,9 +470,9 @@ contract L2RegistryReleaseWithSignatureTest is Test {
     }
 }
 
-/// @dev The smallest possible ERC-1271 wallet: approves exact digests. Receives
-///      ERC-721s because `createSubnode` uses `_safeMint`.
-contract Wallet1271 is IERC1271, IERC721Receiver {
+/// @dev The smallest possible ERC-1271 wallet: approves exact digests. No
+///      ERC-721 receiver, on purpose: a v2 mint calls nothing on its recipient.
+contract Wallet1271 is IERC1271 {
     mapping(bytes32 => bool) public approved;
 
     function approveHash(bytes32 hash) external {
@@ -440,9 +481,5 @@ contract Wallet1271 is IERC1271, IERC721Receiver {
 
     function isValidSignature(bytes32 hash, bytes memory) external view returns (bytes4) {
         return approved[hash] ? IERC1271.isValidSignature.selector : bytes4(0);
-    }
-
-    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
-        return IERC721Receiver.onERC721Received.selector;
     }
 }

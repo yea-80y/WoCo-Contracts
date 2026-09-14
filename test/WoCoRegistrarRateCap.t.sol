@@ -13,9 +13,9 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
  *
  * The property that matters most is the one that is easy to get backwards:
  * the cap is keyed on the address that RECEIVES the name, not on whoever
- * sends the transaction. Every mint is submitted by someone other than the
- * organiser — the sponsor key, or a Kernel/paymaster — so a sender-keyed cap
- * would throttle the platform, not the account.
+ * sends the transaction. Every mint is submitted by a sponsor key on the
+ * organiser's behalf, so a sender-keyed cap would throttle the platform, not
+ * the account.
  */
 contract WoCoRegistrarRateCapTest is Test {
     L2Registry registry;
@@ -25,9 +25,6 @@ contract WoCoRegistrarRateCapTest is Test {
     address sponsor = makeAddr("sponsor");
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
-
-    uint256 platformSignerPk = 0xDEAD;
-    address platformSigner;
 
     uint32 constant DEFAULT_MAX = 30;
     uint64 constant DEFAULT_WINDOW = 30 days;
@@ -39,17 +36,13 @@ contract WoCoRegistrarRateCapTest is Test {
     event MintRateCapSet(uint32 maxMintsPerWindow, uint64 mintWindowSeconds);
 
     function setUp() public {
-        platformSigner = vm.addr(platformSignerPk);
-
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
 
-        registrar = new WoCoRegistrar(address(registry), admin, platformSigner);
+        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
 
-        vm.startPrank(admin);
+        vm.prank(admin);
         registry.addRegistrar(address(registrar));
-        registrar.addSponsor(sponsor);
-        vm.stopPrank();
 
         vm.warp(T0);
     }
@@ -63,9 +56,13 @@ contract WoCoRegistrarRateCapTest is Test {
     }
 
     function _mint(string memory label, address to) internal returns (bytes32) {
+        return _mintAs(sponsor, label, to);
+    }
+
+    function _mintAs(address by, string memory label, address to) internal returns (bytes32) {
         string[] memory keys = new string[](0);
         string[] memory vals = new string[](0);
-        vm.prank(sponsor);
+        vm.prank(by);
         return registrar.register(label, to, SWARM_HASH, keys, vals);
     }
 
@@ -73,30 +70,6 @@ contract WoCoRegistrarRateCapTest is Test {
         for (uint256 i; i < n; ++i) {
             _mint(_label(seed + i), to);
         }
-    }
-
-    function _signPermit(string memory label, address owner_, uint256 expiry) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(registrar.PERMIT_TYPEHASH(), keccak256(bytes(label)), owner_, expiry));
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", registrar.DOMAIN_SEPARATOR(), structHash));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(platformSignerPk, digest);
-        return abi.encodePacked(r, s, v);
-    }
-
-    function _mintWithPermit(string memory label, address to) internal returns (bytes32) {
-        (uint256 expiry, bytes memory sig) = _permit(label, to);
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
-        vm.prank(to); // the organiser submits their own permit
-        return registrar.registerWithPermit(label, to, SWARM_HASH, keys, vals, expiry, sig);
-    }
-
-    /// @dev Builds the permit up front. `vm.expectRevert` binds to the NEXT
-    ///      external call, and `PERMIT_TTL()` / `DOMAIN_SEPARATOR()` are
-    ///      external calls — so a test expecting the MINT to revert must have
-    ///      the permit in hand before the cheatcode.
-    function _permit(string memory label, address to) internal view returns (uint256 expiry, bytes memory sig) {
-        expiry = block.timestamp + registrar.PERMIT_TTL();
-        sig = _signPermit(label, to, expiry);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -124,34 +97,24 @@ contract WoCoRegistrarRateCapTest is Test {
         assertTrue(registrar.available("one-too-many"));
     }
 
-    /// The permit path is the one an organiser's own wallet uses. It must be
-    /// capped identically — a cap on the sponsor path alone would be a cap on
-    /// email-only organisers and nobody else.
-    function test_Cap_BindsThePermitPathToo() public {
-        _mintN(alice, DEFAULT_MAX - 1, 0);
-        _mintWithPermit("via-permit", alice); // the 30th
+    /// Every sponsor draws on the same window per recipient: a second sponsor
+    /// key is not a second allowance.
+    function test_Cap_EverySponsorSharesTheRecipientsWindow() public {
+        address second = makeAddr("second-sponsor");
+        vm.prank(admin);
+        registrar.addSponsor(second);
 
-        (uint256 expiry, bytes memory sig) = _permit("via-permit-two", alice);
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
+        for (uint256 i; i < 15; ++i) {
+            _mintAs(sponsor, _label(i), alice);
+            _mintAs(second, _label(100 + i), alice);
+        }
+        (, uint32 count) = registrar.mintWindow(alice);
+        assertEq(count, 30, "sponsors are counted separately");
+
         vm.expectRevert(
             abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
         );
-        vm.prank(alice);
-        registrar.registerWithPermit("via-permit-two", alice, SWARM_HASH, keys, vals, expiry, sig);
-    }
-
-    /// Both paths share ONE window per recipient: a mint through either counts.
-    function test_Cap_BothPathsShareOneWindow() public {
-        _mintN(alice, 15, 0);
-        for (uint256 i; i < 15; ++i) {
-            _mintWithPermit(_label(100 + i), alice);
-        }
-        (, uint32 count) = registrar.mintWindow(alice);
-        assertEq(count, 30, "paths are counted separately");
-
-        vm.expectRevert();
-        _mint("thirty-first", alice);
+        _mintAs(second, "thirty-first", alice);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -173,22 +136,6 @@ contract WoCoRegistrarRateCapTest is Test {
         (uint64 sponsorStart, uint32 sponsorCount) = registrar.mintWindow(sponsor);
         assertEq(sponsorStart, 0);
         assertEq(sponsorCount, 0);
-    }
-
-    /// The mirror image: a recipient cannot dodge their cap by having a
-    /// different sender submit — the permit path submitted by the organiser
-    /// and the sponsor path submitted by the platform land on the same window.
-    function test_Cap_CannotBeDodgedByChangingTheSender() public {
-        _mintN(alice, DEFAULT_MAX, 0); // all via the sponsor
-
-        (uint256 expiry, bytes memory sig) = _permit("from-my-own-wallet", alice);
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
-        vm.expectRevert(
-            abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
-        );
-        vm.prank(alice); // submitted by alice herself
-        registrar.registerWithPermit("from-my-own-wallet", alice, SWARM_HASH, keys, vals, expiry, sig);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -309,6 +256,45 @@ contract WoCoRegistrarRateCapTest is Test {
 
         assertEq(registrar.maxMintsPerWindow(), DEFAULT_MAX, "cap changed despite the revert");
         assertEq(registrar.mintWindowSeconds(), DEFAULT_WINDOW);
+    }
+
+    /// Audit 925 finding 3. The window arithmetic is checked `uint64`, so v1's
+    /// unbounded window let one owner call make every REPEAT mint revert on
+    /// overflow — a pause with no name. One second past the bound is refused.
+    function test_Tune_RefusesAWindowPastTheBound() public {
+        uint64 bound = registrar.MAX_MINT_WINDOW_SECONDS();
+        assertEq(bound, 366 days, "the bound is a year");
+
+        vm.expectRevert(WoCoRegistrar.InvalidMintRateCap.selector);
+        vm.prank(admin);
+        registrar.setMintRateCap(DEFAULT_MAX, bound + 1);
+
+        assertEq(registrar.mintWindowSeconds(), DEFAULT_WINDOW, "window changed despite the revert");
+    }
+
+    /// The bound itself is accepted, and minting keeps working under it.
+    function test_Tune_AcceptsTheBoundAndRepeatMintsStillWork() public {
+        vm.prank(admin);
+        registrar.setMintRateCap(DEFAULT_MAX, 366 days);
+
+        _mint("first", alice);
+        _mint("second", alice);
+        (, uint32 count) = registrar.mintWindow(alice);
+        assertEq(count, 2);
+    }
+
+    /// Whatever window the owner can set, a repeat mint in it fails only for
+    /// the cap, never for arithmetic — at today's clock and at the uint32 edge.
+    function testFuzz_Tune_NoAcceptedWindowBreaksRepeatMints(uint64 window, bool late) public {
+        window = uint64(bound(window, 1, registrar.MAX_MINT_WINDOW_SECONDS()));
+        vm.prank(admin);
+        registrar.setMintRateCap(2, window);
+        if (late) vm.warp(type(uint32).max);
+
+        _mint("first", alice);
+        _mint("second", alice);
+        (uint32 remaining,) = registrar.mintAllowance(alice);
+        assertEq(remaining, 0);
     }
 
     /*//////////////////////////////////////////////////////////////

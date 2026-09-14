@@ -49,12 +49,10 @@ contract L2RegistryReleaseTest is Test {
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
 
-        registrar = new WoCoRegistrar(address(registry), admin, makeAddr("signer"));
+        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
 
-        vm.startPrank(admin);
+        vm.prank(admin);
         registry.addRegistrar(address(registrar));
-        registrar.addSponsor(sponsor);
-        vm.stopPrank();
 
         // A realistic timestamp, so `releasedAt` is not being compared to 1.
         vm.warp(1_800_000_000);
@@ -135,13 +133,14 @@ contract L2RegistryReleaseTest is Test {
         assertEq(registry.totalSupply(), before, "totalSupply counts a burned name");
     }
 
+    /// The mint moved the record version to 1; the burn moves it to 2.
     function test_Release_EmitsReleasedVersionChangedAndTransfer() public {
         bytes32 node = _register("venue", organiser);
 
         vm.expectEmit(true, true, true, true, address(registry));
         emit Transfer(organiser, address(0), uint256(node));
         vm.expectEmit(true, false, false, true, address(registry));
-        emit VersionChanged(node, 1);
+        emit VersionChanged(node, 2);
         vm.expectEmit(true, true, true, true, address(registry));
         emit Released(node, organiser, organiser);
 

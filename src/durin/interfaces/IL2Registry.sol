@@ -48,6 +48,13 @@ interface IL2Registry is IL2Resolver, IERC721 {
     function removeRegistrar(address registrar) external;
     function setBaseURI(string calldata baseURI) external;
 
+    // WoCo additions: #422 reassignment, and v2's two-step admin handover
+    // (WoCo-Contracts #21) — the only way the base name changes hands.
+    function adminTransfer(bytes32 node, address newOwner) external;
+    function nominateAdmin(address nominee) external;
+    function acceptAdmin() external;
+    function pendingAdmin() external view returns (address);
+
     // WoCo additions (WoCo-Event-App #464). Exposed here so a REGISTRAR can
     // read release history when deciding mint policy — the registry itself
     // never reads it.
