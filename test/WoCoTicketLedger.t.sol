@@ -666,9 +666,15 @@ contract WoCoTicketLedgerTest is Test {
     /// Renouncing would leave `owner` at address(0) for good, and every
     /// onlyOwner power with it. The power it would cost most is exercised
     /// afterwards: removing a sponsor, the only response to a leaked sponsor key.
+    /// A stranger gets the owner's answer: that is what `pure` and unguarded
+    /// means, and the case that tells it apart from `onlyOwner`.
     function test_RenounceOwnership_Disabled() public {
         vm.expectRevert(WoCoTicketLedger.RenounceDisabled.selector);
         vm.prank(owner);
+        ledger.renounceOwnership();
+
+        vm.expectRevert(WoCoTicketLedger.RenounceDisabled.selector);
+        vm.prank(stranger);
         ledger.renounceOwnership();
 
         assertEq(ledger.owner(), owner, "ownership must survive a renounce attempt");

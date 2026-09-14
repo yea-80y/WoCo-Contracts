@@ -717,9 +717,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      read this view, and a rule every caller must remember is one some
     ///      caller forgets.
     ///
-    ///      `owner == address(0)` is still THE test for "unclaimed". A claimed
-    ///      slot's `orderRef` may legitimately be zero, so an all-zero tail
-    ///      does not by itself mean unclaimed.
+    ///      `owner == address(0)` is still THE test for "unclaimed".
     function getSlotData(bytes32 eventId, uint256 slot)
         external
         view
