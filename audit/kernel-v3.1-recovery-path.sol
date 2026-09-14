@@ -1,9 +1,13 @@
 // VERBATIM COPY FOR AUDIT CONTEXT ONLY - not compiled or deployed by WoCo.
 // Source: github.com/zerodevapp/kernel, tag v3.1, commit 03f7f5cf5871cda0070e4223f196f5b577f6cde2.
-// The three files below are byte-identical to that commit, each under its own SPDX header, and match the
-// verified source of the Kernel v3.1 implementation 0xBAC849bB641841b44E965fB01A4Bf5F074f84b4D on Arbitrum One.
-// WoCoGuardianHook runs inside these: Kernel.fallback, installModule, uninstallModule;
-// SelectorManager._installSelector, _uninstallSelector; HookManager._installHook, _uninstallHook, _doPreHook, _doPostHook.
+// The eight files below are byte-identical to that commit, each under its own SPDX header, and match the verified
+// source of the Kernel v3.1 implementation 0xBAC849bB641841b44E965fB01A4Bf5F074f84b4D on Arbitrum One.
+// WoCoGuardianHook runs inside these: Kernel.fallback / installModule / uninstallModule / execute;
+// SelectorManager (_installSelector, _uninstallSelector, _selectorConfig); HookManager (_installHook, _uninstallHook,
+// _doPreHook, _doPostHook); ExecLib (delegatecall to the action, batch execution); ModuleLib; Constants and Types
+// (call types incl. CALLTYPE_DELEGATECALL = 0xff, module types, sentinel hook addresses); IERC7579Modules (IHook).
+// Not included, deliberately: ValidationManager and the validators (standard Kernel authorisation of the account's
+// own calls) and ExecutorManager (not on this path).
 
 // ===================================================================================================
 // FILE: src/Kernel.sol  (sha256 13f9287eccb559dd71acc34a3c0b15cc0992dd253069561952dd45160c43045f)
@@ -702,5 +706,601 @@ abstract contract HookManager {
         }
         emit IERC7579Account.ModuleUninstalled(MODULE_TYPE_HOOK, address(hook));
     }
+}
+
+// ===================================================================================================
+// FILE: src/utils/ExecLib.sol  (sha256 bf12b6d16943d9f9c4dc9684e578062efbcd65980e95b074c4bcfad6fe46f4b7)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+import {ExecMode, CallType, ExecType, ExecModeSelector, ExecModePayload} from "../types/Types.sol";
+import {
+    CALLTYPE_SINGLE,
+    CALLTYPE_BATCH,
+    EXECTYPE_DEFAULT,
+    EXEC_MODE_DEFAULT,
+    EXECTYPE_TRY,
+    CALLTYPE_DELEGATECALL
+} from "../types/Constants.sol";
+import {Execution} from "../types/Structs.sol";
+
+/**
+ * @dev ExecLib is a helper library for execution
+ */
+library ExecLib {
+    error ExecutionFailed();
+
+    event TryExecuteUnsuccessful(uint256 batchExecutionindex, bytes result);
+
+    function execute(ExecMode execMode, bytes calldata executionCalldata)
+        internal
+        returns (bytes[] memory returnData)
+    {
+        (CallType callType, ExecType execType,,) = decode(execMode);
+
+        // check if calltype is batch or single
+        if (callType == CALLTYPE_BATCH) {
+            // destructure executionCallData according to batched exec
+            Execution[] calldata executions = decodeBatch(executionCalldata);
+            // check if execType is revert or try
+            if (execType == EXECTYPE_DEFAULT) returnData = execute(executions);
+            else if (execType == EXECTYPE_TRY) returnData = tryExecute(executions);
+            else revert("Unsupported");
+        } else if (callType == CALLTYPE_SINGLE) {
+            // destructure executionCallData according to single exec
+            (address target, uint256 value, bytes calldata callData) = decodeSingle(executionCalldata);
+            returnData = new bytes[](1);
+            bool success;
+            // check if execType is revert or try
+            if (execType == EXECTYPE_DEFAULT) {
+                returnData[0] = execute(target, value, callData);
+            } else if (execType == EXECTYPE_TRY) {
+                (success, returnData[0]) = tryExecute(target, value, callData);
+                if (!success) emit TryExecuteUnsuccessful(0, returnData[0]);
+            } else {
+                revert("Unsupported");
+            }
+        } else if (callType == CALLTYPE_DELEGATECALL) {
+            returnData = new bytes[](1);
+            address delegate = address(bytes20(executionCalldata[0:20]));
+            bytes calldata callData = executionCalldata[20:];
+            bool success;
+            (success, returnData[0]) = executeDelegatecall(delegate, callData);
+            if (execType == EXECTYPE_TRY) {
+                if (!success) emit TryExecuteUnsuccessful(0, returnData[0]);
+            } else if (execType == EXECTYPE_DEFAULT) {
+                if (!success) revert("Delegatecall failed");
+            } else {
+                revert("Unsupported");
+            }
+        } else {
+            revert("Unsupported");
+        }
+    }
+
+    function execute(Execution[] calldata executions) internal returns (bytes[] memory result) {
+        uint256 length = executions.length;
+        result = new bytes[](length);
+
+        for (uint256 i; i < length; i++) {
+            Execution calldata _exec = executions[i];
+            result[i] = execute(_exec.target, _exec.value, _exec.callData);
+        }
+    }
+
+    function tryExecute(Execution[] calldata executions) internal returns (bytes[] memory result) {
+        uint256 length = executions.length;
+        result = new bytes[](length);
+
+        for (uint256 i; i < length; i++) {
+            Execution calldata _exec = executions[i];
+            bool success;
+            (success, result[i]) = tryExecute(_exec.target, _exec.value, _exec.callData);
+            if (!success) emit TryExecuteUnsuccessful(i, result[i]);
+        }
+    }
+
+    function execute(address target, uint256 value, bytes calldata callData) internal returns (bytes memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := mload(0x40)
+            calldatacopy(result, callData.offset, callData.length)
+            if iszero(call(gas(), target, value, result, callData.length, codesize(), 0x00)) {
+                // Bubble up the revert if the call reverts.
+                returndatacopy(result, 0x00, returndatasize())
+                revert(result, returndatasize())
+            }
+            mstore(result, returndatasize()) // Store the length.
+            let o := add(result, 0x20)
+            returndatacopy(o, 0x00, returndatasize()) // Copy the returndata.
+            mstore(0x40, add(o, returndatasize())) // Allocate the memory.
+        }
+    }
+
+    function tryExecute(address target, uint256 value, bytes calldata callData)
+        internal
+        returns (bool success, bytes memory result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := mload(0x40)
+            calldatacopy(result, callData.offset, callData.length)
+            success := call(gas(), target, value, result, callData.length, codesize(), 0x00)
+            mstore(result, returndatasize()) // Store the length.
+            let o := add(result, 0x20)
+            returndatacopy(o, 0x00, returndatasize()) // Copy the returndata.
+            mstore(0x40, add(o, returndatasize())) // Allocate the memory.
+        }
+    }
+
+    /// @dev Execute a delegatecall with `delegate` on this account.
+    function executeDelegatecall(address delegate, bytes calldata callData)
+        internal
+        returns (bool success, bytes memory result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := mload(0x40)
+            calldatacopy(result, callData.offset, callData.length)
+            // Forwards the `data` to `delegate` via delegatecall.
+            success := delegatecall(gas(), delegate, result, callData.length, codesize(), 0x00)
+            mstore(result, returndatasize()) // Store the length.
+            let o := add(result, 0x20)
+            returndatacopy(o, 0x00, returndatasize()) // Copy the returndata.
+            mstore(0x40, add(o, returndatasize())) // Allocate the memory.
+        }
+    }
+
+    function decode(ExecMode mode)
+        internal
+        pure
+        returns (CallType _calltype, ExecType _execType, ExecModeSelector _modeSelector, ExecModePayload _modePayload)
+    {
+        assembly {
+            _calltype := mode
+            _execType := shl(8, mode)
+            _modeSelector := shl(48, mode)
+            _modePayload := shl(80, mode)
+        }
+    }
+
+    function encode(CallType callType, ExecType execType, ExecModeSelector mode, ExecModePayload payload)
+        internal
+        pure
+        returns (ExecMode)
+    {
+        return ExecMode.wrap(
+            bytes32(abi.encodePacked(callType, execType, bytes4(0), ExecModeSelector.unwrap(mode), payload))
+        );
+    }
+
+    function encodeSimpleBatch() internal pure returns (ExecMode mode) {
+        mode = encode(CALLTYPE_BATCH, EXECTYPE_DEFAULT, EXEC_MODE_DEFAULT, ExecModePayload.wrap(0x00));
+    }
+
+    function encodeSimpleSingle() internal pure returns (ExecMode mode) {
+        mode = encode(CALLTYPE_SINGLE, EXECTYPE_DEFAULT, EXEC_MODE_DEFAULT, ExecModePayload.wrap(0x00));
+    }
+
+    function getCallType(ExecMode mode) internal pure returns (CallType calltype) {
+        assembly {
+            calltype := mode
+        }
+    }
+
+    function decodeBatch(bytes calldata callData) internal pure returns (Execution[] calldata executionBatch) {
+        /*
+         * Batch Call Calldata Layout
+         * Offset (in bytes)    | Length (in bytes) | Contents
+         * 0x0                  | 0x4               | bytes4 function selector
+        *  0x4                  | -                 |
+        abi.encode(IERC7579Execution.Execution[])
+         */
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            let dataPointer := add(callData.offset, calldataload(callData.offset))
+
+            // Extract the ERC7579 Executions
+            executionBatch.offset := add(dataPointer, 32)
+            executionBatch.length := calldataload(dataPointer)
+        }
+    }
+
+    function encodeBatch(Execution[] memory executions) internal pure returns (bytes memory callData) {
+        callData = abi.encode(executions);
+    }
+
+    function decodeSingle(bytes calldata executionCalldata)
+        internal
+        pure
+        returns (address target, uint256 value, bytes calldata callData)
+    {
+        target = address(bytes20(executionCalldata[0:20]));
+        value = uint256(bytes32(executionCalldata[20:52]));
+        callData = executionCalldata[52:];
+    }
+
+    function encodeSingle(address target, uint256 value, bytes memory callData)
+        internal
+        pure
+        returns (bytes memory userOpCalldata)
+    {
+        userOpCalldata = abi.encodePacked(target, value, callData);
+    }
+
+    function doFallback2771Static(address fallbackHandler) internal view returns (bool success, bytes memory result) {
+        assembly {
+            function allocate(length) -> pos {
+                pos := mload(0x40)
+                mstore(0x40, add(pos, length))
+            }
+
+            let calldataPtr := allocate(calldatasize())
+            calldatacopy(calldataPtr, 0, calldatasize())
+
+            // The msg.sender address is shifted to the left by 12 bytes to remove the padding
+            // Then the address without padding is stored right after the calldata
+            let senderPtr := allocate(20)
+            mstore(senderPtr, shl(96, caller()))
+
+            // Add 20 bytes for the address appended add the end
+            success := staticcall(gas(), fallbackHandler, calldataPtr, add(calldatasize(), 20), 0, 0)
+
+            result := mload(0x40)
+            mstore(result, returndatasize()) // Store the length.
+            let o := add(result, 0x20)
+            returndatacopy(o, 0x00, returndatasize()) // Copy the returndata.
+            mstore(0x40, add(o, returndatasize())) // Allocate the memory.
+        }
+    }
+
+    function doFallback2771Call(address target) internal returns (bool success, bytes memory result) {
+        assembly {
+            function allocate(length) -> pos {
+                pos := mload(0x40)
+                mstore(0x40, add(pos, length))
+            }
+
+            let calldataPtr := allocate(calldatasize())
+            calldatacopy(calldataPtr, 0, calldatasize())
+
+            // The msg.sender address is shifted to the left by 12 bytes to remove the padding
+            // Then the address without padding is stored right after the calldata
+            let senderPtr := allocate(20)
+            mstore(senderPtr, shl(96, caller()))
+
+            // Add 20 bytes for the address appended add the end
+            success := call(gas(), target, 0, calldataPtr, add(calldatasize(), 20), 0, 0)
+
+            result := mload(0x40)
+            mstore(result, returndatasize()) // Store the length.
+            let o := add(result, 0x20)
+            returndatacopy(o, 0x00, returndatasize()) // Copy the returndata.
+            mstore(0x40, add(o, returndatasize())) // Allocate the memory.
+        }
+    }
+}
+
+// ===================================================================================================
+// FILE: src/utils/ModuleLib.sol  (sha256 41aafdda4e1dc02d1844e84d3b7461566e35eda07f635fa5973fc1849c5d2315)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {ExcessivelySafeCall} from "ExcessivelySafeCall/ExcessivelySafeCall.sol";
+import {IModule} from "../interfaces/IERC7579Modules.sol";
+
+library ModuleLib {
+    event ModuleUninstallResult(address module, bool result);
+
+    function uninstallModule(address module, bytes memory deinitData) internal returns (bool result) {
+        (result,) = ExcessivelySafeCall.excessivelySafeCall(
+            module, gasleft(), 0, 0, abi.encodeWithSelector(IModule.onUninstall.selector, deinitData)
+        );
+        emit ModuleUninstallResult(module, result);
+    }
+}
+
+// ===================================================================================================
+// FILE: src/types/Constants.sol  (sha256 a1ba2b1df22f6c1afe77c2115f0098fed577165a57e85485bdcedf29f4f6a651)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {CallType, ExecType, ExecModeSelector} from "./Types.sol";
+import {PassFlag, ValidationMode, ValidationType} from "./Types.sol";
+import {ValidationData} from "./Types.sol";
+
+// --- ERC7579 calltypes ---
+// Default CallType
+CallType constant CALLTYPE_SINGLE = CallType.wrap(0x00);
+// Batched CallType
+CallType constant CALLTYPE_BATCH = CallType.wrap(0x01);
+CallType constant CALLTYPE_STATIC = CallType.wrap(0xFE);
+// @dev Implementing delegatecall is OPTIONAL!
+// implement delegatecall with extreme care.
+CallType constant CALLTYPE_DELEGATECALL = CallType.wrap(0xFF);
+
+// --- ERC7579 exectypes ---
+// @dev default behavior is to revert on failure
+// To allow very simple accounts to use mode encoding, the default behavior is to revert on failure
+// Since this is value 0x00, no additional encoding is required for simple accounts
+ExecType constant EXECTYPE_DEFAULT = ExecType.wrap(0x00);
+// @dev account may elect to change execution behavior. For example "try exec" / "allow fail"
+ExecType constant EXECTYPE_TRY = ExecType.wrap(0x01);
+
+// --- ERC7579 mode selector ---
+ExecModeSelector constant EXEC_MODE_DEFAULT = ExecModeSelector.wrap(bytes4(0x00000000));
+
+// --- Kernel permission skip flags ---
+PassFlag constant SKIP_USEROP = PassFlag.wrap(0x0001);
+PassFlag constant SKIP_SIGNATURE = PassFlag.wrap(0x0002);
+
+// --- Kernel validation modes ---
+ValidationMode constant VALIDATION_MODE_DEFAULT = ValidationMode.wrap(0x00);
+ValidationMode constant VALIDATION_MODE_ENABLE = ValidationMode.wrap(0x01);
+ValidationMode constant VALIDATION_MODE_INSTALL = ValidationMode.wrap(0x02);
+
+// --- Kernel validation types ---
+ValidationType constant VALIDATION_TYPE_ROOT = ValidationType.wrap(0x00);
+ValidationType constant VALIDATION_TYPE_VALIDATOR = ValidationType.wrap(0x01);
+ValidationType constant VALIDATION_TYPE_PERMISSION = ValidationType.wrap(0x02);
+
+// --- storage slots ---
+// bytes32(uint256(keccak256('kernel.v3.selector')) - 1)
+bytes32 constant SELECTOR_MANAGER_STORAGE_SLOT = 0x7c341349a4360fdd5d5bc07e69f325dc6aaea3eb018b3e0ea7e53cc0bb0d6f3b;
+// bytes32(uint256(keccak256('kernel.v3.executor')) - 1)
+bytes32 constant EXECUTOR_MANAGER_STORAGE_SLOT = 0x1bbee3173dbdc223633258c9f337a0fff8115f206d302bea0ed3eac003b68b86;
+// bytes32(uint256(keccak256('kernel.v3.hook')) - 1)
+bytes32 constant HOOK_MANAGER_STORAGE_SLOT = 0x4605d5f70bb605094b2e761eccdc27bed9a362d8612792676bf3fb9b12832ffc;
+// bytes32(uint256(keccak256('kernel.v3.validation')) - 1)
+bytes32 constant VALIDATION_MANAGER_STORAGE_SLOT = 0x7bcaa2ced2a71450ed5a9a1b4848e8e5206dbc3f06011e595f7f55428cc6f84f;
+bytes32 constant ERC1967_IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
+// --- Kernel validation nonce incremental size limit ---
+uint32 constant MAX_NONCE_INCREMENT_SIZE = 10;
+
+// -- EIP712 type hash ---
+bytes32 constant ENABLE_TYPE_HASH = 0xb17ab1224aca0d4255ef8161acaf2ac121b8faa32a4b2258c912cc5f8308c505;
+bytes32 constant KERNEL_WRAPPER_TYPE_HASH = 0x1547321c374afde8a591d972a084b071c594c275e36724931ff96c25f2999c83;
+
+// --- ERC constants ---
+// ERC4337 constants
+uint256 constant SIG_VALIDATION_FAILED_UINT = 1;
+uint256 constant SIG_VALIDATION_SUCCESS_UINT = 0;
+ValidationData constant SIG_VALIDATION_FAILED = ValidationData.wrap(SIG_VALIDATION_FAILED_UINT);
+
+// ERC-1271 constants
+bytes4 constant ERC1271_MAGICVALUE = 0x1626ba7e;
+bytes4 constant ERC1271_INVALID = 0xffffffff;
+
+uint256 constant MODULE_TYPE_VALIDATOR = 1;
+uint256 constant MODULE_TYPE_EXECUTOR = 2;
+uint256 constant MODULE_TYPE_FALLBACK = 3;
+uint256 constant MODULE_TYPE_HOOK = 4;
+uint256 constant MODULE_TYPE_POLICY = 5;
+uint256 constant MODULE_TYPE_SIGNER = 6;
+
+// ===================================================================================================
+// FILE: src/types/Types.sol  (sha256 990e1e32f5252ac3383ea6a3cd73f672a35e6ea9b5ef3af2a1218d70a349ebf5)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.23;
+
+// Custom type for improved developer experience
+type ExecMode is bytes32;
+
+type CallType is bytes1;
+
+type ExecType is bytes1;
+
+type ExecModeSelector is bytes4;
+
+type ExecModePayload is bytes22;
+
+using {eqModeSelector as ==} for ExecModeSelector global;
+using {eqCallType as ==} for CallType global;
+using {notEqCallType as !=} for CallType global;
+using {eqExecType as ==} for ExecType global;
+
+function eqCallType(CallType a, CallType b) pure returns (bool) {
+    return CallType.unwrap(a) == CallType.unwrap(b);
+}
+
+function notEqCallType(CallType a, CallType b) pure returns (bool) {
+    return CallType.unwrap(a) != CallType.unwrap(b);
+}
+
+function eqExecType(ExecType a, ExecType b) pure returns (bool) {
+    return ExecType.unwrap(a) == ExecType.unwrap(b);
+}
+
+function eqModeSelector(ExecModeSelector a, ExecModeSelector b) pure returns (bool) {
+    return ExecModeSelector.unwrap(a) == ExecModeSelector.unwrap(b);
+}
+
+type ValidationMode is bytes1;
+
+type ValidationId is bytes21;
+
+type ValidationType is bytes1;
+
+type PermissionId is bytes4;
+
+type PolicyData is bytes22; // 2bytes for flag on skip, 20 bytes for validator address
+
+type PassFlag is bytes2;
+
+using {vModeEqual as ==} for ValidationMode global;
+using {vTypeEqual as ==} for ValidationType global;
+using {vIdentifierEqual as ==} for ValidationId global;
+using {vModeNotEqual as !=} for ValidationMode global;
+using {vTypeNotEqual as !=} for ValidationType global;
+using {vIdentifierNotEqual as !=} for ValidationId global;
+
+// nonce = uint192(key) + nonce
+// key = mode + (vtype + validationDataWithoutType) + 2bytes parallelNonceKey
+// key = 0x00 + 0x00 + 0x000 .. 00 + 0x0000
+// key = 0x00 + 0x01 + 0x1234...ff + 0x0000
+// key = 0x00 + 0x02 + ( ) + 0x000
+
+function vModeEqual(ValidationMode a, ValidationMode b) pure returns (bool) {
+    return ValidationMode.unwrap(a) == ValidationMode.unwrap(b);
+}
+
+function vModeNotEqual(ValidationMode a, ValidationMode b) pure returns (bool) {
+    return ValidationMode.unwrap(a) != ValidationMode.unwrap(b);
+}
+
+function vTypeEqual(ValidationType a, ValidationType b) pure returns (bool) {
+    return ValidationType.unwrap(a) == ValidationType.unwrap(b);
+}
+
+function vTypeNotEqual(ValidationType a, ValidationType b) pure returns (bool) {
+    return ValidationType.unwrap(a) != ValidationType.unwrap(b);
+}
+
+function vIdentifierEqual(ValidationId a, ValidationId b) pure returns (bool) {
+    return ValidationId.unwrap(a) == ValidationId.unwrap(b);
+}
+
+function vIdentifierNotEqual(ValidationId a, ValidationId b) pure returns (bool) {
+    return ValidationId.unwrap(a) != ValidationId.unwrap(b);
+}
+
+type ValidationData is uint256;
+
+type ValidAfter is uint48;
+
+type ValidUntil is uint48;
+
+function getValidationResult(ValidationData validationData) pure returns (address result) {
+    assembly {
+        result := validationData
+    }
+}
+
+function packValidationData(ValidAfter validAfter, ValidUntil validUntil) pure returns (uint256) {
+    return uint256(ValidAfter.unwrap(validAfter)) << 208 | uint256(ValidUntil.unwrap(validUntil)) << 160;
+}
+
+function parseValidationData(uint256 validationData)
+    pure
+    returns (ValidAfter validAfter, ValidUntil validUntil, address result)
+{
+    assembly {
+        result := validationData
+        validUntil := and(shr(160, validationData), 0xffffffffffff)
+        switch iszero(validUntil)
+        case 1 { validUntil := 0xffffffffffff }
+        validAfter := shr(208, validationData)
+    }
+}
+
+// ===================================================================================================
+// FILE: src/interfaces/IERC7579Modules.sol  (sha256 9b23dc3afba5c65484fce3553fed0b12e77202195694db257932b4b98c8aeb58)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.21;
+
+import {PackedUserOperation} from "./PackedUserOperation.sol";
+
+interface IModule {
+    error AlreadyInitialized(address smartAccount);
+    error NotInitialized(address smartAccount);
+
+    /**
+     * @dev This function is called by the smart account during installation of the module
+     * @param data arbitrary data that may be required on the module during `onInstall`
+     * initialization
+     *
+     * MUST revert on error (i.e. if module is already enabled)
+     */
+    function onInstall(bytes calldata data) external payable;
+
+    /**
+     * @dev This function is called by the smart account during uninstallation of the module
+     * @param data arbitrary data that may be required on the module during `onUninstall`
+     * de-initialization
+     *
+     * MUST revert on error
+     */
+    function onUninstall(bytes calldata data) external payable;
+
+    /**
+     * @dev Returns boolean value if module is a certain type
+     * @param moduleTypeId the module type ID according the ERC-7579 spec
+     *
+     * MUST return true if the module is of the given type and false otherwise
+     */
+    function isModuleType(uint256 moduleTypeId) external view returns (bool);
+
+    /**
+     * @dev Returns if the module was already initialized for a provided smartaccount
+     */
+    function isInitialized(address smartAccount) external view returns (bool);
+}
+
+interface IValidator is IModule {
+    error InvalidTargetAddress(address target);
+
+    /**
+     * @dev Validates a transaction on behalf of the account.
+     *         This function is intended to be called by the MSA during the ERC-4337 validation phase
+     *         Note: solely relying on bytes32 hash and signature is not sufficient for some
+     * validation implementations (i.e. SessionKeys often need access to userOp.calldata)
+     * @param userOp The user operation to be validated. The userOp MUST NOT contain any metadata.
+     * The MSA MUST clean up the userOp before sending it to the validator.
+     * @param userOpHash The hash of the user operation to be validated
+     * @return return value according to ERC-4337
+     */
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
+        external
+        payable
+        returns (uint256);
+
+    /**
+     * Validator can be used for ERC-1271 validation
+     */
+    function isValidSignatureWithSender(address sender, bytes32 hash, bytes calldata data)
+        external
+        view
+        returns (bytes4);
+}
+
+interface IExecutor is IModule {}
+
+interface IHook is IModule {
+    function preCheck(address msgSender, uint256 msgValue, bytes calldata msgData)
+        external
+        payable
+        returns (bytes memory hookData);
+
+    function postCheck(bytes calldata hookData) external payable;
+}
+
+interface IFallback is IModule {}
+
+interface IPolicy is IModule {
+    function checkUserOpPolicy(bytes32 id, PackedUserOperation calldata userOp) external payable returns (uint256);
+    function checkSignaturePolicy(bytes32 id, address sender, bytes32 hash, bytes calldata sig)
+        external
+        view
+        returns (uint256);
+}
+
+interface ISigner is IModule {
+    function checkUserOpSignature(bytes32 id, PackedUserOperation calldata userOp, bytes32 userOpHash)
+        external
+        payable
+        returns (uint256);
+    function checkSignature(bytes32 id, address sender, bytes32 hash, bytes calldata sig)
+        external
+        view
+        returns (bytes4);
 }
 
