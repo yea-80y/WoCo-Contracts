@@ -1,16 +1,23 @@
-// VERBATIM COPY FOR AUDIT CONTEXT ONLY - not compiled or deployed by WoCo.
-// Source: github.com/zerodevapp/kernel, tag v3.1, commit 03f7f5cf5871cda0070e4223f196f5b577f6cde2.
-// The eight files below are byte-identical to that commit, each under its own SPDX header, and match the verified
-// source of the Kernel v3.1 implementation 0xBAC849bB641841b44E965fB01A4Bf5F074f84b4D on Arbitrum One.
-// WoCoGuardianHook runs inside these: Kernel.fallback / installModule / uninstallModule / execute;
-// SelectorManager (_installSelector, _uninstallSelector, _selectorConfig); HookManager (_installHook, _uninstallHook,
-// _doPreHook, _doPostHook); ExecLib (delegatecall to the action, batch execution); ModuleLib; Constants and Types
-// (call types incl. CALLTYPE_DELEGATECALL = 0xff, module types, sentinel hook addresses); IERC7579Modules (IHook).
-// Not included, deliberately: ValidationManager and the validators (standard Kernel authorisation of the account's
-// own calls) and ExecutorManager (not on this path).
+// VERBATIM COPIES FOR AUDIT CONTEXT ONLY - not compiled or deployed by WoCo. Source: github.com/zerodevapp/kernel.
+// Every file below is byte-identical to the commit named on its FILE line, keeps its own SPDX header (all MIT) and
+// carries its sha256. Each section matches the verified source of the contract deployed on Arbitrum One:
+//   A. Kernel v3.1 (tag v3.1, 03f7f5cf5871cda0070e4223f196f5b577f6cde2): implementation 0xBAC849bB641841b44E965fB01A4Bf5F074f84b4D,
+//      KernelFactory 0xaac5D4240AF87249B3f71BC8E4A2cae074A3E419
+//   B. ECDSAValidator (8f7fd9946b9d351bb5be0428bf34c87bad7ed6c9): 0x845ADb2C711129d4f3966735eD98a9F09fC4cE57, the user account's root validator
+//   C. WeightedECDSAValidator (00dd9e46413b37f6a7da58f85e8d950c5762243c): 0xeD89244160CfE273800B58b1B534031699dFeEEE, a guardian account's root validator
+// Why these files: WoCoGuardianHook runs inside Kernel.fallback / installModule / uninstallModule / execute (SelectorManager,
+// HookManager, ExecLib, ModuleLib, Constants, Types, IERC7579Modules); recovery rotates the owner in ECDSAValidator; guardian
+// accounts are KernelFactory proxies whose root validator is WeightedECDSAValidator.
+// Types, Constants and PackedUserOperation are identical at all three commits. IERC7579Modules is not: B's copy differs from
+// A's only by a one-word comment typo, and C's copy (included in section C) has the older IHook.postCheck signature.
+// Not included, deliberately: ValidationManager, ValidationTypeLib, ExecutorManager (standard Kernel authorisation of an
+// account's own calls, not on the hook's path) and the solady libraries (ECDSA, EIP712, LibClone).
 
+// ###################################################################################################
+// SECTION A - ZeroDev Kernel v3.1 (tag v3.1)
+// ###################################################################################################
 // ===================================================================================================
-// FILE: src/Kernel.sol  (sha256 13f9287eccb559dd71acc34a3c0b15cc0992dd253069561952dd45160c43045f)
+// FILE: src/Kernel.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 13f9287eccb559dd71acc34a3c0b15cc0992dd253069561952dd45160c43045f)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
@@ -572,7 +579,7 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
 }
 
 // ===================================================================================================
-// FILE: src/core/SelectorManager.sol  (sha256 ed9e53eb352cee5e6d5601f810805db1deaacbb34d374a9cb43dfa4018665e12)
+// FILE: src/core/SelectorManager.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 ed9e53eb352cee5e6d5601f810805db1deaacbb34d374a9cb43dfa4018665e12)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 
@@ -650,7 +657,7 @@ abstract contract SelectorManager {
 }
 
 // ===================================================================================================
-// FILE: src/core/HookManager.sol  (sha256 dbf557281bceac23fa2f6fbaa3abec6cce07282ccd6915db66b69499a3c622f8)
+// FILE: src/core/HookManager.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 dbf557281bceac23fa2f6fbaa3abec6cce07282ccd6915db66b69499a3c622f8)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 
@@ -709,7 +716,7 @@ abstract contract HookManager {
 }
 
 // ===================================================================================================
-// FILE: src/utils/ExecLib.sol  (sha256 bf12b6d16943d9f9c4dc9684e578062efbcd65980e95b074c4bcfad6fe46f4b7)
+// FILE: src/utils/ExecLib.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 bf12b6d16943d9f9c4dc9684e578062efbcd65980e95b074c4bcfad6fe46f4b7)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
@@ -983,7 +990,7 @@ library ExecLib {
 }
 
 // ===================================================================================================
-// FILE: src/utils/ModuleLib.sol  (sha256 41aafdda4e1dc02d1844e84d3b7461566e35eda07f635fa5973fc1849c5d2315)
+// FILE: src/utils/ModuleLib.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 41aafdda4e1dc02d1844e84d3b7461566e35eda07f635fa5973fc1849c5d2315)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 
@@ -1004,7 +1011,7 @@ library ModuleLib {
 }
 
 // ===================================================================================================
-// FILE: src/types/Constants.sol  (sha256 a1ba2b1df22f6c1afe77c2115f0098fed577165a57e85485bdcedf29f4f6a651)
+// FILE: src/types/Constants.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 a1ba2b1df22f6c1afe77c2115f0098fed577165a57e85485bdcedf29f4f6a651)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 
@@ -1085,7 +1092,7 @@ uint256 constant MODULE_TYPE_POLICY = 5;
 uint256 constant MODULE_TYPE_SIGNER = 6;
 
 // ===================================================================================================
-// FILE: src/types/Types.sol  (sha256 990e1e32f5252ac3383ea6a3cd73f672a35e6ea9b5ef3af2a1218d70a349ebf5)
+// FILE: src/types/Types.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 990e1e32f5252ac3383ea6a3cd73f672a35e6ea9b5ef3af2a1218d70a349ebf5)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 
@@ -1202,7 +1209,7 @@ function parseValidationData(uint256 validationData)
 }
 
 // ===================================================================================================
-// FILE: src/interfaces/IERC7579Modules.sol  (sha256 9b23dc3afba5c65484fce3553fed0b12e77202195694db257932b4b98c8aeb58)
+// FILE: src/interfaces/IERC7579Modules.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 9b23dc3afba5c65484fce3553fed0b12e77202195694db257932b4b98c8aeb58)
 // ===================================================================================================
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
@@ -1281,6 +1288,613 @@ interface IHook is IModule {
         returns (bytes memory hookData);
 
     function postCheck(bytes calldata hookData) external payable;
+}
+
+interface IFallback is IModule {}
+
+interface IPolicy is IModule {
+    function checkUserOpPolicy(bytes32 id, PackedUserOperation calldata userOp) external payable returns (uint256);
+    function checkSignaturePolicy(bytes32 id, address sender, bytes32 hash, bytes calldata sig)
+        external
+        view
+        returns (uint256);
+}
+
+interface ISigner is IModule {
+    function checkUserOpSignature(bytes32 id, PackedUserOperation calldata userOp, bytes32 userOpHash)
+        external
+        payable
+        returns (uint256);
+    function checkSignature(bytes32 id, address sender, bytes32 hash, bytes calldata sig)
+        external
+        view
+        returns (bytes4);
+}
+
+// ===================================================================================================
+// FILE: src/interfaces/PackedUserOperation.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 da71298af29edd1d470f4ab120e6725b82bef18c30c71ef08a28980af9ef7c0f)
+// ===================================================================================================
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.7.5;
+
+/**
+ * User Operation struct
+ * @param sender                - The sender account of this request.
+ * @param nonce                 - Unique value the sender uses to verify it is not a replay.
+ * @param initCode              - If set, the account contract will be created by this constructor/
+ * @param callData              - The method call to execute on this account.
+ * @param accountGasLimits      - Packed gas limits for validateUserOp and gas limit passed to the callData method call.
+ * @param preVerificationGas    - Gas not calculated by the handleOps method, but added to the gas paid.
+ *                                Covers batch overhead.
+ * @param gasFees                - packed gas fields maxFeePerGas and maxPriorityFeePerGas - Same as EIP-1559 gas parameter.
+ * @param paymasterAndData      - If set, this field holds the paymaster address, verification gas limit, postOp gas limit and paymaster-specific extra data
+ *                                The paymaster will pay for the transaction instead of the sender.
+ * @param signature             - Sender-verified signature over the entire request, the EntryPoint address and the chain ID.
+ */
+struct PackedUserOperation {
+    address sender;
+    uint256 nonce;
+    bytes initCode;
+    bytes callData;
+    bytes32 accountGasLimits;
+    uint256 preVerificationGas;
+    bytes32 gasFees; //maxPriorityFee and maxFeePerGas;
+    bytes paymasterAndData;
+    bytes signature;
+}
+
+// ===================================================================================================
+// FILE: src/factory/KernelFactory.sol  @ 03f7f5cf5871cda0070e4223f196f5b577f6cde2  (sha256 a21b7f24a4b847e257b9bffbb724f558ff13e04d2be274eeabcb2b9b6b400aae)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {LibClone} from "solady/utils/LibClone.sol";
+
+contract KernelFactory {
+    error InitializeError();
+
+    address public immutable implementation;
+
+    constructor(address _impl) {
+        implementation = _impl;
+    }
+
+    function createAccount(bytes calldata data, bytes32 salt) public payable returns (address) {
+        bytes32 actualSalt = keccak256(abi.encodePacked(data, salt));
+        (bool alreadyDeployed, address account) =
+            LibClone.createDeterministicERC1967(msg.value, implementation, actualSalt);
+        if (!alreadyDeployed) {
+            (bool success,) = account.call(data);
+            if (!success) {
+                revert InitializeError();
+            }
+        }
+        return account;
+    }
+
+    function getAddress(bytes calldata data, bytes32 salt) public view virtual returns (address) {
+        bytes32 actualSalt = keccak256(abi.encodePacked(data, salt));
+        return LibClone.predictDeterministicAddressERC1967(implementation, actualSalt, address(this));
+    }
+}
+
+// ###################################################################################################
+// SECTION B - ECDSAValidator (user account root validator)
+// ###################################################################################################
+// ===================================================================================================
+// FILE: src/validator/ECDSAValidator.sol  @ 8f7fd9946b9d351bb5be0428bf34c87bad7ed6c9  (sha256 f889ab378a9c47ed7e080ff5d6a2a1fc15f87324e2a4a99bb6903cdbd0b9457e)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {ECDSA} from "solady/utils/ECDSA.sol";
+import {IValidator, IHook} from "../interfaces/IERC7579Modules.sol";
+import {PackedUserOperation} from "../interfaces/PackedUserOperation.sol";
+import {
+    SIG_VALIDATION_SUCCESS_UINT,
+    SIG_VALIDATION_FAILED_UINT,
+    MODULE_TYPE_VALIDATOR,
+    MODULE_TYPE_HOOK,
+    ERC1271_MAGICVALUE,
+    ERC1271_INVALID
+} from "../types/Constants.sol";
+
+struct ECDSAValidatorStorage {
+    address owner;
+}
+
+contract ECDSAValidator is IValidator, IHook {
+    event OwnerRegistered(address indexed kernel, address indexed owner);
+
+    mapping(address => ECDSAValidatorStorage) public ecdsaValidatorStorage;
+
+    function onInstall(bytes calldata _data) external payable override {
+        if (_isInitialized(msg.sender)) revert AlreadyInitialized(msg.sender);
+        address owner = address(bytes20(_data[0:20]));
+        ecdsaValidatorStorage[msg.sender].owner = owner;
+        emit OwnerRegistered(msg.sender, owner);
+    }
+
+    function onUninstall(bytes calldata) external payable override {
+        if (!_isInitialized(msg.sender)) revert NotInitialized(msg.sender);
+        delete ecdsaValidatorStorage[msg.sender];
+    }
+
+    function isModuleType(uint256 typeID) external pure override returns (bool) {
+        return typeID == MODULE_TYPE_VALIDATOR || typeID == MODULE_TYPE_HOOK;
+    }
+
+    function isInitialized(address smartAccount) external view override returns (bool) {
+        return _isInitialized(smartAccount);
+    }
+
+    function _isInitialized(address smartAccount) internal view returns (bool) {
+        return ecdsaValidatorStorage[smartAccount].owner != address(0);
+    }
+
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
+        external
+        payable
+        override
+        returns (uint256)
+    {
+        address owner = ecdsaValidatorStorage[msg.sender].owner;
+        bytes calldata sig = userOp.signature;
+        if (owner == ECDSA.recover(userOpHash, sig)) {
+            return SIG_VALIDATION_SUCCESS_UINT;
+        }
+        bytes32 ethHash = ECDSA.toEthSignedMessageHash(userOpHash);
+        address recovered = ECDSA.recover(ethHash, sig);
+        if (owner != recovered) {
+            return SIG_VALIDATION_FAILED_UINT;
+        }
+        return SIG_VALIDATION_SUCCESS_UINT;
+    }
+
+    function isValidSignatureWithSender(address, bytes32 hash, bytes calldata sig)
+        external
+        view
+        override
+        returns (bytes4)
+    {
+        address owner = ecdsaValidatorStorage[msg.sender].owner;
+        if (owner == ECDSA.recover(hash, sig)) {
+            return ERC1271_MAGICVALUE;
+        }
+        bytes32 ethHash = ECDSA.toEthSignedMessageHash(hash);
+        address recovered = ECDSA.recover(ethHash, sig);
+        if (owner != recovered) {
+            return ERC1271_INVALID;
+        }
+        return ERC1271_MAGICVALUE;
+    }
+
+    function preCheck(address msgSender, uint256 value, bytes calldata)
+        external
+        payable
+        override
+        returns (bytes memory)
+    {
+        require(msgSender == ecdsaValidatorStorage[msg.sender].owner, "ECDSAValidator: sender is not owner");
+        return hex"";
+    }
+
+    function postCheck(bytes calldata hookData) external payable override {}
+}
+
+// ###################################################################################################
+// SECTION C - WeightedECDSAValidator (guardian account root validator) and the IERC7579Modules it compiled against
+// ###################################################################################################
+// ===================================================================================================
+// FILE: src/validator/WeightedECDSAValidator.sol  @ 00dd9e46413b37f6a7da58f85e8d950c5762243c  (sha256 7e3068e25e48a1f823a248efe2673c10afe6bc68a3fb5bceaf8b9fea3168c5a8)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "../types/Types.sol";
+import {ECDSA} from "solady/utils/ECDSA.sol";
+import {EIP712} from "solady/utils/EIP712.sol";
+import {PackedUserOperation} from "../interfaces/PackedUserOperation.sol";
+import {IValidator} from "../interfaces/IERC7579Modules.sol";
+import {
+    ERC1271_MAGICVALUE,
+    ERC1271_INVALID,
+    SIG_VALIDATION_FAILED_UINT,
+    MODULE_TYPE_VALIDATOR,
+    MODULE_TYPE_HOOK
+} from "../types/Constants.sol";
+
+struct WeightedECDSAValidatorStorage {
+    uint24 totalWeight;
+    uint24 threshold;
+    uint48 delay;
+    address firstGuardian;
+}
+
+struct GuardianStorage {
+    uint24 weight;
+    address nextGuardian;
+}
+
+enum ProposalStatus {
+    Ongoing, // all proposal is ongoing by default
+    Approved,
+    Rejected,
+    Executed
+}
+
+struct ProposalStorage {
+    ProposalStatus status;
+    ValidAfter validAfter;
+}
+
+enum VoteStatus {
+    NA,
+    Approved
+}
+
+struct VoteStorage {
+    VoteStatus status;
+}
+
+contract WeightedECDSAValidator is EIP712, IValidator {
+    mapping(address kernel => WeightedECDSAValidatorStorage) public weightedStorage;
+    mapping(address guardian => mapping(address kernel => GuardianStorage)) public guardian;
+    mapping(bytes32 callDataAndNonceHash => mapping(address kernel => ProposalStorage)) public proposalStatus;
+    mapping(bytes32 callDataAndNonceHash => mapping(address guardian => mapping(address kernel => VoteStorage))) public
+        voteStatus;
+
+    event GuardianAdded(address indexed guardian, address indexed kernel, uint24 weight);
+    event GuardianRemoved(address indexed guardian, address indexed kernel);
+
+    function _domainNameAndVersion() internal pure override returns (string memory, string memory) {
+        return ("WeightedECDSAValidator", "0.0.3");
+    }
+
+    function _addGuardians(address[] memory _guardians, uint24[] memory _weights, address _kernel) internal {
+        uint24 totalWeight = weightedStorage[_kernel].totalWeight;
+        require(_guardians.length == _weights.length, "Length mismatch");
+        uint160 prevGuardian = uint160(weightedStorage[_kernel].firstGuardian);
+        for (uint256 i = 0; i < _guardians.length; i++) {
+            require(_guardians[i] != _kernel, "Guardian cannot be self");
+            require(_guardians[i] != address(0), "Guardian cannot be 0");
+            require(_weights[i] != 0, "Weight cannot be 0");
+            require(guardian[_guardians[i]][_kernel].weight == 0, "Guardian already enabled");
+            require(uint160(_guardians[i]) < prevGuardian, "Guardians not sorted");
+            guardian[_guardians[i]][_kernel] =
+                GuardianStorage({weight: _weights[i], nextGuardian: weightedStorage[_kernel].firstGuardian});
+            weightedStorage[_kernel].firstGuardian = _guardians[i];
+            totalWeight += _weights[i];
+            prevGuardian = uint160(_guardians[i]);
+            emit GuardianAdded(_guardians[i], _kernel, _weights[i]);
+        }
+        weightedStorage[_kernel].totalWeight = totalWeight;
+    }
+
+    function onInstall(bytes calldata _data) external payable override {
+        (address[] memory _guardians, uint24[] memory _weights, uint24 _threshold, uint48 _delay) =
+            abi.decode(_data, (address[], uint24[], uint24, uint48));
+        require(_guardians.length == _weights.length, "Length mismatch");
+        if (_isInitialized(msg.sender)) revert AlreadyInitialized(msg.sender);
+        weightedStorage[msg.sender].firstGuardian = address(uint160(type(uint160).max));
+        _addGuardians(_guardians, _weights, msg.sender);
+        weightedStorage[msg.sender].delay = _delay;
+        weightedStorage[msg.sender].threshold = _threshold;
+        require(_threshold <= weightedStorage[msg.sender].totalWeight, "Threshold too high");
+    }
+
+    function onUninstall(bytes calldata) external payable override {
+        if (!_isInitialized(msg.sender)) revert NotInitialized(msg.sender);
+        address currentGuardian = weightedStorage[msg.sender].firstGuardian;
+        while (currentGuardian != address(uint160(type(uint160).max))) {
+            address nextGuardian = guardian[currentGuardian][msg.sender].nextGuardian;
+            emit GuardianRemoved(currentGuardian, msg.sender);
+            delete guardian[currentGuardian][msg.sender];
+            currentGuardian = nextGuardian;
+        }
+        delete weightedStorage[msg.sender];
+    }
+
+    function isModuleType(uint256 moduleTypeId) external pure returns (bool) {
+        return moduleTypeId == MODULE_TYPE_VALIDATOR;
+    }
+
+    function isInitialized(address smartAccount) external view returns (bool) {
+        return _isInitialized(smartAccount);
+    }
+
+    function _isInitialized(address smartAccount) internal view returns (bool) {
+        return weightedStorage[smartAccount].totalWeight != 0;
+    }
+
+    function renew(address[] calldata _guardians, uint24[] calldata _weights, uint24 _threshold, uint48 _delay)
+        external
+        payable
+    {
+        if (!_isInitialized(msg.sender)) revert NotInitialized(msg.sender);
+        address currentGuardian = weightedStorage[msg.sender].firstGuardian;
+        while (currentGuardian != address(uint160(type(uint160).max))) {
+            address nextGuardian = guardian[currentGuardian][msg.sender].nextGuardian;
+            emit GuardianRemoved(currentGuardian, msg.sender);
+            delete guardian[currentGuardian][msg.sender];
+            currentGuardian = nextGuardian;
+        }
+        delete weightedStorage[msg.sender];
+        require(_guardians.length == _weights.length, "Length mismatch");
+        weightedStorage[msg.sender].firstGuardian = address(uint160(type(uint160).max));
+        _addGuardians(_guardians, _weights, msg.sender);
+        weightedStorage[msg.sender].delay = _delay;
+        weightedStorage[msg.sender].threshold = _threshold;
+    }
+
+    function approve(bytes32 _callDataAndNonceHash, address _kernel) external {
+        require(guardian[msg.sender][_kernel].weight != 0, "Guardian not enabled");
+        require(weightedStorage[_kernel].threshold != 0, "Kernel not enabled");
+        ProposalStorage storage proposal = proposalStatus[_callDataAndNonceHash][_kernel];
+        require(proposal.status == ProposalStatus.Ongoing, "Proposal not ongoing");
+        VoteStorage storage vote = voteStatus[_callDataAndNonceHash][msg.sender][_kernel];
+        require(vote.status == VoteStatus.NA, "Already voted");
+        vote.status = VoteStatus.Approved;
+        (, bool isApproved) = getApproval(_kernel, _callDataAndNonceHash);
+        if (isApproved) {
+            proposal.status = ProposalStatus.Approved;
+            proposal.validAfter = ValidAfter.wrap(uint48(block.timestamp + weightedStorage[_kernel].delay));
+        }
+    }
+
+    function approveWithSig(bytes32 _callDataAndNonceHash, address _kernel, bytes calldata sigs) external {
+        uint256 sigCount = sigs.length / 65;
+        require(weightedStorage[_kernel].threshold != 0, "Kernel not enabled");
+        ProposalStorage storage proposal = proposalStatus[_callDataAndNonceHash][_kernel];
+        require(proposal.status == ProposalStatus.Ongoing, "Proposal not ongoing");
+        for (uint256 i = 0; i < sigCount; i++) {
+            address signer = ECDSA.recover(
+                _hashTypedData(
+                    keccak256(abi.encode(keccak256("Approve(bytes32 callDataAndNonceHash)"), _callDataAndNonceHash))
+                ),
+                sigs[i * 65:(i + 1) * 65]
+            );
+            VoteStorage storage vote = voteStatus[_callDataAndNonceHash][signer][_kernel];
+            require(vote.status == VoteStatus.NA, "Already voted");
+            vote.status = VoteStatus.Approved;
+        }
+
+        (, bool isApproved) = getApproval(_kernel, _callDataAndNonceHash);
+        if (isApproved) {
+            proposal.status = ProposalStatus.Approved;
+            proposal.validAfter = ValidAfter.wrap(uint48(block.timestamp + weightedStorage[_kernel].delay));
+        }
+    }
+
+    function veto(bytes32 _callDataAndNonceHash) external {
+        ProposalStorage storage proposal = proposalStatus[_callDataAndNonceHash][msg.sender];
+        require(
+            proposal.status == ProposalStatus.Ongoing || proposal.status == ProposalStatus.Approved,
+            "Proposal not ongoing"
+        );
+        proposal.status = ProposalStatus.Rejected;
+    }
+
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
+        external
+        payable
+        override
+        returns (uint256)
+    {
+        bytes32 callDataAndNonceHash = keccak256(abi.encode(userOp.sender, userOp.callData, userOp.nonce));
+        ProposalStorage storage proposal = proposalStatus[callDataAndNonceHash][msg.sender];
+        WeightedECDSAValidatorStorage storage strg = weightedStorage[msg.sender];
+        if (strg.threshold == 0) {
+            return SIG_VALIDATION_FAILED_UINT;
+        }
+        (uint256 totalWeight, bool passed) = getApproval(msg.sender, callDataAndNonceHash);
+        uint256 threshold = strg.threshold;
+        if (proposal.status == ProposalStatus.Ongoing && !passed) {
+            if (strg.delay != 0) {
+                // if delay > 0, only allow proposal to be approved before execution
+                return SIG_VALIDATION_FAILED_UINT;
+            }
+            bytes calldata sig = userOp.signature;
+            // parse sig with 65 bytes
+            uint256 sigCount = sig.length / 65;
+            require(sigCount > 0, "No sig");
+            address signer;
+            VoteStorage storage vote;
+            for (uint256 i = 0; i < sigCount - 1 && !passed; i++) {
+                signer = ECDSA.recover(
+                    _hashTypedData(
+                        keccak256(abi.encode(keccak256("Approve(bytes32 callDataAndNonceHash)"), callDataAndNonceHash))
+                    ),
+                    sig[i * 65:(i + 1) * 65]
+                );
+                vote = voteStatus[callDataAndNonceHash][signer][msg.sender];
+                if (vote.status != VoteStatus.NA) {
+                    continue;
+                } // skip if already voted
+                vote.status = VoteStatus.Approved;
+                totalWeight += guardian[signer][msg.sender].weight;
+                if (totalWeight >= threshold) {
+                    passed = true;
+                }
+            }
+            // userOpHash verification for the last sig
+            signer = ECDSA.recover(ECDSA.toEthSignedMessageHash(userOpHash), sig[sig.length - 65:]);
+            vote = voteStatus[callDataAndNonceHash][signer][msg.sender];
+            if (vote.status == VoteStatus.NA) {
+                vote.status = VoteStatus.Approved;
+                totalWeight += guardian[signer][msg.sender].weight;
+                if (totalWeight >= threshold) {
+                    passed = true;
+                }
+            }
+            proposal.status = ProposalStatus.Executed;
+            if (passed && guardian[signer][msg.sender].weight != 0) {
+                return packValidationData(ValidAfter.wrap(0), ValidUntil.wrap(0));
+            }
+            return SIG_VALIDATION_FAILED_UINT;
+        } else if (proposal.status == ProposalStatus.Approved || passed) {
+            if (userOp.paymasterAndData.length == 0 || address(bytes20(userOp.paymasterAndData[0:20])) == address(0)) {
+                address signer = ECDSA.recover(ECDSA.toEthSignedMessageHash(userOpHash), userOp.signature);
+                if (guardian[signer][msg.sender].weight != 0) {
+                    proposal.status = ProposalStatus.Executed;
+                    return packValidationData(proposal.validAfter, ValidUntil.wrap(0));
+                }
+            } else {
+                proposal.status = ProposalStatus.Executed;
+                return packValidationData(proposal.validAfter, ValidUntil.wrap(0));
+            }
+        }
+        return SIG_VALIDATION_FAILED_UINT;
+    }
+
+    function getApproval(address kernel, bytes32 hash) public view returns (uint256 approvals, bool passed) {
+        WeightedECDSAValidatorStorage storage strg = weightedStorage[kernel];
+        for (
+            address currentGuardian = strg.firstGuardian;
+            currentGuardian != address(0);
+            currentGuardian = guardian[currentGuardian][kernel].nextGuardian
+        ) {
+            if (voteStatus[hash][currentGuardian][kernel].status == VoteStatus.Approved) {
+                approvals += guardian[currentGuardian][kernel].weight;
+            }
+        }
+        ProposalStorage storage proposal = proposalStatus[hash][kernel];
+        if (proposal.status == ProposalStatus.Rejected) {
+            passed = false;
+        } else {
+            passed = approvals >= strg.threshold;
+        }
+    }
+
+    function isValidSignatureWithSender(address, bytes32 hash, bytes calldata data) external view returns (bytes4) {
+        WeightedECDSAValidatorStorage storage strg = weightedStorage[msg.sender];
+        if (strg.threshold == 0) {
+            return ERC1271_INVALID;
+        }
+
+        uint256 sigCount = data.length / 65;
+        if (sigCount == 0) {
+            return ERC1271_INVALID;
+        }
+        uint256 totalWeight = 0;
+        address prevSigner = address(uint160(type(uint160).max));
+        for (uint256 i = 0; i < sigCount; i++) {
+            address signer = ECDSA.recover(hash, data[i * 65:(i + 1) * 65]);
+            totalWeight += guardian[signer][msg.sender].weight;
+            if (totalWeight >= strg.threshold) {
+                return ERC1271_MAGICVALUE;
+            }
+            if (signer >= prevSigner) {
+                return ERC1271_INVALID;
+            }
+            prevSigner = signer;
+        }
+        return ERC1271_INVALID;
+    }
+}
+
+// ===================================================================================================
+// FILE: src/interfaces/IERC7579Modules.sol  @ 00dd9e46413b37f6a7da58f85e8d950c5762243c  (sha256 9c3c1e8116884fee2c150527f0c5f075543526040e65f66708ca94eef9a3778d)
+// ===================================================================================================
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.21;
+
+import {PackedUserOperation} from "./PackedUserOperation.sol";
+
+interface IModule {
+    error AlreadyInitialized(address smartAccount);
+    error NotInitialized(address smartAccount);
+
+    /**
+     * @dev This function is called by the smart account during installation of the module
+     * @param data arbitrary data that may be required on the module during `onInstall`
+     * initialization
+     *
+     * MUST revert on error (i.e. if module is already enabled)
+     */
+    function onInstall(bytes calldata data) external payable;
+
+    /**
+     * @dev This function is called by the smart account during uninstallation of the module
+     * @param data arbitrary data that may be required on the module during `onUninstall`
+     * de-initialization
+     *
+     * MUST revert on error
+     */
+    function onUninstall(bytes calldata data) external payable;
+
+    /**
+     * @dev Returns boolean value if module is a certain type
+     * @param moduleTypeId the module type ID according the ERC-7579 spec
+     *
+     * MUST return true if the module is of the given type and false otherwise
+     */
+    function isModuleType(uint256 moduleTypeId) external view returns (bool);
+
+    /**
+     * @dev Returns if the module was already initialized for a provided smartaccount
+     */
+    function isInitialized(address smartAccount) external view returns (bool);
+}
+
+interface IValidator is IModule {
+    error InvalidTargetAddress(address target);
+
+    /**
+     * @dev Validates a transaction on behalf of the account.
+     *         This function is intended to be called by the MSA during the ERC-4337 validaton phase
+     *         Note: solely relying on bytes32 hash and signature is not sufficient for some
+     * validation implementations (i.e. SessionKeys often need access to userOp.calldata)
+     * @param userOp The user operation to be validated. The userOp MUST NOT contain any metadata.
+     * The MSA MUST clean up the userOp before sending it to the validator.
+     * @param userOpHash The hash of the user operation to be validated
+     * @return return value according to ERC-4337
+     */
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
+        external
+        payable
+        returns (uint256);
+
+    /**
+     * Validator can be used for ERC-1271 validation
+     */
+    function isValidSignatureWithSender(address sender, bytes32 hash, bytes calldata data)
+        external
+        view
+        returns (bytes4);
+}
+
+interface IExecutor is IModule {}
+
+interface IHook is IModule {
+    /**
+     * @dev Called by the smart account before execution
+     * @param msgSender the address that called the smart account
+     * @param value the value that was sent to the smart account
+     * @param msgData the data that was sent to the smart account
+     *
+     * MAY return arbitrary data in the `hookData` return value
+     */
+    function preCheck(address msgSender, uint256 value, bytes calldata msgData)
+        external
+        payable
+        returns (bytes memory hookData);
+
+    /**
+     * @dev Called by the smart account after execution
+     * @param hookData the data that was returned by the `preCheck` function
+     * @param executionSuccess whether the execution(s) was (were) successful
+     * @param executionReturn the return/revert data of the execution(s)
+     *
+     * MAY validate the `hookData` to validate transaction context of the `preCheck` function
+     */
+    function postCheck(bytes calldata hookData, bool executionSuccess, bytes calldata executionReturn)
+        external
+        payable;
 }
 
 interface IFallback is IModule {}
