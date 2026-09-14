@@ -2,9 +2,9 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
-import {L2RegistryFactory} from "../src/durin/L2RegistryFactory.sol";
 
 /**
  * Tests for `L2Registry.adminTransfer` — the governed reassignment added to the
@@ -20,9 +20,8 @@ import {L2RegistryFactory} from "../src/durin/L2RegistryFactory.sol";
  *    under a published policy."
  */
 contract L2RegistryAdminTransferTest is Test {
-    L2RegistryFactory factory;
-    L2Registry        registry;
-    WoCoRegistrar     registrar;
+    L2Registry    registry;
+    WoCoRegistrar registrar;
 
     address admin     = makeAddr("admin");
     address sponsor   = makeAddr("sponsor");
@@ -39,18 +38,14 @@ contract L2RegistryAdminTransferTest is Test {
     event VersionChanged(bytes32 indexed node, uint64 newVersion);
 
     function setUp() public {
-        L2Registry impl = new L2Registry();
-        factory = new L2RegistryFactory(address(impl));
+        // The production shape: our implementation, cloned, initialised.
+        registry = L2Registry(Clones.clone(address(new L2Registry())));
+        registry.initialize("woco.eth", "WoCo Names", "", admin);
+
+        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
 
         vm.prank(admin);
-        registry = L2Registry(factory.deployRegistry("woco.eth", "WoCo Names", "", admin));
-
-        registrar = new WoCoRegistrar(address(registry), admin, makeAddr("signer"));
-
-        vm.startPrank(admin);
         registry.addRegistrar(address(registrar));
-        registrar.addSponsor(sponsor);
-        vm.stopPrank();
     }
 
     function _register(string memory label, address owner_) internal returns (bytes32 node) {
@@ -104,11 +99,13 @@ contract L2RegistryAdminTransferTest is Test {
 
     /// Reassignment must be distinguishable on chain from an ordinary sale —
     /// that legibility is the entire argument for having the power in the open.
+    /// The mint moved the record version to 1; the reassignment moves it to 2.
     function test_AdminTransfer_EmitsDistinctEvent() public {
         bytes32 node = _register("venue", organiser);
+        assertEq(registry.recordVersions(node), 1, "precondition: the mint is an ownership change");
 
         vm.expectEmit(true, false, false, true, address(registry));
-        emit VersionChanged(node, 1);
+        emit VersionChanged(node, 2);
         vm.expectEmit(true, true, true, true, address(registry));
         emit AdminTransfer(node, organiser, claimant);
 
@@ -158,9 +155,9 @@ contract L2RegistryAdminTransferTest is Test {
         registry.adminTransfer(node, address(0));
     }
 
-    /// Registry admin rotates by moving the baseNode NFT as an ordinary ERC-721
-    /// transfer. Routing it through the abuse path would let one call hand over
-    /// the entire registry.
+    /// The admin seat changes hands only through `nominateAdmin` + `acceptAdmin`.
+    /// Routing it through the abuse path would let one call hand over the whole
+    /// registry; the error names the right door.
     function test_AdminTransfer_RevertOnBaseNode() public {
         // Read baseNode BEFORE expectRevert — otherwise the cheatcode binds to
         // the `baseNode()` view call instead of the transfer.
@@ -222,10 +219,8 @@ contract L2RegistryAdminTransferTest is Test {
 
     /// Self-transfer must be refused. `_transfer` permits `from == to`, so
     /// without an explicit guard `adminTransfer(node, currentOwner)` moves
-    /// nothing but still bumps the record version — a wipe-in-place that is
-    /// functionally the suspend/takedown power the owner decided AGAINST
-    /// (transfer only). It has no legitimate transfer use, and the contract
-    /// cannot be patched after the clone deploy.
+    /// nothing but still resets the records — a one-call wipe-in-place with no
+    /// transfer use.
     function test_AdminTransfer_RevertSelfTransfer() public {
         bytes32 node = _register("venue", organiser);
 
@@ -326,11 +321,10 @@ contract L2RegistryAdminTransferTest is Test {
         assertEq(registry.owner(node), claimant);
     }
 
-    /// Documents the frozen registry shape honestly: the registry ADMIN can
-    /// reach `setAddr` on any node in two visible transactions, by adding
-    /// itself as a registrar. This is inherited Durin behaviour, not something
-    /// this change introduces — pinned so the published policy does not claim
-    /// more than the contract delivers.
+    /// The accepted power, pinned so no published policy claims more than the
+    /// contract delivers (owner decision 2026-09-14): the admin seat can rewrite
+    /// any name's records IN PLACE, in two visible transactions, by enrolling
+    /// itself as a registrar. The name does not move.
     function test_Governance_CanReachAddrRecordsViaAddRegistrar() public {
         bytes32 node = _register("venue", organiser);
 
@@ -340,6 +334,7 @@ contract L2RegistryAdminTransferTest is Test {
         vm.stopPrank();
 
         assertEq(registry.addr(node), stranger);
+        assertEq(registry.owner(node), organiser, "the name itself did not move");
     }
 
     // ── setText removal ───────────────────────────────────────────────────────

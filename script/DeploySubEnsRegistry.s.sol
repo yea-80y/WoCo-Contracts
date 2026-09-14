@@ -2,78 +2,68 @@
 pragma solidity ^0.8.24;
 
 import {Script, console} from "forge-std/Script.sol";
-import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {WoCoSubEnsDeployer} from "../src/WoCoSubEnsDeployer.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
-import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
 
 /// @title DeploySubEnsRegistry
-/// @notice Creates WoCo's sub-ENS registry on an L2 from OUR OWN registry
-///         implementation, deploys WoCoRegistrar, wires it in, seeds sponsor +
-///         reserved names, and hands both admin roles to `REGISTRY_ADMIN`
-///         before it returns.
+/// @notice Deploys WoCo's sub-ENS registry (v2) for `woco.eth` and its
+///         WoCoRegistrar in ONE transaction through `WoCoSubEnsDeployer`, with
+///         both admin roles on `REGISTRY_ADMIN` from the start, and proves the
+///         registry runs OUR implementation before anything is broadcast.
 ///
-/// @dev Run against Arbitrum Sepolia first:
+/// @dev Run against Arbitrum Sepolia first, with a Safe there as the admin:
 ///        forge script script/DeploySubEnsRegistry.s.sol --rpc-url arb_sepolia --broadcast
 ///
 ///      Required env:
-///        DEPLOYER_PRIVATE_KEY — deployer EOA. Holds both admin roles only for the
-///                               length of this script; see the rotation step below.
+///        DEPLOYER_PRIVATE_KEY — pays for the one transaction. Holds no role at
+///                               any point.
 ///        SPONSOR_ADDRESS      — platform gas-sponsor wallet authorised to mint.
-///        REGISTRY_ADMIN       — the address that ENDS UP holding `baseNode` and
-///                               owning WoCoRegistrar. REQUIRED, no default.
-///      Optional env:
-///        PLATFORM_SIGNER_ADDRESS — signer for registerWithPermit (defaults to sponsor).
-///        PARENT_NAME             — defaults to "woco.eth".
-///        ALLOW_EOA_ADMIN         — testnet escape hatch; see the guard below.
+///        REGISTRY_ADMIN       — the Safe. Holds the admin seat and owns the
+///                               registrar from construction. REQUIRED.
+///
+///      The parent name is NOT configurable: see `PARENT_NAME`.
+///
+///      NOT DONE HERE, BY DESIGN: wiring the registrar in. `addRegistrar` is the
+///      admin's own transaction; the script prints its calldata
+///      (`wiringCall`).
+///
+/// WHAT CHANGED IN v2 (WoCo-Contracts #21)
+///
+/// v1 cloned and initialised in separate transactions, which left the clone open
+/// to anyone's `initialize` in between (audit 924 F-10 / 927 M9), and gave both
+/// admin roles to the deployer first, then moved them to the Safe with two
+/// single-step, irreversible transfers. v2 does neither: one transaction, roles
+/// set at construction, nothing to rotate. The `ALLOW_EOA_ADMIN` escape hatch
+/// went with the rotation — rehearse on Arbitrum Sepolia with a Safe, as on
+/// mainnet.
 ///
 /// WHY THIS DEPLOYS ITS OWN IMPLEMENTATION (WoCo-Event-App #440)
 ///
-/// This script used to create the registry through Durin's canonical
-/// `L2RegistryFactory`, which does `Clones.clone(registryImplementation)` against
-/// an implementation address fixed at the factory's own construction — NameStone's.
-/// Every WoCo addition to `L2Registry.sol` (`adminTransfer` and the #422 guards)
-/// therefore existed only in this repo: the bytecode that would have run on chain
-/// was pristine upstream Durin. The tests passed because they construct
-/// `L2Registry` locally; nothing asserted that the DEPLOYED registry was built
-/// from our source.
+/// An earlier version created the registry through Durin's canonical
+/// `L2RegistryFactory`, which clones an implementation fixed at the factory's
+/// construction — NameStone's — so every WoCo change to `L2Registry.sol` existed
+/// only in this repo and never on chain. The tripwire below asserts, at deploy
+/// time, that the registry about to go live runs OUR source. Reinstating a
+/// factory call trips it.
 ///
-/// So the shape is kept (an EIP-1167 clone — every existing test and all the
-/// storage-layout reasoning still hold) and only the implementation changes hands:
-/// deploy `L2Registry` from this repo, clone THAT, initialise it. Direct
-/// construction is not an option — the vendored constructor calls
-/// `_disableInitializers()`.
-///
-/// The tripwire below is the point of the change, not the clone. It asserts, on
-/// chain, at deploy time, that the registry about to be handed to the multisig
-/// runs OUR code. Reinstating the factory call trips it three separate ways —
-/// see `_assertRegistryRunsOurImplementation`.
-///
-/// WHY THE ROTATION IS IN THE SCRIPT AND NOT A RUNBOOK STEP
-///
-/// Registry admin is not a role flag — it is ownership of the `baseNode` ERC-721
-/// (`L2Registry.owner()` returns `owner(baseNode)`, and `initialize` mints that
-/// token to whoever is handed as `admin`). Whoever holds it can call
-/// `addRegistrar(itself)` and then write records — `setAddr` included — for ANY
-/// name in the registry, because `onlyOwnerOrRegistrar` scopes to registrar
-/// MEMBERSHIP, not to a node. It can also `adminTransfer` any name to itself.
-///
-/// The registry is an EIP-1167 clone and cannot be upgraded, and the #422
-/// decision to ship `adminTransfer` with NO TIMELOCK rests entirely on that
-/// power sitting behind a multisig rather than one key. A deploy that ends with
-/// the deployer EOA still holding `baseNode` therefore does not merely leave a
-/// chore outstanding — it invalidates the premise the contract was reviewed on,
-/// silently, and an earlier version of this script did exactly that.
-///
-/// ⚠️ BOTH TRANSFERS BELOW ARE SINGLE-STEP AND IRREVERSIBLE. `baseNode` sent to
-/// an address that cannot transact is the whole registry lost with no recovery
-/// path; `WoCoRegistrar` is plain `Ownable` (not `Ownable2Step`), so the same
-/// mistake there permanently freezes `addSponsor` / `setReserved` /
-/// `setPlatformSigner`. Verify `REGISTRY_ADMIN` on a block explorer before
-/// broadcasting. The guard below rejects an EOA, which catches a typo'd or
-/// forgotten value, but it CANNOT catch a well-formed address you do not control.
+/// ⚠️ `REGISTRY_ADMIN` RECEIVES THE WHOLE REGISTRY AT CONSTRUCTION. The admin seat
+/// then moves only through `nominateAdmin`, which only its holder can call, so a
+/// wrong address here loses the registry for good. Verify it on a block explorer
+/// before broadcasting. The guard below refuses an address with no code, and an
+/// EOA carrying an EIP-7702 delegation — which is what the Safe's own signer
+/// account is — but it CANNOT catch a well-formed contract you do not control.
 contract DeploySubEnsRegistry is Script {
+    /// @notice The parent name this registry serves, and its namehash.
+    /// @dev Fixed rather than configured: a registry initialised under a
+    ///      mistyped parent mints normally and answers nothing once L1 points at
+    ///      it. The node is a literal, checked against the deployed registry,
+    ///      because comparing `baseNode()` with a namehash computed from the same
+    ///      string would check nothing.
+    string constant PARENT_NAME = "woco.eth";
+    bytes32 constant PARENT_NODE = 0x616c19dee44e200629c0e4918ca0fe2f6e85100ea0b354c4f888e11c07a9006f;
+
     /// @notice The implementation NameStone's canonical `L2RegistryFactory`
     ///         clones (read from the factory on Arb Sepolia, 2026-09-02). Named
     ///         here so that a deploy which somehow ends up pointing at upstream
@@ -86,122 +76,128 @@ contract DeploySubEnsRegistry is Script {
     bytes15 constant CLONE_SUFFIX = 0x5af43d82803e903d91602b57fd5bf3;
     uint256 constant CLONE_RUNTIME_LENGTH = 45;
 
+    /// @dev EIP-7702 delegation designator: 0xef0100 ‖ 20-byte delegate. No
+    ///      deployed contract's code can start with 0xEF (EIP-3541), so the
+    ///      prefix alone identifies a delegated account.
+    bytes3 constant DELEGATION_PREFIX = 0xef0100;
+
     /// @dev A node that is registered nowhere: not the zero node the
     ///      uninitialised implementation calls `baseNode`, and not a namehash
     ///      anything could mint. Used only to make WoCo's functions answer.
     bytes32 constant PROBE_NODE = keccak256("woco/deploy/tripwire-probe");
 
-    /// @return registryAddress The initialised registry clone now owned by `REGISTRY_ADMIN`.
-    /// @return registrarAddress The `WoCoRegistrar` wired into it.
+    /// @return registryAddress  The initialised registry clone, admin seat on `REGISTRY_ADMIN`.
+    /// @return registrarAddress The `WoCoRegistrar`, owned by `REGISTRY_ADMIN`, not yet wired in.
     function run() external returns (address registryAddress, address registrarAddress) {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
-        address deployer = vm.addr(deployerPk);
         address sponsor = vm.envAddress("SPONSOR_ADDRESS");
-        // Platform signer: address whose off-chain signature authorises registerWithPermit.
-        // For buildathon: same address as sponsor. Post-buildathon: use a separate cold key.
-        address platformSigner = vm.envOr("PLATFORM_SIGNER_ADDRESS", sponsor);
-        string memory parentName = vm.envOr("PARENT_NAME", string("woco.eth"));
-
-        // Required, not defaulted. Defaulting this to `deployer` is precisely the
-        // outcome the header describes, and a console warning is not a safeguard
-        // because forge script output scrolls past.
-        address registryAdmin = vm.envAddress("REGISTRY_ADMIN");
-        require(registryAdmin != address(0), "REGISTRY_ADMIN must not be the zero address");
-
-        // A multisig is a contract; the deployer EOA is not. This is a coarse
-        // check and deliberately so — it cannot verify signers or a threshold,
-        // only that the deploy is not ending on a bare key. Testnet iteration
-        // sets ALLOW_EOA_ADMIN=true and accepts that the #422 premise does not
-        // hold there.
-        bool allowEoaAdmin = vm.envOr("ALLOW_EOA_ADMIN", false);
-        require(
-            allowEoaAdmin || registryAdmin.code.length > 0,
-            "REGISTRY_ADMIN has no code - expected a multisig; set ALLOW_EOA_ADMIN=true for testnet"
-        );
+        address registryAdmin = _registryAdmin();
+        _requireSafeShapedAdmin(registryAdmin);
 
         vm.startBroadcast(deployerPk);
-
-        // 1. Create our registry from OUR implementation. The deployer takes
-        //    admin only because steps 3-5 are `onlyOwner` and the multisig would
-        //    otherwise have to sign each of them; step 6 hands it straight on.
-        (address registryAddr, address implAddr) = _deployRegistryClone(parentName, deployer);
-        registryAddress = registryAddr;
-
-        // 1b. Prove it before anything else touches it. Placed here, and inside
-        //     the broadcast, so that a failure aborts the script before forge
-        //     submits ANY transaction — a wrong registry is never created.
-        _assertRegistryRunsOurImplementation(registryAddr, implAddr);
-
-        IL2Registry registry = IL2Registry(registryAddr);
-
-        // 2. Deploy our minting-policy layer.
-        WoCoRegistrar registrar = new WoCoRegistrar(registryAddr, deployer, platformSigner);
-        registrarAddress = address(registrar);
-
-        // 3. Grant the registrar record-setting + minting authority on the registry.
-        registry.addRegistrar(address(registrar));
-
-        // 4. Authorise the platform gas-sponsor wallet to mint.
-        registrar.addSponsor(sponsor);
-
-        // 5. Reserve platform / impersonation-risk labels.
-        string[8] memory reservedLabels =
-            ["woco", "admin", "support", "help", "www", "api", "app", "mail"];
-        for (uint256 i; i < reservedLabels.length; ++i) {
-            registrar.setReserved(reservedLabels[i], true);
-        }
-
-        // 6. Hand both admin roles over. LAST, because everything above needs them.
-        //
-        //    `transferFrom`, not `safeTransferFrom`: the safe variant calls
-        //    `onERC721Received` on the recipient, which a Safe answers only
-        //    through its fallback handler. A multisig deployed without one would
-        //    revert here and strand the whole deploy mid-broadcast, with the
-        //    registry live and the deployer still holding it — the exact state
-        //    this step exists to prevent. The recipient is asserted to be a
-        //    contract above and verified by the operator; a Safe can move any
-        //    ERC-721 it holds regardless of how it received it.
-        bytes32 baseNode = registry.baseNode();
-        registry.transferFrom(deployer, registryAdmin, uint256(baseNode));
-        registrar.transferOwnership(registryAdmin);
-
+        address implAddr;
+        (registryAddress, implAddr, registrarAddress) =
+            _deploy(PARENT_NAME, registryAdmin, sponsor, reservedLabels());
         vm.stopBroadcast();
 
-        // 7. Prove the rotation landed. A deploy that reports success while the
-        //    deployer still holds either role is the failure mode with no
-        //    external signal — nothing else on chain looks different.
-        require(registry.owner() == registryAdmin, "registry admin rotation did not land");
-        require(registrar.owner() == registryAdmin, "registrar ownership rotation did not land");
+        // Forge runs the whole of `run()` as a simulation before it broadcasts
+        // anything, so a check below that fails stops the deploy transaction from
+        // ever being sent.
+        _assertRegistryRunsOurImplementation(registryAddress, implAddr);
+        _assertDeployedState(registryAddress, registrarAddress, registryAdmin, sponsor);
 
-        console.log("Parent name:      ", parentName);
-        console.log("L2Registry impl:  ", implAddr);
-        console.log("L2Registry (clone):", registryAddr);
-        console.log("WoCoRegistrar:    ", address(registrar));
-        console.log("Registry admin:   ", registryAdmin);
-        console.log("Registrar owner:  ", registryAdmin);
-        console.log("Deployer (no roles retained):", deployer);
-        console.log("Authorised sponsor:", sponsor);
-        console.log("Platform signer:  ", platformSigner);
+        console.log("Parent name:        ", PARENT_NAME);
+        console.log("L2Registry impl:    ", implAddr);
+        console.log("L2Registry (clone): ", registryAddress);
+        console.log("WoCoRegistrar:      ", registrarAddress);
+        console.log("Registry admin:     ", registryAdmin);
+        console.log("Registrar owner:    ", registryAdmin);
+        console.log("Deployer (no roles):", vm.addr(deployerPk));
+        console.log("Authorised sponsor: ", sponsor);
+        console.log("NEXT - the registry admin sends, to the registry above:");
+        console.logBytes(wiringCall(registrarAddress));
+    }
+
+    /// @notice Labels the registrar will never mint.
+    function reservedLabels() public pure returns (string[] memory labels) {
+        labels = new string[](8);
+        labels[0] = "woco";
+        labels[1] = "admin";
+        labels[2] = "support";
+        labels[3] = "help";
+        labels[4] = "www";
+        labels[5] = "api";
+        labels[6] = "app";
+        labels[7] = "mail";
+    }
+
+    /// @notice The calldata the registry admin sends to the registry to let the
+    ///         new registrar mint. Public so the tests execute exactly what is
+    ///         printed.
+    function wiringCall(address registrar) public pure returns (bytes memory) {
+        return abi.encodeCall(L2Registry.addRegistrar, (registrar));
     }
 
     /*//////////////////////////////////////////////////////////////
-                          REGISTRY CREATION
+                              DEPLOYMENT
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Deploys our `L2Registry` implementation, clones it, initialises the clone.
-    /// @dev `virtual` ONLY so that tests can substitute a deployment the tripwire
-    ///      must reject (an upstream-shaped registry, a clone of something else).
-    ///      Production always runs this body.
-    /// @return registryAddr The initialised EIP-1167 clone.
-    /// @return implAddr     The implementation it delegates to.
-    function _deployRegistryClone(string memory parentName, address admin)
+    /// @notice Who receives the admin seat and the registrar.
+    /// @dev Required, not defaulted: whoever this is holds the registry for good.
+    ///      `virtual` ONLY so that tests can vary it: `vm.setEnv` writes the whole
+    ///      forge process's environment while test functions run in parallel,
+    ///      so a per-test value would race. The guard on it stays in `run()`.
+    function _registryAdmin() internal view virtual returns (address) {
+        return vm.envAddress("REGISTRY_ADMIN");
+    }
+
+    /// @notice Creates the registry, its implementation and the registrar.
+    /// @dev `virtual` ONLY so that tests can substitute a deployment the checks
+    ///      must reject. Production always runs this body.
+    function _deploy(string memory parentName, address admin, address sponsor, string[] memory labels)
         internal
         virtual
-        returns (address registryAddr, address implAddr)
+        returns (address registryAddr, address implAddr, address registrarAddr)
     {
-        implAddr = address(new L2Registry());
-        registryAddr = Clones.clone(implAddr);
-        IL2Registry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+        WoCoSubEnsDeployer deployer = new WoCoSubEnsDeployer(parentName, admin, sponsor, labels);
+        return (address(deployer.registry()), address(deployer.implementation()), address(deployer.registrar()));
+    }
+
+    /// @dev Refuses an admin that cannot be the Safe: the zero address, an
+    ///      address with no code (a typo, or a bare key), and an EOA carrying an
+    ///      EIP-7702 delegation. The last is not hypothetical — the Safe's own
+    ///      signer is such an account, it has code, and a plain code check
+    ///      would take it.
+    function _requireSafeShapedAdmin(address admin) internal view {
+        require(admin != address(0), "REGISTRY_ADMIN must not be the zero address");
+        bytes memory code = admin.code;
+        require(code.length > 0, "REGISTRY_ADMIN has no code - expected the Safe");
+        require(
+            bytes3(code) != DELEGATION_PREFIX,
+            "REGISTRY_ADMIN is an EIP-7702 delegated EOA - expected the Safe, not a signer account"
+        );
+    }
+
+    /// @dev What the Safe's signers are told they are getting. Every clause
+    ///      holds by construction of `WoCoSubEnsDeployer`; checked anyway, because
+    ///      a deploy that reports success over a wrong state has no other signal.
+    function _assertDeployedState(address registryAddr, address registrarAddr, address admin, address sponsor)
+        internal
+        view
+    {
+        L2Registry registry = L2Registry(registryAddr);
+        WoCoRegistrar registrar = WoCoRegistrar(registrarAddr);
+
+        require(registry.baseNode() == PARENT_NODE, "registry is not woco.eth - its base node is not namehash(woco.eth)");
+        require(registry.owner() == admin, "registry admin seat is not on REGISTRY_ADMIN");
+        require(registrar.owner() == admin, "registrar is not owned by REGISTRY_ADMIN");
+        require(address(registrar.registry()) == registryAddr, "registrar mints into a different registry");
+        require(registrar.authorisedSponsors(sponsor), "SPONSOR_ADDRESS is not an authorised sponsor");
+
+        string[] memory labels = reservedLabels();
+        for (uint256 i; i < labels.length; ++i) {
+            require(registrar.reserved(keccak256(bytes(labels[i]))), "a reserved label is not reserved");
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -209,43 +205,35 @@ contract DeploySubEnsRegistry is Script {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Refuses to continue unless the registry about to go live executes
-    ///         the `L2Registry` source in THIS repo.
+    ///         the v2 `L2Registry` source in THIS repo.
     ///
-    /// @dev Three independent checks, because one is not enough to survive a
-    ///      careless edit:
+    /// @dev Independent checks, because one is not enough to survive a careless
+    ///      edit:
     ///
     ///        (1) SHAPE + TARGET — `registryAddr` is a canonical EIP-1167 clone
-    ///            whose embedded implementation is exactly `implAddr`. Reinstating
-    ///            `IL2RegistryFactory(...).deployRegistry(...)` while leaving the
-    ///            `new L2Registry()` line in place fails here: the factory clones
-    ///            an implementation of its own choosing. Deleting that line
-    ///            instead does not compile.
+    ///            whose embedded implementation is exactly `implAddr`.
     ///
     ///        (2) NOT UPSTREAM — the implementation is not NameStone's known
     ///            address. Redundant with (1) by construction; kept because it
     ///            names the failure the operator actually cares about.
     ///
     ///        (3) OUR CODE — the implementation ANSWERS as ours does. Each WoCo
-    ///            addition is called on the implementation with arguments that
+    ///            function is called on the implementation with arguments that
     ///            make our source revert with one of our own custom errors, and
     ///            the revert data is matched against that error's selector. A
     ///            contract without the function reverts with empty data; one
-    ///            that merely mentions the selector somewhere in its bytecode
-    ///            — a constant, an unrelated PUSH — does the same. This is the
-    ///            check that survives address substitution: (1) and (2) both
-    ///            compare addresses, and an address proves nothing about the
-    ///            code behind it.
+    ///            that merely mentions the selector in its bytecode does the
+    ///            same. Behaviour survives address substitution; addresses and
+    ///            byte scans do not.
     ///
-    ///            An earlier version scanned the runtime bytecode for the
-    ///            selector's four bytes. That is a positive signal only that
-    ///            those bytes occur SOMEWHERE — inside a PUSH32 constant as
-    ///            readily as in the dispatcher — and it is defeated by any
-    ///            contract that names the selector. Behaviour is not.
+    ///        (4) v2, NOT v1 — `acceptAdmin` answers with v2's own error, and
+    ///            `nonces`, which v1's signed record setters needed and v1
+    ///            answers like any view, does not exist at all.
     ///
-    ///            If a WoCo addition is ever removed from `L2Registry`, its
-    ///            probe must be re-pointed at whatever replaces it; deleting the
-    ///            probe is not the fix. If the error vocabulary changes, the
-    ///            expected selectors change with it.
+    ///      If a WoCo function is ever removed from `L2Registry`, its probe must
+    ///      be re-pointed at whatever replaces it; deleting the probe is not the
+    ///      fix. If the error vocabulary changes, the expected selectors change
+    ///      with it.
     function _assertRegistryRunsOurImplementation(address registryAddr, address implAddr) internal view {
         address embedded = _cloneImplementationOf(registryAddr);
         require(embedded == implAddr, "registry is not a clone of the implementation this script deployed");
@@ -287,6 +275,16 @@ contract DeploySubEnsRegistry is Script {
             ),
             "registry implementation does not run WoCo's releaseWithSignature - it is not our bytecode"
         );
+        // v2 admin handover. No handover is open on the uninitialised
+        // implementation, so our source refuses whoever calls.
+        require(
+            _revertsWith(implAddr, abi.encodeCall(L2Registry.acceptAdmin, ()), L2Registry.NotPendingAdmin.selector),
+            "registry implementation does not run v2's acceptAdmin - it is not the v2 bytecode"
+        );
+        require(
+            _revertsEmpty(implAddr, abi.encodeWithSignature("nonces(bytes32)", PROBE_NODE)),
+            "registry implementation still answers nonces - it carries v1's signed record setters"
+        );
     }
 
     /// @dev Extracts the implementation address from an EIP-1167 minimal proxy,
@@ -325,5 +323,13 @@ contract DeploySubEnsRegistry is Script {
         // shorter or empty revert zero-pads and so never matches.
         // forge-lint: disable-next-line(unsafe-typecast)
         return bytes4(ret) == expectedError;
+    }
+
+    /// @dev True if a STATICCALL of `callData` on `target` reverts with no data
+    ///      at all — what a contract with no matching function and no fallback
+    ///      does.
+    function _revertsEmpty(address target, bytes memory callData) internal view returns (bool) {
+        (bool ok, bytes memory ret) = target.staticcall(callData);
+        return !ok && ret.length == 0;
     }
 }
