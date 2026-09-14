@@ -187,8 +187,10 @@ contract WoCoTicketLedgerTest is Test {
         ledger.registerEvent(organiser, 0, MANIFEST, END_TS);
     }
 
+    /// Its own error, not ZeroAddress: a zero organiser and an empty manifest
+    /// are different mistakes, and the caller should be told which it made.
     function test_RegisterEvent_RevertZeroManifest() public {
-        vm.expectRevert(WoCoTicketLedger.ZeroAddress.selector);
+        vm.expectRevert(WoCoTicketLedger.EmptyManifestRef.selector);
         vm.prank(sponsor);
         ledger.registerEvent(organiser, SUPPLY, bytes32(0), END_TS);
     }
@@ -568,8 +570,73 @@ contract WoCoTicketLedgerTest is Test {
         ledger.getEventStatus(keccak256("nope"));
     }
 
-    function test_Remaining_UnknownEventIsZero() public view {
-        assertEq(ledger.remaining(keccak256("nope")), 0);
+    /// An unknown id is not a sold-out event. Returning 0 made the two
+    /// indistinguishable; every other event view already refuses.
+    function test_Remaining_RevertNotFound() public {
+        vm.expectRevert(WoCoTicketLedger.EventNotFound.selector);
+        ledger.remaining(keccak256("nope"));
+    }
+
+    /// `remaining` is what can be sold NOW. A cancelled event sells nothing,
+    /// however much stamped supply it has left — which `getEvent` still reports.
+    function test_Remaining_ZeroOnceCancelled() public {
+        bytes32 eventId = _register();
+        assertEq(ledger.remaining(eventId), SUPPLY, "precondition: a live event reports its supply");
+
+        vm.prank(organiser);
+        ledger.cancelEvent(eventId);
+
+        assertEq(ledger.remaining(eventId), 0);
+        (uint64 totalSupply, uint64 nextSlot, , ) = ledger.getEvent(eventId);
+        assertEq(totalSupply - nextSlot, SUPPLY, "cancelling must not touch stamped supply");
+    }
+
+    /// The same boundary as the mint paths, to the second: `eventEndTs - 1`
+    /// still sells and `eventEndTs` does not. Each side is checked against
+    /// `claimFor` itself, so the view cannot drift from the guard it mirrors.
+    function test_Remaining_ClosesAtTheCutoffSecond() public {
+        bytes32 eventId = _register();
+
+        vm.warp(uint256(END_TS) - 1);
+        assertEq(ledger.remaining(eventId), SUPPLY, "the last second before the cutoff still sells");
+        vm.prank(sponsor);
+        ledger.claimFor(eventId, buyer, bytes32(0));
+        assertEq(ledger.remaining(eventId), SUPPLY - 1);
+
+        vm.warp(uint256(END_TS));
+        assertEq(ledger.remaining(eventId), 0, "the cutoff second itself does not");
+        vm.expectRevert(WoCoTicketLedger.SalesClosed.selector);
+        vm.prank(sponsor);
+        ledger.claimFor(eventId, buyer, bytes32(0));
+    }
+
+    /// Non-zero exactly when a sponsor mint succeeds — across sales,
+    /// cancellation and the clock. The cutoff second itself is pinned above;
+    /// a fuzzed clock rarely lands on it.
+    function testFuzz_Remaining_NonZeroExactlyWhenClaimForSucceeds(
+        uint256 sold,
+        bool    cancelled,
+        uint256 elapsed
+    ) public {
+        bytes32 eventId = _register();
+        sold = bound(sold, 0, SUPPLY);
+        if (sold > 0) {
+            vm.prank(sponsor);
+            ledger.batchClaimFor(eventId, _owners(sold), bytes32(0));
+        }
+        if (cancelled) {
+            vm.prank(organiser);
+            ledger.cancelEvent(eventId);
+        }
+        vm.warp(block.timestamp + bound(elapsed, 0, 14 days));
+
+        uint256 left = ledger.remaining(eventId);
+        vm.prank(sponsor);
+        try ledger.claimFor(eventId, buyer, bytes32(0)) {
+            assertGt(left, 0, "claimFor succeeded while remaining reported 0");
+        } catch {
+            assertEq(left, 0, "claimFor reverted while remaining reported stock");
+        }
     }
 
     function test_SlotOwner_UnclaimedIsZero() public {
@@ -594,6 +661,20 @@ contract WoCoTicketLedgerTest is Test {
         vm.expectRevert(WoCoTicketLedger.ZeroAddress.selector);
         vm.prank(owner);
         ledger.addSponsor(address(0));
+    }
+
+    /// Renouncing would leave `owner` at address(0) for good, and every
+    /// onlyOwner power with it. The power it would cost most is exercised
+    /// afterwards: removing a sponsor, the only response to a leaked sponsor key.
+    function test_RenounceOwnership_Disabled() public {
+        vm.expectRevert(WoCoTicketLedger.RenounceDisabled.selector);
+        vm.prank(owner);
+        ledger.renounceOwnership();
+
+        assertEq(ledger.owner(), owner, "ownership must survive a renounce attempt");
+        vm.prank(owner);
+        ledger.removeSponsor(sponsor);
+        assertFalse(ledger.authorisedSponsors(sponsor), "the owner must still be able to remove a sponsor");
     }
 
     /// The replacement mechanism the split exists for: swapping the sponsor set
@@ -737,6 +818,21 @@ contract WoCoTicketLedgerTest is Test {
         ledger.setDisputeAuthority(daoAuth);
     }
 
+    /// The server encodes calls and decodes reverts from its OWN human-readable
+    /// ABI (event-contract-ledger.ts), never from this contract's artefact. So a
+    /// parameter rename — `claimFor`'s `owner` became `to` — is invisible to it,
+    /// but a type change here would break fulfilment with no compile error
+    /// anywhere. The signatures are written out, as in `_expectedId`, so that
+    /// drift has to be made in two places.
+    function test_ServerAbi_SelectorsUnchanged() public pure {
+        assertEq(bytes32(WoCoTicketLedger.claimFor.selector),      bytes32(bytes4(keccak256("claimFor(bytes32,address,bytes32)"))));
+        assertEq(bytes32(WoCoTicketLedger.batchClaimFor.selector), bytes32(bytes4(keccak256("batchClaimFor(bytes32,address[],bytes32)"))));
+        assertEq(bytes32(WoCoTicketLedger.getSlotData.selector),   bytes32(bytes4(keccak256("getSlotData(bytes32,uint256)"))));
+        assertEq(bytes32(WoCoTicketLedger.remaining.selector),     bytes32(bytes4(keccak256("remaining(bytes32)"))));
+        assertEq(bytes32(WoCoTicketLedger.EventNotFound.selector), bytes32(bytes4(keccak256("EventNotFound()"))));
+        assertEq(WoCoTicketLedger.SlotClaimed.selector, keccak256("SlotClaimed(bytes32,uint256,address,address,bytes32)"));
+    }
+
     // ── Boundaries the guarantee depends on ───────────────────────────────────
 
     /// The cutoff is exclusive: the last second before `eventEndTs` still
@@ -791,22 +887,25 @@ contract WoCoTicketLedgerTest is Test {
         assertTrue(cancelled);
     }
 
-    /// getSlotData on an UNCLAIMED slot returns the batch-0 claimer/orderRef,
-    /// not zeroes, because `batchFirstSlot` defaults to 0. Callers must gate on
-    /// `owner`. Pinned because payments will read this view.
-    function test_GetSlotData_UnclaimedSlotMisattributesBatchFields() public {
+    /// getSlotData on an UNCLAIMED slot returns all zeroes. Its `batchFirstSlot`
+    /// defaults to 0, so reading through would hand back batch 0's claimer and
+    /// orderRef — which is why slot 0 is claimed here with non-zero values
+    /// first: without them the leak would read as zeroes too, and this test
+    /// would pass against it. Pinned because payments will read this view.
+    function test_GetSlotData_UnclaimedSlotReturnsZeroes() public {
         bytes32 eventId = _register();
 
         vm.prank(sponsor);
         ledger.claimFor(eventId, buyer, keccak256("real-order"));
+        (, address claimer0, bytes32 ref0) = ledger.getSlotData(eventId, 0);
+        assertEq(claimer0, sponsor, "precondition: batch 0 has a non-zero claimer");
+        assertEq(ref0, keccak256("real-order"), "precondition: batch 0 has a non-zero orderRef");
 
         (address owner_, address claimer, bytes32 ref) = ledger.getSlotData(eventId, 7);
 
         assertEq(owner_, address(0), "slot 7 was never claimed");
-        // These are slot 0's values leaking through, NOT zeroes — the exact
-        // reason the natspec tells callers to check `owner` first.
-        assertEq(claimer, sponsor);
-        assertEq(ref, keccak256("real-order"));
+        assertEq(claimer, address(0), "batch 0's claimer leaked into an unclaimed slot");
+        assertEq(ref, bytes32(0), "batch 0's orderRef leaked into an unclaimed slot");
     }
 
     function test_Admin_RevertNonOwner() public {
