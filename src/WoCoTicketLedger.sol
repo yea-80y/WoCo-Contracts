@@ -235,6 +235,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error NotSlotOwner();
     error TransferToSelf();
     error SignatureExpired();
+    error EmptyManifestRef();
+    error RenounceDisabled();
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -272,7 +274,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *                     wallet registering on the organiser's behalf. This
      *                     is the address that may later `cancelEvent`.
      * @param supply       Total tickets. Must fit in uint64 and be non-zero.
-     * @param manifestRef  Off-chain ticket-manifest commit.
+     * @param manifestRef  Off-chain ticket-manifest commit. Must be non-zero.
+     *                     Refused with its own `EmptyManifestRef`, not the
+     *                     `ZeroAddress` a zero organiser gets, so a caller can
+     *                     tell which argument was wrong.
      * @param eventEndTs   UNIX seconds; the on-chain sales cutoff. `claimFor`
      *                     reverts `SalesClosed` at or after this. Immutable
      *                     once stamped — see the monotonicity note above.
@@ -285,7 +290,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ) external returns (bytes32 eventId) {
         if (organiser == address(0))       revert ZeroAddress();
         if (supply == 0)                   revert InsufficientSupply();
-        if (manifestRef == bytes32(0))     revert ZeroAddress();
+        if (manifestRef == bytes32(0))     revert EmptyManifestRef();
         if (eventEndTs <= block.timestamp) revert InvalidEventEnd();
 
         // DOMAIN-SEPARATED by chain and contract, then keyed by the registrant.
@@ -334,13 +339,22 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /**
      * @notice Mint a single slot. Authorised sponsors only. No funds move here
      *         — whoever called has already settled payment on their own side.
+     * @param eventId  The event to mint in.
+     * @param to       The slot's first holder. Cannot be zero: `owner ==
+     *                 address(0)` is how this contract encodes "never claimed".
+     *                 Named `to`, not `owner`, so it cannot shadow
+     *                 `Ownable.owner()` — under that name a later edit reaching
+     *                 for the contract's owner in this body would silently get
+     *                 the buyer instead.
+     * @param orderRef Off-chain order commit, stored once for the batch and
+     *                 returned by `getSlotData`.
      */
-    function claimFor(bytes32 eventId, address owner, bytes32 orderRef)
+    function claimFor(bytes32 eventId, address to, bytes32 orderRef)
         external
         onlyAuthorised
         returns (uint256 slot)
     {
-        if (owner == address(0)) revert ZeroAddress();
+        if (to == address(0)) revert ZeroAddress();
         Event storage ev = _events[eventId];
         if (!ev.exists)                       revert EventNotFound();
         if (ev.cancelled)                     revert AlreadyCancelled();
@@ -352,15 +366,22 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         // safe: first < totalSupply ≤ uint64.max
         unchecked { ev.nextSlot = first + 1; }
 
-        slots[eventId][slot] = Slot({owner: owner, batchFirstSlot: first});
+        slots[eventId][slot] = Slot({owner: to, batchFirstSlot: first});
         batchOrderRef[eventId][first] = orderRef;
         batchClaimer[eventId][first]  = msg.sender;
 
-        emit SlotClaimed(eventId, slot, owner, msg.sender, orderRef);
+        emit SlotClaimed(eventId, slot, to, msg.sender, orderRef);
     }
 
     /**
      * @notice Mint N contiguous slots in one call. Authorised sponsors only.
+     * @param eventId  The event to mint in.
+     * @param owners   One first holder per slot, in slot order; none may be
+     *                 zero. The loop binds each to `to`, not `owner`, for the
+     *                 shadowing reason given on `claimFor`.
+     * @param orderRef Stored once for the whole batch: every slot in it
+     *                 resolves to this ref, and to the calling sponsor as
+     *                 `claimer`.
      */
     function batchClaimFor(
         bytes32 eventId,
@@ -389,12 +410,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         batchClaimer[eventId][first]  = msg.sender;
 
         for (uint256 i; i < n;) {
-            address owner = owners[i];
-            if (owner == address(0)) revert ZeroAddress();
+            address to = owners[i];
+            if (to == address(0)) revert ZeroAddress();
             uint256 s;
             unchecked { s = firstSlot + i; }
-            slots[eventId][s] = Slot({owner: owner, batchFirstSlot: first});
-            emit SlotClaimed(eventId, s, owner, msg.sender, orderRef);
+            slots[eventId][s] = Slot({owner: to, batchFirstSlot: first});
+            emit SlotClaimed(eventId, s, to, msg.sender, orderRef);
             unchecked { ++i; }
         }
 
@@ -686,19 +707,24 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         return (ev.eventEndTs, ev.cancelled);
     }
 
-    /// @notice Slot owner plus the batch attribution it was minted under.
-    /// @dev CALLERS MUST CHECK `owner` FIRST. An unclaimed slot has no batch,
-    ///      so `batchFirstSlot` reads as its default 0 and the other two
-    ///      returns are those of the batch at slot 0 — real data belonging to
-    ///      a different slot, not zero values. `owner == address(0)` means the
-    ///      slot is unclaimed and `claimer`/`orderRef` MUST be ignored.
-    ///      (Inherited from V2; payments will read this view.)
+    /// @notice Slot owner plus the batch attribution it was minted under. All
+    ///         three are zero for a slot that was never claimed.
+    /// @dev The unclaimed zeroes are returned explicitly, not read. Such a slot
+    ///      has no batch, so its `batchFirstSlot` reads as the default 0, and
+    ///      reading through would return the claimer and orderRef of the batch
+    ///      at slot 0 — real data belonging to a different slot. V2 returned
+    ///      exactly that and told callers to check `owner` first; payments will
+    ///      read this view, and a rule every caller must remember is one some
+    ///      caller forgets.
+    ///
+    ///      `owner == address(0)` is still THE test for "unclaimed".
     function getSlotData(bytes32 eventId, uint256 slot)
         external
         view
         returns (address owner, address claimer, bytes32 orderRef)
     {
         Slot memory sd = slots[eventId][slot];
+        if (sd.owner == address(0)) return (address(0), address(0), bytes32(0));
         return (
             sd.owner,
             batchClaimer[eventId][sd.batchFirstSlot],
@@ -710,9 +736,24 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         return slots[eventId][slot].owner;
     }
 
+    /// @notice Slots remaining to be sold now: zero once the event is cancelled
+    ///         or past its sales cutoff, whatever stamped supply is left.
+    /// @dev The two zero cases copy the mint paths' guards exactly — `cancelled`
+    ///      and `block.timestamp >= eventEndTs` — so a non-zero answer means
+    ///      `claimFor`, in the same state and block, will not revert
+    ///      `AlreadyCancelled` or `SalesClosed`. Change those guards and these
+    ///      must change with them. Reporting stamped supply instead would show
+    ///      a cancelled or closed event as on sale; that figure, regardless of
+    ///      state, is `getEvent`'s `totalSupply - nextSlot`.
+    ///
+    ///      Reverts `EventNotFound` for an unknown id, like `getEvent` and
+    ///      `getEventStatus`: returning 0 made a mistyped id indistinguishable
+    ///      from a sold-out event.
     function remaining(bytes32 eventId) external view returns (uint256) {
         Event memory ev = _events[eventId];
-        if (!ev.exists) return 0;
+        if (!ev.exists)                       revert EventNotFound();
+        if (ev.cancelled)                     return 0;
+        if (block.timestamp >= ev.eventEndTs) return 0;
         return ev.totalSupply - ev.nextSlot;
     }
 
@@ -733,5 +774,22 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         if (authority == address(0)) revert ZeroAddress();
         disputeAuthority = authority;
         emit DisputeAuthorityUpdated(authority);
+    }
+
+    /// @notice Disabled: always reverts `RenounceDisabled`.
+    /// @dev Renouncing would set `owner` to address(0) for good, and every
+    ///      `onlyOwner` power would go with it — `addSponsor`, `removeSponsor`,
+    ///      `setDisputeAuthority`. A leaked sponsor key could then never be
+    ///      removed, nor a lost dispute authority replaced, on a contract that
+    ///      is deployed once. `Ownable2Step` makes transfers two-step but leaves
+    ///      renounce a single call, and renounce is the only road to a zero
+    ///      owner: a transfer takes effect only when its recipient accepts,
+    ///      which address(0) cannot do. Hand ownership on with
+    ///      `transferOwnership` + `acceptOwnership` instead.
+    ///
+    ///      `pure` and unguarded: there is nothing left to authorise, so every
+    ///      caller gets the same answer. The selector is unchanged.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 }
