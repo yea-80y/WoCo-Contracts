@@ -294,6 +294,38 @@ contract L2RegistryReleaseTest is Test {
         assertEq(by, organiser, "release record was overwritten");
     }
 
+    /// The cleanup a parent's holder owes before releasing it: one `release`
+    /// per child, batched through the public `multicall`, which keeps the
+    /// caller (Fable sign-off F4). A stranger's same batch fails as a whole.
+    function test_Release_AParentClearsItsChildrenInOneMulticall() public {
+        bytes32 venue = _register("venue", organiser);
+        address childHolder = makeAddr("childHolder");
+        bytes[] memory noData = new bytes[](0);
+        vm.startPrank(organiser);
+        bytes32 shop = registry.createSubnode(venue, "shop", childHolder, noData);
+        bytes32 bar = registry.createSubnode(venue, "bar", childHolder, noData);
+        vm.stopPrank();
+
+        bytes[] memory calls = new bytes[](3);
+        calls[0] = abi.encodeCall(L2Registry.release, (shop));
+        calls[1] = abi.encodeCall(L2Registry.release, (bar));
+        calls[2] = abi.encodeCall(L2Registry.release, (venue));
+
+        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
+        vm.prank(stranger);
+        registry.multicall(calls);
+        assertEq(registry.owner(shop), childHolder, "a stranger's batch released something");
+
+        vm.prank(organiser);
+        registry.multicall(calls);
+        assertEq(registry.owner(shop), address(0));
+        assertEq(registry.owner(bar), address(0));
+        assertEq(registry.owner(venue), address(0));
+        assertEq(registry.childCount(venue), 0);
+        (address byShop,) = registry.lastRelease(shop);
+        assertEq(byShop, childHolder, "the record names the child's holder");
+    }
+
     /*//////////////////////////////////////////////////////////////
                         WHAT HAPPENS AFTERWARDS
     //////////////////////////////////////////////////////////////*/

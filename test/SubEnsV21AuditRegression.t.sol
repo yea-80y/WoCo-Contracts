@@ -1000,6 +1000,22 @@ contract SubEnsV21AuditRegressionTest is Test {
         assertEq(registry.owner(node), address(wallet));
     }
 
+    /// The LOWER bound of `VALIDATOR_GAS` (Fable sign-off F3): a wallet that
+    /// spends ~700k before answering — the size of an undeployed passkey
+    /// account's deployment plus a P-256 verification — must still be believed.
+    /// Without this, trimming the constant would pass every other test and
+    /// refuse every real passkey release.
+    function test_Validator_AHeavyButHonestWalletIsBelieved() public {
+        Spends1271 wallet = new Spends1271();
+        (bytes32 node, uint256 exp) = _walletName(address(wallet), "heavy");
+        wallet.approve(registry.releaseDigest(node, exp));
+        vm.etch(Validator.ADDR, address(new Asks1271()).code);
+
+        vm.prank(stranger);
+        registry.releaseWithSignature(node, exp, address(wallet), hex"1271");
+        assertEq(registry.owner(node), address(0), "a wallet within the gas bound was refused");
+    }
+
     /// Only a clean `true` is yes: a malformed or oversized answer is no.
     function test_Validator_AnythingButACleanTrueIsARefusal() public {
         Approves1271 wallet = new Approves1271();
@@ -1166,6 +1182,45 @@ contract SubEnsV21AuditRegressionTest is Test {
         );
     }
 
+    /// `releaseDigest` decodes the stored name with `ENSDNSUtils.dnsDecode`,
+    /// which writes past its allocation. Names whose decoded length sits on the
+    /// allocation's 32-byte boundaries (31, 32, 33, 63, 64, 65 bytes) hash as an
+    /// independent encoder says (Fable sign-off, Q3).
+    function test_712_TheDigestAtAllocationBoundaries() public {
+        uint256[6] memory lens = [uint256(22), 23, 24, 54, 55, 56];
+        for (uint256 i; i < lens.length; ++i) {
+            string memory label = _repeat(bytes1(uint8(0x61 + i)), lens[i]);
+            bytes32 node = _mint(label, holder);
+            string memory full = string.concat(label, ".woco.eth");
+            assertEq(bytes(full).length, lens[i] + 9);
+            uint256 exp = block.timestamp + 600 + i;
+            assertEq(registry.releaseDigest(node, exp), _releaseDigest(full, node, 1, exp), full);
+            assertEq(registry.decodeName(registry.names(node)), full);
+        }
+    }
+
+    /// ... and at the 255-byte wire cap, end to end through a real release.
+    function test_712_TheDigestAtTheNameCap() public {
+        (address sigHolder, uint256 sigPk) = makeAddrAndKey("capHolder");
+        string memory l63 = _repeat("x", 63);
+        string memory l52 = _repeat("y", 52);
+        bytes32 n = _mint(l63, holder);
+        n = _child(n, l63, holder);
+        n = _child(n, l63, holder);
+        n = _child(n, l52, sigHolder);
+        assertEq(registry.names(n).length, 255, "premise: at the cap");
+
+        string memory full = string.concat(l52, ".", l63, ".", l63, ".", l63, ".woco.eth");
+        assertEq(registry.decodeName(registry.names(n)), full);
+        uint256 exp = block.timestamp + 600;
+        assertEq(registry.releaseDigest(n, exp), _releaseDigest(full, n, 1, exp));
+
+        bytes memory sig = _sign(sigPk, registry.releaseDigest(n, exp));
+        vm.prank(stranger);
+        registry.releaseWithSignature(n, exp, sigHolder, sig);
+        assertEq(registry.owner(n), address(0));
+    }
+
     /// ERC-5267, read from the CLONE: the name and version come from the
     /// implementation's immutables, the address and chain from the clone.
     function test_712_TheCloneReportsItsOwnDomain() public view {
@@ -1293,6 +1348,34 @@ contract Approves1271 is IERC1271 {
 
     function isValidSignature(bytes32 hash, bytes memory) external view returns (bytes4) {
         return approved[hash] ? IERC1271.isValidSignature.selector : bytes4(0);
+    }
+}
+
+/// @dev An ERC-1271 wallet that spends ~700k gas before approving `approved`.
+contract Spends1271 {
+    bytes32 public approved;
+
+    function approve(bytes32 h) external {
+        approved = h;
+    }
+
+    function isValidSignature(bytes32 h, bytes memory) external view returns (bytes4) {
+        uint256 start = gasleft();
+        uint256 x;
+        while (start - gasleft() < 700_000) {
+            x = uint256(keccak256(abi.encode(x)));
+        }
+        return h == approved ? IERC1271.isValidSignature.selector : bytes4(0);
+    }
+}
+
+/// @dev A validator that simply asks the signer through ERC-1271, with all the
+///      gas it was given. Etched over the pinned validator.
+contract Asks1271 {
+    function isValidSig(address signer, bytes32 hash, bytes calldata) external view returns (bool) {
+        (bool ok, bytes memory ret) =
+            signer.staticcall(abi.encodeCall(IERC1271.isValidSignature, (hash, bytes(""))));
+        return ok && ret.length >= 32 && bytes4(ret) == IERC1271.isValidSignature.selector;
     }
 }
 

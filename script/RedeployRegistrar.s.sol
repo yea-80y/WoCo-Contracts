@@ -42,6 +42,9 @@ import {IL2Registry} from "../src/durin/interfaces/IL2Registry.sol";
 /// `owner()` is its registry's admin, read live (audit 937 F13). v2's
 /// `REGISTRAR_ADMIN` is gone with the stored owner it set.
 contract RedeployRegistrar is Script {
+    /// @notice namehash("woco.eth"), as `DeploySubEnsRegistry` pins it.
+    bytes32 constant PARENT_NODE = 0x616c19dee44e200629c0e4918ca0fe2f6e85100ea0b354c4f888e11c07a9006f;
+
     /// @notice Everything this script reads from its environment, in one place.
     struct Config {
         uint256 deployerPk;
@@ -67,6 +70,12 @@ contract RedeployRegistrar is Script {
         Config memory c = _config();
 
         IL2Registry registry = IL2Registry(c.registryAddress);
+        // Catches a registry for another name. It cannot tell a retired woco.eth
+        // registry from the live one: the printed addresses below are for that.
+        require(
+            registry.baseNode() == PARENT_NODE,
+            "L2_REGISTRY_ADDRESS is not a woco.eth registry - its base node is not namehash(woco.eth)"
+        );
         // A mistyped previous registrar would print a retirement that retires
         // nothing, while the real one keeps minting.
         require(

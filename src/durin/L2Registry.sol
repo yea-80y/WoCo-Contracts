@@ -721,10 +721,12 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      deployment for an undeployed one. It runs with `VALIDATOR_GAS`, and
     ///      anything but a clean `true` — a revert, running out of gas, a
     ///      malformed answer — is `Unauthorized` (audit 938 M-5 / 937 F18,
-    ///      F19). The validator may run code with lasting effects — for a
-    ///      deployed wallet it retries after a "prepare" call named in the
-    ///      signature — so the record version is read again afterwards, and
-    ///      a name that moved or was cleared meanwhile is refused (938 L-7).
+    ///      F19). The record version is then read again, and a name that moved
+    ///      or was cleared meanwhile is refused (938 L-7). That is defence
+    ///      against a validator that acts before it answers: the pinned one
+    ///      cannot — its ERC-1271 call is static and its counterfactual
+    ///      deployment is undone — so the guard is pinned by a test that puts
+    ///      an acting validator in its place.
     ///
     ///      The order matters for an EOA with an EIP-7702 delegation. It has
     ///      code, so the validator asks its delegate through ERC-1271, and a

@@ -404,6 +404,31 @@ contract WoCoRegistrarRateCapTest is Test {
         _mint("churn", alice);
     }
 
+    /// The accepted cost of R5, pinned so it is not rediscovered (Fable sign-off
+    /// F6): a sponsor may hand a recipient back its own released label again and
+    /// again, even at the cap, without the recipient asking. The recipient can
+    /// release it again; the relay's limits and the sponsor's gas bound such a
+    /// loop, not this cap.
+    function test_Cap_ASponsorMayGiveARecipientBackItsOwnReleasedLabelAtTheCap() public {
+        bytes32 node = _mint("old-name", alice);
+        vm.prank(alice);
+        registry.release(node);
+        _mintN(alice, DEFAULT_MAX - 1, 0);
+        (uint32 remaining,) = registrar.mintAllowance(alice);
+        assertEq(remaining, 0, "premise: alice is at the cap");
+
+        for (uint256 i; i < 3; ++i) {
+            _mint("old-name", alice);
+            vm.prank(alice);
+            registry.release(node);
+        }
+        _mint("old-name", alice);
+
+        assertEq(registry.owner(node), alice);
+        (, uint32 count) = registrar.mintWindow(alice);
+        assertEq(count, DEFAULT_MAX, "the returns were charged");
+    }
+
     /// Someone else's release is not yours: taking their label counts.
     function test_Cap_TakingSomeoneElsesReleasedLabelCounts() public {
         bytes32 node = _mint("theirs", bob);

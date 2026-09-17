@@ -155,6 +155,19 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
         script.run();
     }
 
+    /// A registry for another name is refused before anything is deployed
+    /// (Fable sign-off F5).
+    function test_Redeploy_RefusesARegistryForAnotherName() public {
+        L2Registry other = L2Registry(Clones.clone(address(new L2Registry())));
+        other.initialize("wocoo.eth", "WoCo Names", "", address(safe));
+        uint64 nonceBefore = vm.getNonce(deployer);
+
+        RedeployRegistrar script = new WithRegistry(address(other));
+        vm.expectRevert("L2_REGISTRY_ADDRESS is not a woco.eth registry - its base node is not namehash(woco.eth)");
+        script.run();
+        assertEq(vm.getNonce(deployer), nonceBefore, "something was deployed");
+    }
+
     /*//////////////////////////////////////////////////////////////
                     OWNERSHIP FOLLOWS THE ADMIN SEAT
     //////////////////////////////////////////////////////////////*/
@@ -209,6 +222,20 @@ contract WithInputs is RedeployRegistrar {
     function _config() internal view override returns (Config memory c) {
         c = super._config();
         c.previousRegistrar = configuredPrevious;
+    }
+}
+
+/// @dev Overrides only the registry; every guard in `run()` is the real one.
+contract WithRegistry is RedeployRegistrar {
+    address internal immutable configuredRegistry;
+
+    constructor(address registry_) {
+        configuredRegistry = registry_;
+    }
+
+    function _config() internal view override returns (Config memory c) {
+        c = super._config();
+        c.registryAddress = configuredRegistry;
     }
 }
 

@@ -23,8 +23,8 @@ library ENSDNSUtils {
             // it's ok since we don't call anything
             //
             // WoCo (audit 938 L-8): what actually keeps that safe, and nothing
-            // asserts it. The writes past `ens` land at or above the free-memory
-            // pointer, and every caller (`tokenURI`, `decodeName`,
+            // asserts it. The writes past `ens`'s length land inside `ens`'s own
+            // padding or above the free-memory pointer, and every caller (`tokenURI`, `decodeName`,
             // `L2Registry.releaseDigest`) reads only the returned string's own
             // bytes before its next allocation overwrites that region. So:
             //   - never mark these assembly blocks `memory-safe`: a via-IR build
