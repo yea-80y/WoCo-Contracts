@@ -15,9 +15,13 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
  * EIP-1167 clone that cannot be upgraded, so the shape frozen here is permanent.
  * Each test below pins one clause of the public promise:
  *
- *   "Your name is an NFT we can never re-issue over or burn. The registry admin
- *    — intended to be a DAO multisig — can reassign it, on-chain and visibly,
- *    under a published policy."
+ *   "Your name is an NFT we can never re-issue over, and never burn from
+ *    where it stands. The registry admin — intended to be a DAO multisig — can
+ *    reassign it, on-chain and visibly, under a published policy."
+ *
+ * "From where it stands", because the admin can end a name in two visible
+ * steps: reassign it to an address it controls, then release it there as its
+ * holder (audit 937 F14 / 938 M-1; accepted power, see `adminTransfer`).
  */
 contract L2RegistryAdminTransferTest is Test {
     L2Registry    registry;
@@ -42,7 +46,7 @@ contract L2RegistryAdminTransferTest is Test {
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
 
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
+        registrar = new WoCoRegistrar(address(registry), sponsor, new string[](0));
 
         vm.prank(admin);
         registry.addRegistrar(address(registrar));
@@ -335,6 +339,23 @@ contract L2RegistryAdminTransferTest is Test {
 
         assertEq(registry.addr(node), stranger);
         assertEq(registry.owner(node), organiser, "the name itself did not move");
+    }
+
+    /// The two visible steps by which the admin seat can end a name, pinned so
+    /// no policy says "never burned" (audit 937 F14 / 938 M-1).
+    function test_Governance_CanEndANameInTwoVisibleSteps() public {
+        bytes32 node = _register("venue", organiser);
+
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit AdminTransfer(node, organiser, admin);
+        vm.startPrank(admin);
+        registry.adminTransfer(node, admin);
+        registry.release(node);
+        vm.stopPrank();
+
+        assertEq(registry.owner(node), address(0));
+        (address previous,) = registry.lastRelease(node);
+        assertEq(previous, admin, "the release record names the seat, not the organiser");
     }
 
     // ── setText removal ───────────────────────────────────────────────────────

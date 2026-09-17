@@ -20,9 +20,9 @@ import {WoCoRegistrar} from "./WoCoRegistrar.sol";
 ///      WHY NO ROTATION. v1 minted the admin seat to the deployer key, then moved
 ///      it and the registrar's ownership to the Safe with two single-step,
 ///      irreversible transfers that the whole trust model rested on. Here the
-///      seat is minted straight to `admin` and the registrar is constructed
-///      owned by it: there is nothing to rotate, and the deployer key never holds
-///      a role.
+///      seat is minted straight to `admin`, and the registrar's owner is
+///      whoever holds that seat (`WoCoRegistrar.owner`): there is nothing to
+///      rotate, and the deployer key never holds a role.
 ///
 ///      It keeps no power afterwards; it only records the three addresses. The
 ///      registrar is NOT wired into the registry: `addRegistrar` is the admin's
@@ -35,13 +35,13 @@ contract WoCoSubEnsDeployer {
     WoCoRegistrar public immutable registrar;
 
     /// @param parentName     The parent ENS name, e.g. "woco.eth".
-    /// @param admin          Holder of the admin seat and owner of the registrar.
+    /// @param admin          Holder of the admin seat, and so owner of the registrar.
     /// @param sponsor        The registrar's first authorised sponsor.
     /// @param reservedLabels Labels the registrar will never mint.
     constructor(string memory parentName, address admin, address sponsor, string[] memory reservedLabels) {
         implementation = new L2Registry();
         registry = L2Registry(Clones.clone(address(implementation)));
         registry.initialize(parentName, TOKEN_SYMBOL, "", admin);
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, reservedLabels);
+        registrar = new WoCoRegistrar(address(registry), sponsor, reservedLabels);
     }
 }

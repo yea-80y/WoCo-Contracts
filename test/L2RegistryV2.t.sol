@@ -30,7 +30,9 @@ import {L2Resolver} from "../src/durin/L2Resolver.sol";
  *   - A registrar creates names beneath the base name only; a holder beneath
  *     its own names; nothing is called on a recipient.
  *   - Labels and names respect the DNS limits and never break `tokenURI`'s JSON.
- *   - ONE rule decides who writes records, and `clearRecords` is the holder's.
+ *   - ONE rule decides who writes records — the holder, or a registrar for any
+ *     name but the base name — and `clearRecords` is the holder's alone
+ *     (v2.1, audits 937 / 938: approvals no longer reach either).
  *   - The signed record setters and their nonces are gone; the selectors the
  *     server encodes by hand are unchanged.
  *
@@ -657,7 +659,9 @@ contract L2RegistryV2Test is Test {
                     ONE RULE FOR WHO WRITES RECORDS
     //////////////////////////////////////////////////////////////*/
 
-    function test_Records_TheHolderSideWrites() public {
+    /// Audit 938 H-1 / 937 F4: the approval a marketplace asks for must not
+    /// let it repoint where the name's payments go.
+    function test_Records_TheHolderWritesAndApprovalsDoNot() public {
         bytes32 byHolder = _mint("by-holder", holder);
         bytes32 byApprovee = _mint("by-approvee", holder);
         bytes32 byOperator = _mint("by-operator", holder);
@@ -667,8 +671,22 @@ contract L2RegistryV2Test is Test {
         vm.stopPrank();
 
         _assertCanWrite(holder, byHolder, "the holder");
-        _assertCanWrite(approvee, byApprovee, "a per-token approvee");
-        _assertCanWrite(operator, byOperator, "an operator-for-all");
+        _assertCannotWrite(approvee, byApprovee, "a per-token approvee");
+        _assertCannotWrite(operator, byOperator, "an operator-for-all");
+    }
+
+    /// Audit 937 F7 / 938 M-9: the base name's records are its holder's alone.
+    function test_Records_OnlyTheAdminWritesTheBaseName() public {
+        bytes32 base = registry.baseNode();
+        vm.startPrank(admin);
+        registry.setApprovalForAll(operator, true);
+        registry.approve(approvee, uint256(base));
+        vm.stopPrank();
+
+        _assertCannotWrite(registrar, base, "a registrar");
+        _assertCannotWrite(operator, base, "the admin's operator");
+        _assertCannotWrite(approvee, base, "the admin's approvee");
+        _assertCanWrite(admin, base, "the admin");
     }
 
     function test_Records_ARegistrarWritesANameThatExists() public {
@@ -752,7 +770,9 @@ contract L2RegistryV2Test is Test {
                      clearRecords IS THE HOLDER'S
     //////////////////////////////////////////////////////////////*/
 
-    function test_Clear_TheHolderSideClears() public {
+    /// Clearing moves the record version, which voids the holder's release
+    /// signature — so only the holder clears.
+    function test_Clear_TheHolderClearsAndApprovalsDoNot() public {
         bytes32 byHolder = _mint("by-holder", holder);
         bytes32 byApprovee = _mint("by-approvee", holder);
         bytes32 byOperator = _mint("by-operator", holder);
@@ -766,14 +786,16 @@ contract L2RegistryV2Test is Test {
 
         vm.prank(holder);
         registry.clearRecords(byHolder);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, byApprovee));
         vm.prank(approvee);
         registry.clearRecords(byApprovee);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, byOperator));
         vm.prank(operator);
         registry.clearRecords(byOperator);
 
         _assertNoRecords(byHolder, "the holder could not clear");
-        _assertNoRecords(byApprovee, "an approvee could not clear");
-        _assertNoRecords(byOperator, "an operator could not clear");
+        assertEq(registry.contenthash(byApprovee), SITE, "an approvee cleared");
+        assertEq(registry.contenthash(byOperator), SITE, "an operator cleared");
     }
 
     /// Audit 927 H1: in v1 the admin enrolled itself as a registrar and cleared
@@ -801,11 +823,19 @@ contract L2RegistryV2Test is Test {
         assertEq(registry.recordVersions(node), 1);
     }
 
+    /// Not even a caller presenting itself as the zero address, which is what
+    /// an unminted name's holder reads as.
     function test_Clear_NobodyClearsANameThatDoesNotExist() public {
         bytes32 unminted = registry.makeNode(registry.baseNode(), "future");
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, unminted));
         vm.prank(registrar);
         registry.clearRecords(unminted);
+
+        uint64 before = registry.recordVersions(unminted);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, unminted));
+        vm.prank(address(0));
+        registry.clearRecords(unminted);
+        assertEq(registry.recordVersions(unminted), before);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -863,9 +893,10 @@ contract L2RegistryV2Test is Test {
     }
 
     /// The server and the client encode registry calls from their OWN
-    /// human-readable ABIs (sub-ens-contract.ts, release-digest.ts, l2-reader.ts),
-    /// never from this artefact. A changed signature here breaks them with no
-    /// compile error anywhere, so the signatures are written out.
+    /// human-readable ABIs (sub-ens-contract.ts, release-digest.ts,
+    /// name-records.ts, l2-reader.ts), never from this artefact. A changed
+    /// signature here breaks them with no compile error anywhere, so the
+    /// signatures are written out.
     function test_Abi_TheSelectorsTheAppEncodesByHandAreUnchanged() public view {
         // Reads — getters and inherited functions included: each hand-written
         // signature must answer on this contract, which has no fallback.
@@ -876,7 +907,7 @@ contract L2RegistryV2Test is Test {
             abi.encodeWithSignature("lastRelease(bytes32)", base),
             abi.encodeWithSignature("contenthash(bytes32)", base),
             abi.encodeWithSignature("recordVersions(bytes32)", base),
-            abi.encodeWithSignature("RELEASE_TYPEHASH()"),
+            abi.encodeWithSignature("releaseDigest(bytes32,uint256)", base, block.timestamp),
             abi.encodeWithSignature(
                 "resolve(bytes,bytes)", hex"04776f636f0365746800", abi.encodeWithSignature("contenthash(bytes32)", base)
             )
@@ -900,6 +931,8 @@ contract L2RegistryV2Test is Test {
         assertEq(L2Registry.SignatureExpired.selector, bytes4(keccak256("SignatureExpired()")));
         assertEq(L2Registry.ReleaseBaseNode.selector, bytes4(keccak256("ReleaseBaseNode()")));
         assertEq(L2Registry.ReleaseUnregistered.selector, bytes4(keccak256("ReleaseUnregistered(bytes32)")));
+        assertEq(L2Registry.HasChildren.selector, bytes4(keccak256("HasChildren(bytes32,uint256)")));
+        assertEq(L2Registry.ExpirationTooFar.selector, bytes4(keccak256("ExpirationTooFar()")));
         assertEq(IERC721Errors.ERC721NonexistentToken.selector, bytes4(keccak256("ERC721NonexistentToken(uint256)")));
     }
 }

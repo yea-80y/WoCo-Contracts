@@ -10,8 +10,8 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
  * (WoCo-Contracts #21):
  *
  *   A name's records hold ONLY writes made since its current holding began,
- *   by its holder, an approvee or operator acting for the holder, or an
- *   enrolled registrar.
+ *   by its holder or an enrolled registrar. An approvee or operator moves the
+ *   name and does nothing else (v2.1, audits 937 F4 / 938 H-1, M-7).
  *
  * The handler keeps its own MODEL of who holds each name, who is approved,
  * who is an operator and whether the registrar is enrolled, built from the
@@ -23,9 +23,9 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
  * compared with the last write the model saw accepted in the current holding.
  *
  * WHAT THIS CAMPAIGN DOES NOT COVER: the admin handover (the admin is never a
- * holder of the names under test), children below the fuzzed names, and
- * signatures — `releaseWithSignature` authorises exactly as `release` does and
- * is pinned by its own suite. The admin is never enrolled as a registrar here;
+ * holder of the names under test), children below the fuzzed names — which
+ * `L2RegistryTreeInvariant.t.sol` covers — and signatures, pinned by their own
+ * suite. The admin is never enrolled as a registrar here;
  * that accepted power is pinned in the unit suites instead.
  *
  * Kept in its own file because invariant campaigns are slow.
@@ -58,6 +58,9 @@ contract RecordsHandler is Test {
     uint256 public acceptedClears;
     uint256 public refusedClears;
     uint256 public writesToAbsentNames;
+    /// Attempts by an approvee or operator of the holder, who must be refused
+    /// records, clears and burns — the v2.1 rule this campaign most needs to see.
+    uint256 public delegateAttempts;
 
     bool public modelDisagreed;
     string public disagreement;
@@ -115,7 +118,9 @@ contract RecordsHandler is Test {
     function release(uint256 labelSeed, uint256 bySeed) external {
         bytes32 node = nodeAt(labelSeed);
         address by = people[bySeed % people.length];
-        bool expected = modelOwner[node] != address(0) && _actsForHolder(node, by);
+        // The holder only: these names sit beneath the base name, so no
+        // parent's holder may act, and approvals never reach a burn.
+        bool expected = modelOwner[node] != address(0) && by == modelOwner[node];
 
         vm.prank(by);
         try registry.release(node) {
@@ -175,6 +180,42 @@ contract RecordsHandler is Test {
         modelRegistrarEnrolled = on;
     }
 
+    /// The holder approves someone — for this name or for all of its names —
+    /// and that someone tries to write, clear and burn. Each must be refused.
+    /// Its own action so that every run makes the attempt the v2.1 rule is
+    /// about, rather than waiting for the other actions to line one up.
+    function delegateTries(uint256 labelSeed, uint256 delegateSeed, bool forAll, uint256 valueSeed) external {
+        bytes32 node = nodeAt(labelSeed);
+        address holder = modelOwner[node];
+        if (holder == address(0)) return;
+        address delegate = people[delegateSeed % people.length];
+        if (delegate == holder) delegate = people[(delegateSeed % people.length + 1) % people.length];
+
+        vm.prank(holder);
+        if (forAll) {
+            registry.setApprovalForAll(delegate, true);
+            modelOperator[holder][delegate] = true;
+        } else {
+            registry.approve(delegate, uint256(node));
+            modelApproved[node] = delegate;
+        }
+        delegateAttempts++;
+
+        bytes memory value = abi.encodePacked(hex"e40101fa011b20", keccak256(abi.encode(valueSeed)));
+        vm.prank(delegate);
+        try registry.setContenthash(node, value) {
+            _agree(false, true, "a delegate's record write");
+        } catch {}
+        vm.prank(delegate);
+        try registry.clearRecords(node) {
+            _agree(false, true, "a delegate's clearRecords");
+        } catch {}
+        vm.prank(delegate);
+        try registry.release(node) {
+            _agree(false, true, "a delegate's release");
+        } catch {}
+    }
+
     // ── Records ────────────────────────────────────────────────────────────
 
     function write(uint256 labelSeed, uint256 writerSeed, bool asHolder, uint8 kind, uint256 valueSeed) external {
@@ -182,7 +223,7 @@ contract RecordsHandler is Test {
         address writer = _pickWriter(node, writerSeed, asHolder);
         bool present = modelOwner[node] != address(0);
         bool expected = present
-            && ((writer == registrarActor && modelRegistrarEnrolled) || _actsForHolder(node, writer));
+            && ((writer == registrarActor && modelRegistrarEnrolled) || writer == modelOwner[node]);
         if (!present) writesToAbsentNames++;
 
         kind %= 3;
@@ -218,8 +259,9 @@ contract RecordsHandler is Test {
     function clear(uint256 labelSeed, uint256 writerSeed, bool asHolder) external {
         bytes32 node = nodeAt(labelSeed);
         address writer = _pickWriter(node, writerSeed, asHolder);
-        // The holder's side only: a registrar is refused even when enrolled.
-        bool expected = modelOwner[node] != address(0) && _actsForHolder(node, writer);
+        // The holder only: a registrar is refused even when enrolled, and so
+        // are the holder's approvees and operators.
+        bool expected = modelOwner[node] != address(0) && writer == modelOwner[node];
 
         vm.prank(writer);
         try registry.clearRecords(node) {
@@ -234,7 +276,8 @@ contract RecordsHandler is Test {
 
     // ── Model helpers ──────────────────────────────────────────────────────
 
-    /// The holder, its per-token approvee, or an operator of the holder.
+    /// The holder, its per-token approvee, or an operator of the holder: who
+    /// may MOVE the name.
     function _actsForHolder(bytes32 node, address who) internal view returns (bool) {
         address holder = modelOwner[node];
         return holder != address(0)
@@ -243,12 +286,13 @@ contract RecordsHandler is Test {
 
     /// Half the attempts come from the holder itself, when there is one, so
     /// every run lands writes and clears; the rest from anyone who might try —
-    /// the four people, the registrar, the admin.
+    /// the four people, whoever the holder approved, the registrar, the admin.
     function _pickWriter(bytes32 node, uint256 seed, bool asHolder) internal view returns (address) {
         if (asHolder && modelOwner[node] != address(0)) return modelOwner[node];
-        uint256 k = seed % (people.length + 2);
+        uint256 k = seed % (people.length + 3);
         if (k < people.length) return people[k];
-        return k == people.length ? registrarActor : admin;
+        if (k == people.length) return modelApproved[node] == address(0) ? people[0] : modelApproved[node];
+        return k == people.length + 1 ? registrarActor : admin;
     }
 
     function _newHolding(bytes32 node, address to) internal {
@@ -286,7 +330,7 @@ contract L2RegistryRecordsInvariantTest is Test {
         vm.prank(admin);
         registry.addRegistrar(registrarActor);
 
-        bytes4[] memory selectors = new bytes4[](9);
+        bytes4[] memory selectors = new bytes4[](10);
         selectors[0] = RecordsHandler.mint.selector;
         selectors[1] = RecordsHandler.transfer.selector;
         selectors[2] = RecordsHandler.release.selector;
@@ -296,6 +340,7 @@ contract L2RegistryRecordsInvariantTest is Test {
         selectors[6] = RecordsHandler.toggleRegistrar.selector;
         selectors[7] = RecordsHandler.write.selector;
         selectors[8] = RecordsHandler.clear.selector;
+        selectors[9] = RecordsHandler.delegateTries.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -330,5 +375,6 @@ contract L2RegistryRecordsInvariantTest is Test {
         assertGt(handler.acceptedClears(), 0, "campaign never cleared records");
         assertGt(handler.refusedClears(), 0, "campaign never had a clear refused");
         assertGt(handler.writesToAbsentNames(), 0, "campaign never tried to write a name that does not exist");
+        assertGt(handler.delegateAttempts(), 0, "campaign never had an approvee or operator try to act");
     }
 }

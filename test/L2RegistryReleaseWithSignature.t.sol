@@ -18,8 +18,12 @@ import {UniversalSigValidatorFixture as Validator} from "./fixtures/UniversalSig
  *
  *   "If you sign a release, anyone can hand it in for you — but only for the
  *    name, the registry, the chain and the deadline you signed, only once,
- *    and only if you could have released it yourself. Nobody can turn any
- *    other signature of yours into a release."
+ *    only within two days of handing it in, and only if you hold the name.
+ *    Nobody can turn any other signature of yours into a release, and nobody
+ *    else's signature releases your name."
+ *
+ * v2.1: the message is EIP-712 typed data (domain "WoCo Names" / "2"), so a
+ * wallet shows what is being signed.
  *
  * The signature checks run against the REAL ERC-6492 validator bytecode
  * (etched from Arbitrum Sepolia, see the fixture), not a stand-in.
@@ -57,7 +61,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
 
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
+        registrar = new WoCoRegistrar(address(registry), sponsor, new string[](0));
 
         vm.prank(admin);
         registry.addRegistrar(address(registrar));
@@ -143,30 +147,51 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         registry.releaseWithSignature(node, EXPIRY, holder, sig);
     }
 
-    function test_ReleaseWithSignature_ByPerTokenApprovee() public {
+    /// Audit 938 M-7: approvals do not reach the burn, signed or not. Refused
+    /// before the validator is consulted.
+    function test_ReleaseWithSignature_RevertForPerTokenApprovee() public {
         bytes32 node = _register("venue", holder);
         vm.prank(holder);
         registry.approve(approvee, uint256(node));
-
         bytes memory sig = _signRelease(APPROVEE_KEY, node);
-
-        vm.expectEmit(true, true, true, true, address(registry));
-        emit Released(node, holder, approvee);
+        vm.mockCallRevert(Validator.ADDR, bytes(""), "validator must not be reached");
 
         vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         registry.releaseWithSignature(node, EXPIRY, approvee, sig);
-        assertEq(registry.owner(node), address(0));
+        assertEq(registry.owner(node), holder);
     }
 
-    function test_ReleaseWithSignature_ByOperatorForAll() public {
+    function test_ReleaseWithSignature_RevertForOperatorForAll() public {
         bytes32 node = _register("venue", holder);
         vm.prank(holder);
         registry.setApprovalForAll(approvee, true);
         bytes memory sig = _signRelease(APPROVEE_KEY, node);
+        vm.mockCallRevert(Validator.ADDR, bytes(""), "validator must not be reached");
 
         vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         registry.releaseWithSignature(node, EXPIRY, approvee, sig);
-        assertEq(registry.owner(node), address(0));
+        assertEq(registry.owner(node), holder);
+    }
+
+    /// The parent's holder releases a child by direct call only; its signature
+    /// is refused like a stranger's.
+    function test_ReleaseWithSignature_RevertForTheParentsHolder() public {
+        bytes32 venue = _register("venue", approvee);
+        bytes[] memory none = new bytes[](0);
+        vm.prank(approvee);
+        bytes32 shop = registry.createSubnode(venue, "shop", holder, none);
+        bytes memory sig = _signRelease(APPROVEE_KEY, shop);
+
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, shop));
+        registry.releaseWithSignature(shop, EXPIRY, approvee, sig);
+        assertEq(registry.owner(shop), holder);
+
+        vm.prank(approvee);
+        registry.release(shop);
+        assertEq(registry.owner(shop), address(0), "the direct call is the parent's door");
     }
 
     /// A smart-account holder: the validator routes to ERC-1271 and the wallet
@@ -381,7 +406,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         // A second registry with the same parent name: identical node, same holder.
         L2Registry other = L2Registry(Clones.clone(address(new L2Registry())));
         other.initialize("woco.eth", "WoCo Names", "", admin);
-        WoCoRegistrar otherRegistrar = new WoCoRegistrar(address(other), admin, sponsor, new string[](0));
+        WoCoRegistrar otherRegistrar = new WoCoRegistrar(address(other), sponsor, new string[](0));
         vm.prank(admin);
         other.addRegistrar(address(otherRegistrar));
         vm.prank(sponsor);
@@ -404,20 +429,99 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         registry.releaseWithSignature(node, EXPIRY, holder, sig);
     }
 
-    /// The domain tag is what separates a release from any other 32-byte
-    /// personal-sign message of the holder's: the same fields signed WITHOUT
-    /// the typehash are refused.
-    function test_ReleaseWithSignature_TheSameFieldsWithoutTheTypehashAreRefused() public {
+    /// The domain is what separates a release from any other typed message of
+    /// the holder's, and v2's personal-sign release is dead: neither the v2
+    /// digest, nor the v2.1 struct signed without its domain, nor the v2.1
+    /// struct under another version, releases anything.
+    function test_ReleaseWithSignature_OtherEncodingsOfTheSameFieldsAreRefused() public {
         bytes32 node = _register("venue", holder);
-        bytes32 untagged = keccak256(
-            abi.encode(address(registry), block.chainid, node, registry.recordVersions(node), EXPIRY)
-        ).toEthSignedMessageHash();
-        bytes memory sig = _sign(HOLDER_KEY, untagged);
+        uint64 version = registry.recordVersions(node);
+        bytes32 structHash = keccak256(
+            abi.encode(
+                registry.RELEASE_TYPEHASH(), keccak256("venue.woco.eth"), node, version, EXPIRY
+            )
+        );
+        bytes32[3] memory impostors = [
+            keccak256(
+                abi.encode(
+                    keccak256(
+                        "WoCoRelease(address registry,uint256 chainId,bytes32 node,uint64 recordVersion,uint256 expiration)"
+                    ),
+                    address(registry),
+                    block.chainid,
+                    node,
+                    version,
+                    EXPIRY
+                )
+            ).toEthSignedMessageHash(),
+            structHash,
+            MessageHashUtils.toTypedDataHash(_domain("1"), structHash)
+        ];
+        assertEq(MessageHashUtils.toTypedDataHash(_domain("2"), structHash), registry.releaseDigest(node, EXPIRY));
+
+        for (uint256 i; i < impostors.length; ++i) {
+            bytes memory sig = _sign(HOLDER_KEY, impostors[i]);
+            vm.prank(relayer);
+            vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
+            registry.releaseWithSignature(node, EXPIRY, holder, sig);
+        }
+        assertEq(registry.owner(node), holder, "the name survives");
+    }
+
+    /// The name in the message is the name the node was minted as: a signature
+    /// naming another name is refused, although every other field matches.
+    function test_ReleaseWithSignature_TheNameInTheMessageMustMatch() public {
+        bytes32 node = _register("venue", holder);
+        bytes32 structHash = keccak256(
+            abi.encode(
+                registry.RELEASE_TYPEHASH(), keccak256("other.woco.eth"), node, registry.recordVersions(node), EXPIRY
+            )
+        );
+        bytes memory sig = _sign(HOLDER_KEY, MessageHashUtils.toTypedDataHash(_domain("2"), structHash));
 
         vm.prank(relayer);
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         registry.releaseWithSignature(node, EXPIRY, holder, sig);
-        assertEq(registry.owner(node), holder, "the name survives");
+    }
+
+    function _domain(string memory version) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("WoCo Names"),
+                keccak256(bytes(version)),
+                block.chainid,
+                address(registry)
+            )
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                  NO SIGNATURE LIVES LONGER THAN THE CEILING
+    //////////////////////////////////////////////////////////////*/
+
+    function test_ReleaseWithSignature_RevertWhenExpirationIsPastTheCeiling() public {
+        bytes32 node = _register("venue", holder);
+        uint256 tooFar = NOW + registry.MAX_RELEASE_SIGNATURE_TTL() + 1;
+        bytes memory sig = _sign(HOLDER_KEY, registry.releaseDigest(node, tooFar));
+
+        vm.prank(relayer);
+        vm.expectRevert(L2Registry.ExpirationTooFar.selector);
+        registry.releaseWithSignature(node, tooFar, holder, sig);
+    }
+
+    /// The ceiling is measured from the block that submits, so a signature too
+    /// far ahead when made becomes usable once the chain catches up — which is
+    /// what lets a lagging sequencer clock accept a fresh one.
+    function test_ReleaseWithSignature_TheCeilingIsMeasuredFromTheSubmittingBlock() public {
+        bytes32 node = _register("venue", holder);
+        uint256 far = NOW + registry.MAX_RELEASE_SIGNATURE_TTL() + 1 hours;
+        bytes memory sig = _sign(HOLDER_KEY, registry.releaseDigest(node, far));
+
+        vm.warp(NOW + 1 hours);
+        vm.prank(relayer);
+        registry.releaseWithSignature(node, far, holder, sig);
+        assertEq(registry.owner(node), address(0));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -433,9 +537,11 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         registry.releaseWithSignature(base, EXPIRY, holder, sig);
     }
 
+    /// A node never minted has no name, so no digest: any signature is
+    /// refused by the unregistered guard, which runs before the digest is built.
     function test_ReleaseWithSignature_RevertOnUnregisteredName() public {
         bytes32 node = registry.makeNode(registry.baseNode(), "nobody");
-        bytes memory sig = _sign(HOLDER_KEY, registry.releaseDigest(node, EXPIRY));
+        bytes memory sig = _sign(HOLDER_KEY, keccak256("anything"));
 
         vm.prank(relayer);
         vm.expectRevert(abi.encodeWithSelector(L2Registry.ReleaseUnregistered.selector, node));
@@ -446,27 +552,25 @@ contract L2RegistryReleaseWithSignatureTest is Test {
                      THE DIGEST IS PINNED FOR CLIENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// A client that rebuilds the digest instead of reading it must land on
-    /// the same bytes; and the typehash string is frozen with the registry.
+    /// A client that builds the typed data instead of reading the digest must
+    /// land on the same bytes; and the type string is frozen with the registry.
     /// The record version at mint is 1: the mint is an ownership change.
     function test_ReleaseWithSignature_DigestFormulaIsPinned() public {
         bytes32 node = _register("venue", holder);
         assertEq(registry.recordVersions(node), 1, "a fresh name's record version");
-        bytes32 expected = keccak256(
+        bytes32 structHash = keccak256(
             abi.encode(
-                keccak256(
-                    "WoCoRelease(address registry,uint256 chainId,bytes32 node,uint64 recordVersion,uint256 expiration)"
-                ),
-                address(registry),
-                block.chainid,
+                keccak256("Release(string name,bytes32 node,uint64 recordVersion,uint256 expiration)"),
+                keccak256("venue.woco.eth"),
                 node,
                 uint64(1),
                 EXPIRY
             )
-        ).toEthSignedMessageHash();
+        );
+        bytes32 expected = keccak256(abi.encodePacked(hex"1901", _domain("2"), structHash));
         assertEq(registry.releaseDigest(node, EXPIRY), expected);
         // Frozen with the registry: a different string here is a different contract.
-        assertEq(registry.RELEASE_TYPEHASH(), 0x07afadc76277c3eeb107a6e5f76aa8a4a6a8cb3439a468c964f320f452f1bdfc);
+        assertEq(registry.RELEASE_TYPEHASH(), 0x05782dabdaf1921b53744147d5ff0a6fba84d6ca7ead23afe05c5031f54b9f19);
     }
 }
 

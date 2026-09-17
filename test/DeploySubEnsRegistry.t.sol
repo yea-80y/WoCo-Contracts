@@ -16,8 +16,9 @@ import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
  * (WoCo-Contracts #21).
  *
  * They run the script and assert what it actually put on chain: one
- * transaction, both admin roles on the Safe from construction and never
- * anywhere else, the registrar left for the Safe to wire. And they prove each
+ * transaction, the admin seat on the Safe from construction and never
+ * anywhere else, a registrar that answers to whoever holds that seat, left for
+ * the Safe to wire. And they prove each
  * check the script makes fires on its own, by substituting a deployment that
  * check must reject.
  *
@@ -91,9 +92,9 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
     }
 
     /// No rotation: the admin seat's only Transfer is its mint, straight to the
-    /// Safe, and the registrar's only ownership event is its construction. So
-    /// neither role was ever held by anyone else — not the deployer, not for a
-    /// block.
+    /// Safe, and the registrar stores no owner at all — it emits no ownership
+    /// event and answers to the seat. So neither role was ever held by anyone
+    /// else — not the deployer, not for a block.
     function test_Deploy_NoRotation_NeitherRoleWasEverAnywhereElse() public {
         vm.recordLogs();
         (address registryAddr, address registrarAddr) = script.run();
@@ -113,15 +114,13 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
                 assertEq(address(uint160(uint256(l.topics[1]))), address(0), "the seat came from someone");
                 assertEq(address(uint160(uint256(l.topics[2]))), address(safe), "the seat went somewhere else");
             }
-            if (l.emitter == registrarAddr && l.topics[0] == ownershipSig) {
+            if (l.emitter == registrarAddr && (l.topics[0] == ownershipSig || l.topics[0] == startedSig)) {
                 registrarOwnerships++;
-                assertEq(address(uint160(uint256(l.topics[1]))), address(0), "registrar ownership came from someone");
-                assertEq(address(uint160(uint256(l.topics[2]))), address(safe), "registrar ownership went elsewhere");
             }
-            assertFalse(l.emitter == registrarAddr && l.topics[0] == startedSig, "a registrar handover was started");
         }
         assertEq(seatTransfers, 1, "the admin seat moved more than once");
-        assertEq(registrarOwnerships, 1, "registrar ownership moved more than once");
+        assertEq(registrarOwnerships, 0, "the registrar emitted an ownership event - it has an owner of its own");
+        assertEq(WoCoRegistrar(registrarAddr).owner(), address(safe));
     }
 
     function test_Deploy_BothRolesOnTheSafeWithNoHandoverOpen() public {
@@ -130,7 +129,6 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         assertEq(L2Registry(registryAddr).owner(), address(safe));
         assertEq(L2Registry(registryAddr).pendingAdmin(), address(0));
         assertEq(WoCoRegistrar(registrarAddr).owner(), address(safe));
-        assertEq(WoCoRegistrar(registrarAddr).pendingOwner(), address(0));
         assertEq(L2Registry(registryAddr).balanceOf(deployer), 0, "the deployer holds a name");
     }
 
@@ -178,9 +176,10 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         assertEq(registry.owner(node), claimant, "adminTransfer is not reachable on the deployed registry");
     }
 
-    /// The seat's way on: the Safe hands it to a DAO in two steps.
+    /// The seat's way on: the Safe hands it to a DAO in two steps, and the
+    /// registrar goes with it in the same transaction (audit 937 F13).
     function test_Deploy_TheSafeCanHandTheSeatToADao() public {
-        (address registryAddr,) = script.run();
+        (address registryAddr, address registrarAddr) = script.run();
         L2Registry registry = L2Registry(registryAddr);
         address dao = address(new MockSafe());
 
@@ -189,6 +188,7 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         vm.prank(dao);
         registry.acceptAdmin();
         assertEq(registry.owner(), dao);
+        assertEq(WoCoRegistrar(registrarAddr).owner(), dao, "the registrar stayed with the Safe");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -377,6 +377,40 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         bad.run();
     }
 
+    /// Clause 5, the regression that matters for THIS redeploy: v2 exactly as
+    /// merged — every v1 and v2 probe answers as ours does — without the
+    /// signature ceiling. A deploy from the v2 branch lands here.
+    function test_Tripwire_RejectsAV2ShapedImplementation() public {
+        ClonesV2Shape bad = new ClonesV2Shape();
+        vm.expectRevert("registry implementation does not bound release signatures - it is not the v2.1 bytecode");
+        bad.run();
+    }
+
+    /// Clause 5, the other half: the ceiling is there, `parentTransfer` is not.
+    function test_Tripwire_RejectsAnImplementationWithoutParentTransfer() public {
+        ClonesCeilingOnly bad = new ClonesCeilingOnly();
+        vm.expectRevert("registry implementation does not run v2.1's parentTransfer - it is not the v2.1 bytecode");
+        bad.run();
+    }
+
+    /// Clause 3's signature probe must reach the body: an implementation that
+    /// refuses every expiration as too far — so never gets past its modifier —
+    /// is not answering as ours does.
+    function test_Tripwire_RejectsAnImplementationThatRefusesEveryExpiration() public {
+        ClonesRefusesEveryExpiration bad = new ClonesRefusesEveryExpiration();
+        vm.expectRevert("registry implementation does not run WoCo's releaseWithSignature - it is not our bytecode");
+        bad.run();
+    }
+
+    /// The genuine implementation passes clause 5 on a chain whose clock is
+    /// at the far end of what a `uint64` timestamp can say, where "now plus
+    /// the ceiling" is still well inside `uint256`.
+    function test_Tripwire_PassesAtALateTimestamp() public {
+        vm.warp(type(uint64).max);
+        (address registryAddr,) = script.run();
+        assertEq(L2Registry(registryAddr).owner(), address(safe));
+    }
+
     /// Shape, length: a proxy carrying trailing immutable args.
     function test_Tripwire_RejectsACloneWithTrailingBytes() public {
         DeploysOversizedProxy bad = new DeploysOversizedProxy();
@@ -491,7 +525,7 @@ contract DeploysTheSeatElsewhere is BuildsAGenuineRegistry {
         returns (address registryAddr, address implAddr, address registrarAddr)
     {
         (registryAddr, implAddr) = _genuineRegistry(parentName, address(new MockSafe()));
-        registrarAddr = address(new WoCoRegistrar(registryAddr, admin, sponsor, labels));
+        registrarAddr = address(new WoCoRegistrar(registryAddr, sponsor, labels));
     }
 }
 
@@ -502,7 +536,10 @@ contract DeploysARegistrarOwnedElsewhere is BuildsAGenuineRegistry {
         returns (address registryAddr, address implAddr, address registrarAddr)
     {
         (registryAddr, implAddr) = _genuineRegistry(parentName, admin);
-        registrarAddr = address(new WoCoRegistrar(registryAddr, address(new MockSafe()), sponsor, labels));
+        // A registrar answers to its own registry's admin, so one owned by
+        // someone else is one bound to a registry whose seat is elsewhere.
+        (address elsewhere,) = _genuineRegistry(parentName, address(new MockSafe()));
+        registrarAddr = address(new WoCoRegistrar(elsewhere, sponsor, labels));
     }
 }
 
@@ -514,7 +551,7 @@ contract DeploysARegistrarForAnotherRegistry is BuildsAGenuineRegistry {
     {
         (registryAddr, implAddr) = _genuineRegistry(parentName, admin);
         (address other,) = _genuineRegistry(parentName, admin);
-        registrarAddr = address(new WoCoRegistrar(other, admin, sponsor, labels));
+        registrarAddr = address(new WoCoRegistrar(other, sponsor, labels));
     }
 }
 
@@ -525,7 +562,7 @@ contract DeploysWithoutTheSponsor is BuildsAGenuineRegistry {
         returns (address registryAddr, address implAddr, address registrarAddr)
     {
         (registryAddr, implAddr) = _genuineRegistry(parentName, admin);
-        registrarAddr = address(new WoCoRegistrar(registryAddr, admin, address(0xdead), labels));
+        registrarAddr = address(new WoCoRegistrar(registryAddr, address(0xdead), labels));
     }
 }
 
@@ -536,7 +573,7 @@ contract DeploysWithoutReservedLabels is BuildsAGenuineRegistry {
         returns (address registryAddr, address implAddr, address registrarAddr)
     {
         (registryAddr, implAddr) = _genuineRegistry(parentName, admin);
-        registrarAddr = address(new WoCoRegistrar(registryAddr, admin, sponsor, new string[](0)));
+        registrarAddr = address(new WoCoRegistrar(registryAddr, sponsor, new string[](0)));
     }
 }
 
@@ -547,7 +584,7 @@ contract DeploysUnderAnotherParent is BuildsAGenuineRegistry {
         returns (address registryAddr, address implAddr, address registrarAddr)
     {
         (registryAddr, implAddr) = _genuineRegistry("wocoo.eth", admin);
-        registrarAddr = address(new WoCoRegistrar(registryAddr, admin, sponsor, labels));
+        registrarAddr = address(new WoCoRegistrar(registryAddr, sponsor, labels));
     }
 }
 
@@ -673,6 +710,45 @@ contract ClonesV1Shape is DeploySubEnsRegistry {
         implAddr = address(new V1ShapedRegistry());
         registryAddr = Clones.clone(implAddr);
         V1ShapedRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+        registrarAddr = address(0);
+    }
+}
+
+contract ClonesV2Shape is DeploySubEnsRegistry {
+    function _deploy(string memory parentName, address admin, address, string[] memory)
+        internal
+        override
+        returns (address registryAddr, address implAddr, address registrarAddr)
+    {
+        implAddr = address(new V2ShapedRegistry());
+        registryAddr = Clones.clone(implAddr);
+        V2ShapedRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+        registrarAddr = address(0);
+    }
+}
+
+contract ClonesCeilingOnly is DeploySubEnsRegistry {
+    function _deploy(string memory parentName, address admin, address, string[] memory)
+        internal
+        override
+        returns (address registryAddr, address implAddr, address registrarAddr)
+    {
+        implAddr = address(new CeilingOnlyRegistry());
+        registryAddr = Clones.clone(implAddr);
+        CeilingOnlyRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+        registrarAddr = address(0);
+    }
+}
+
+contract ClonesRefusesEveryExpiration is DeploySubEnsRegistry {
+    function _deploy(string memory parentName, address admin, address, string[] memory)
+        internal
+        override
+        returns (address registryAddr, address implAddr, address registrarAddr)
+    {
+        implAddr = address(new RefusesEveryExpiration());
+        registryAddr = Clones.clone(implAddr);
+        RefusesEveryExpiration(registryAddr).initialize(parentName, "WoCo Names", "", admin);
         registrarAddr = address(0);
     }
 }
@@ -822,6 +898,55 @@ contract StillAnswersNonces is V1ShapedRegistry {
 
     function acceptAdmin() external view {
         revert NotPendingAdmin(msg.sender);
+    }
+}
+
+/// @dev v2 as merged: every v1 probe, `acceptAdmin`, no `nonces` — and a
+///      `releaseWithSignature` whose body answers whatever the expiration.
+contract V2ShapedRegistry is ReleaseOnlyRegistry {
+    error NotPendingAdmin(address caller);
+
+    function releaseWithSignature(bytes32 node, uint256, address, bytes calldata) external pure {
+        revert ReleaseUnregistered(node);
+    }
+
+    function acceptAdmin() external view {
+        revert NotPendingAdmin(msg.sender);
+    }
+}
+
+/// @dev v2 plus the signature ceiling, without `parentTransfer`.
+contract CeilingOnlyRegistry is ReleaseOnlyRegistry {
+    error NotPendingAdmin(address caller);
+    error ExpirationTooFar();
+
+    function releaseWithSignature(bytes32 node, uint256 expiration, address, bytes calldata) external view {
+        if (expiration > block.timestamp + 48 hours) revert ExpirationTooFar();
+        revert ReleaseUnregistered(node);
+    }
+
+    function acceptAdmin() external view {
+        revert NotPendingAdmin(msg.sender);
+    }
+}
+
+/// @dev Answers every other probe as v2.1 does, but refuses every expiration
+///      before its body runs.
+contract RefusesEveryExpiration is ReleaseOnlyRegistry {
+    error NotPendingAdmin(address caller);
+    error ExpirationTooFar();
+    error ParentTransferUnregistered(bytes32 node);
+
+    function releaseWithSignature(bytes32, uint256, address, bytes calldata) external pure {
+        revert ExpirationTooFar();
+    }
+
+    function acceptAdmin() external view {
+        revert NotPendingAdmin(msg.sender);
+    }
+
+    function parentTransfer(bytes32 node, address) external pure {
+        revert ParentTransferUnregistered(node);
     }
 }
 

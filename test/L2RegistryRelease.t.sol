@@ -16,10 +16,12 @@ import {L2Resolver} from "../src/durin/L2Resolver.sol";
  * ships as an EIP-1167 clone and cannot be patched, so every clause below is a
  * permanent promise. The promise is:
  *
- *   "You can give a name back. Only you (or someone you approved) can do it.
- *    The platform cannot do it to you. When you do, the name stops resolving
- *    to your records at once, the registry remembers you held it, and the
- *    label is free for anyone to take through the normal mint path."
+ *   "You can give a name back. Only you can do it — or, for a name issued
+ *    beneath another name, whoever holds that one. An approval you gave a
+ *    marketplace cannot. The platform cannot do it to you. A name with names
+ *    beneath it goes back only once they are gone. When it goes, it stops
+ *    resolving to your records at once, the registry remembers you held it,
+ *    and the label is free for anyone to take through the normal mint path."
  *
  * Every guard in `release` has a test here that fails when the guard is
  * deleted. The two facts it stores are pinned even though nothing on chain
@@ -49,7 +51,7 @@ contract L2RegistryReleaseTest is Test {
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
 
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
+        registrar = new WoCoRegistrar(address(registry), sponsor, new string[](0));
 
         vm.prank(admin);
         registry.addRegistrar(address(registrar));
@@ -152,38 +154,59 @@ contract L2RegistryReleaseTest is Test {
                     WHO MAY CALL IT — AND WHO MAY NOT
     //////////////////////////////////////////////////////////////*/
 
-    /// The ERC-721 convention: whoever may transfer the token may burn it. The
-    /// event records the holder as `previousOwner` and the approvee as
-    /// `operator`, so the two are distinguishable afterwards.
-    function test_Release_ByPerTokenApprovee() public {
+    /// Audit 938 M-7. v2 followed the ERC-721 convention — whoever may
+    /// transfer the token may burn it. An approval is what a marketplace asks
+    /// for to list a name, and a burn cannot be undone, so v2.1 refuses both
+    /// kinds of approval. They still move the token.
+    function test_Release_RevertForPerTokenApprovee() public {
         bytes32 node = _register("venue", organiser);
         vm.prank(organiser);
         registry.approve(operator, uint256(node));
 
-        vm.expectEmit(true, true, true, true, address(registry));
-        emit Released(node, organiser, operator);
-
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         vm.prank(operator);
         registry.release(node);
+        assertEq(registry.owner(node), organiser, "an approvee burned the name");
 
-        assertEq(registry.owner(node), address(0));
-        (address by,) = registry.lastRelease(node);
-        assertEq(by, organiser, "previousOwner must be the holder, not the operator");
+        vm.prank(operator);
+        registry.transferFrom(organiser, operator, uint256(node));
+        assertEq(registry.owner(node), operator, "the approval no longer moves the token");
     }
 
-    function test_Release_ByOperatorForAll() public {
+    function test_Release_RevertForOperatorForAll() public {
         bytes32 node = _register("venue", organiser);
         vm.prank(organiser);
         registry.setApprovalForAll(operator, true);
 
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         vm.prank(operator);
         registry.release(node);
 
-        assertEq(registry.owner(node), address(0));
+        assertEq(registry.owner(node), organiser, "an operator burned the name");
     }
 
-    /// A stale approval on a burned token must not matter — but pinned in the
-    /// other direction too: revoking approval before release keeps the name.
+    /// The holder of the name directly above may release it (the fusion,
+    /// owner decision 2026-09-17). The event records the holder as
+    /// `previousOwner` and the parent's holder as `operator`, so the two are
+    /// distinguishable afterwards.
+    function test_Release_ByTheParentsHolder() public {
+        bytes32 venue = _register("venue", organiser);
+        address childHolder = makeAddr("childHolder");
+        bytes[] memory noData = new bytes[](0);
+        vm.prank(organiser);
+        bytes32 shop = registry.createSubnode(venue, "shop", childHolder, noData);
+
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit Released(shop, childHolder, organiser);
+        vm.prank(organiser);
+        registry.release(shop);
+
+        assertEq(registry.owner(shop), address(0));
+        (address by,) = registry.lastRelease(shop);
+        assertEq(by, childHolder, "previousOwner must be the holder, not the parent's holder");
+    }
+
+    /// A revoked approval is refused like any other.
     function test_Release_RevokedApproveeCannotRelease() public {
         bytes32 node = _register("venue", organiser);
         vm.startPrank(organiser);
@@ -366,37 +389,50 @@ contract L2RegistryReleaseTest is Test {
         assertEq(by, address(0));
     }
 
-    /// The residual #464 names, stated precisely. Children keep their OWN
-    /// holders and records; they are not "inherited" by whoever re-mints the
-    /// parent, who gains only the right to create new siblings.
-    function test_Release_ChildrenSurviveWithTheirOwnHolders() public {
+    /// Audit 938 H-2 / 937 F8, which v2 stated here as a residual: children
+    /// outlived their parent's release, with their records, and whoever
+    /// re-minted the parent found a live subtree it had no standing over. A
+    /// name with children cannot be released now; they go first — released by
+    /// their holder or by the parent's — and the re-minter starts clean.
+    function test_Release_ANameWithChildrenGoesBackOnlyOnceTheyAreGone() public {
         bytes32 venue = _register("venue", organiser);
         address childHolder = makeAddr("childHolder");
 
         bytes[] memory noData = new bytes[](0);
         vm.prank(organiser); // parent's holder may create children
         bytes32 shop = registry.createSubnode(venue, "shop", childHolder, noData);
+        vm.prank(organiser);
+        bytes32 bar = registry.createSubnode(venue, "bar", organiser, noData);
         vm.prank(childHolder);
         registry.setContenthash(shop, OTHER_HASH);
 
+        vm.expectRevert(abi.encodeWithSelector(L2Registry.HasChildren.selector, venue, 2));
         vm.prank(organiser);
         registry.release(venue);
 
-        assertEq(registry.owner(shop), childHolder, "child changed hands");
-        assertEq(registry.contenthash(shop), OTHER_HASH, "child's records were cleared");
+        vm.prank(childHolder);
+        registry.release(shop);
+        vm.expectRevert(abi.encodeWithSelector(L2Registry.HasChildren.selector, venue, 1));
+        vm.prank(organiser);
+        registry.release(venue);
 
-        // Re-mint the parent to someone else: they do NOT get the child...
+        vm.startPrank(organiser);
+        registry.release(bar);
+        registry.release(venue);
+        vm.stopPrank();
+        assertEq(registry.childCount(venue), 0);
+
+        // Re-mint the parent to someone else: nothing hangs beneath it.
         string[] memory keys = new string[](0);
         string[] memory vals = new string[](0);
         vm.prank(sponsor);
         registrar.register("venue", stranger, SWARM_HASH, keys, vals);
-        assertEq(registry.owner(shop), childHolder, "child was inherited by the parent's new holder");
-        vm.expectRevert();
-        vm.prank(stranger);
-        registry.setContenthash(shop, SWARM_HASH);
+        assertEq(registry.owner(shop), address(0), "a child outlived its parent");
+        assertEq(registry.contenthash(shop).length, 0, "a child's records outlived it");
 
-        // ...but they can create new siblings beside it.
         vm.prank(stranger);
-        registry.createSubnode(venue, "bar", stranger, noData);
+        bytes32 again = registry.createSubnode(venue, "shop", stranger, noData);
+        assertEq(again, shop);
+        assertEq(registry.contenthash(shop).length, 0, "the new child inherited records");
     }
 }

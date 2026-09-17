@@ -10,10 +10,9 @@ pragma solidity ^0.8.20;
 
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import {NameEncoder} from "@ensdomains/ens-contracts/utils/NameEncoder.sol";
 
 import {ENSDNSUtils} from "./lib/ENSDNSUtils.sol";
 import {IUniversalSignatureValidator} from "./interfaces/IUniversalSignatureValidator.sol";
@@ -42,27 +41,55 @@ import {L2Resolver} from "./L2Resolver.sol";
 ///   - Labels are 1..63 bytes with no '.', '"', '\' or control bytes, and a
 ///     whole name is at most 255 bytes.
 ///   - A registrar creates names beneath the base name only.
-///   - `clearRecords` belongs to the holder's side only.
 ///   - `releaseWithSignature` checks plain ECDSA before the ERC-6492 validator.
 ///   - `addRegistrar(address(0))` is refused.
 ///
-/// The tests that freeze these are the L2Registry*.t.sol suites and
-/// SubEnsV2AuditRegression.t.sol. This contract is deployed as an EIP-1167
-/// clone and CANNOT be upgraded: anything wrong here is permanent.
-contract L2Registry is ERC721, Initializable, L2Resolver {
-    using MessageHashUtils for bytes32;
-
+/// v2.1 (after audits 937 and 938):
+///   - A name's records, `clearRecords` and `release` belong to its HOLDER.
+///     An ERC-721 approval moves the token and does nothing else.
+///   - The base name's records are written by its holder only, never by a
+///     registrar.
+///   - Every name records the name above it (`parentOf`) and counts the live
+///     names directly beneath it (`childCount`). A name with children cannot
+///     be released. The holder of a name may move (`parentTransfer`) or
+///     release the names directly beneath it, one level at a time; beneath
+///     the base name that door is the admin's `adminTransfer` instead.
+///     `adminTransfer` is never blocked by what hangs beneath a name.
+///   - `createSubnode` refuses to finish if its own batch moved the new name.
+///   - Release signatures are EIP-712 typed data and expire within
+///     `MAX_RELEASE_SIGNATURE_TTL`; the validator runs with bounded gas and
+///     its failure is a refusal.
+///   - No name is ever sent to the registry itself.
+///   - `initialize` holds the base name to the same label rules as any other.
+///   - `ABI` answers for every `contentTypes` (`L2Resolver`).
+///
+/// The tests that freeze these are the L2Registry*.t.sol suites,
+/// SubEnsV2AuditRegression.t.sol and SubEnsV21AuditRegression.t.sol. This
+/// contract is deployed as an EIP-1167 clone and CANNOT be upgraded: anything
+/// wrong here is permanent.
+contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Domain tag of the message `releaseWithSignature` verifies (WoCo
-    ///         addition, #464). Named fields, so a client can rebuild the
-    ///         digest — but `releaseDigest` is the reference and clients should
-    ///         read it rather than re-derive it.
-    bytes32 public constant RELEASE_TYPEHASH = keccak256(
-        "WoCoRelease(address registry,uint256 chainId,bytes32 node,uint64 recordVersion,uint256 expiration)"
-    );
+    /// @notice EIP-712 type of the message `releaseWithSignature` verifies.
+    ///         `name` is the whole name as a wallet should show it, e.g.
+    ///         "alice.woco.eth"; the registry and the chain are in the domain
+    ///         ("WoCo Names", version "2").
+    bytes32 public constant RELEASE_TYPEHASH =
+        keccak256("Release(string name,bytes32 node,uint64 recordVersion,uint256 expiration)");
+
+    /// @notice The furthest ahead of the submitting block a release signature
+    ///         may expire.
+    /// @dev A ceiling, not the product's policy: the relay accepts 15 minutes
+    ///      and the client asks for 10. It is this long because the clock it is
+    ///      compared with is the Arbitrum sequencer's, which may run up to a day
+    ///      behind (audit 937 F25): a signature that expires ten minutes from
+    ///      the wallet's clock must still be in range there, and the L1
+    ///      force-inclusion path, about a day, must stay usable. Without any
+    ///      ceiling a signature could be made to outlive every intent behind
+    ///      it (937 F2, F3).
+    uint256 public constant MAX_RELEASE_SIGNATURE_TTL = 48 hours;
 
     /// @dev The DNS limits (RFC 1035 §2.3.4), in wire format: 63 bytes per
     ///      label, and 255 for a whole name counting its length bytes and the
@@ -71,10 +98,17 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     uint256 private constant MAX_LABEL_BYTES = 63;
     uint256 private constant MAX_NAME_BYTES = 255;
 
+    /// @dev Gas forwarded to the ERC-6492 validator. Enough for an undeployed
+    ///      passkey account — a factory deployment plus a P-256 verification in
+    ///      Solidity, together about 600k — while bounding what one signature
+    ///      can cost whoever submits it (audit 938 M-5). A frozen constant, so
+    ///      it errs high.
+    uint256 private constant VALIDATOR_GAS = 1_000_000;
+
     /// @dev ERC-6492 validator: ERC-1271 for deployed contract accounts, and a
     ///      counterfactual deployment for undeployed ones. Consulted only by
     ///      `releaseWithSignature`, and only for a signature that does not
-    ///      already recover to its signer as plain ECDSA.
+    ///      already recover to the holder as plain ECDSA.
     IUniversalSignatureValidator internal immutable universalSignatureValidator =
         IUniversalSignatureValidator(0x164af34fAF9879394370C7f09064127C043A35E9);
 
@@ -88,8 +122,8 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
 
     /// @notice Number of names that currently exist, at any depth, including
     ///         the base name.
-    /// @dev Upstream only ever incremented this. `release` (#464) decrements it,
-    ///      so that it means what its name says rather than "ever minted".
+    /// @dev Kept by the ownership funnel, `_updateAndBumpVersion`: a mint adds
+    ///      one and a burn takes one away, whichever path made them.
     uint256 public totalSupply;
 
     string private _tokenName;
@@ -109,27 +143,40 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         uint64 releasedAt;
     }
 
-    /// @notice The most recent release of each node.
+    /// @notice The most recent release of each node: who HELD the name, and
+    ///         when it was burned — whoever authorised the burn, the holder or
+    ///         the holder of the name above it. `Released` says which.
     ///
-    /// @dev Written by `release`, read by nothing in this contract, and that is
-    ///      deliberate. This registry is an EIP-1167 clone and cannot be
-    ///      patched; the registrar that decides mint policy can be replaced at
-    ///      will. A policy such as "for N days after a release only the previous
-    ///      holder may take the label back" is therefore a registrar concern —
-    ///      but it can only ever be enforced ON CHAIN if the frozen layer kept
-    ///      the two facts it needs, because `release` is holder-only and never
-    ///      passes through a registrar. A burn that forgot who it burned would
-    ///      close that door permanently, to save one slot per release.
+    /// @dev Read by nothing in this contract, and that is deliberate. This
+    ///      registry is an EIP-1167 clone and cannot be patched; the registrar
+    ///      that decides mint policy can be replaced at will. A policy such as
+    ///      "for N days after a release only the previous holder may take the
+    ///      label back" is therefore a registrar concern — but it can only
+    ///      ever be enforced ON CHAIN if the frozen layer kept the two facts it
+    ///      needs, because `release` never passes through a registrar. A burn
+    ///      that forgot who it burned would close that door permanently, to
+    ///      save one slot per release.
     ///
     ///      FOOTGUN FOR A FUTURE READER: this record SURVIVES a re-mint of the
     ///      same label, on purpose — it is history. "Currently released" is
     ///      `owner(node) == address(0)`; check that first, and read this only
-    ///      for who held it last and when they let go.
+    ///      for who held it last and when it went.
     mapping(bytes32 node => ReleaseRecord) public lastRelease;
 
     /// @notice The address the admin has nominated to take the admin seat, or
     ///         zero when no handover is open. See `nominateAdmin`.
     address public pendingAdmin;
+
+    /// @notice The name directly above `node`. Zero for the base name and for
+    ///         a node never minted.
+    /// @dev Written when the name is created and never cleared; a re-mint of
+    ///      the same label writes the same value. It is structure, not state:
+    ///      whether the name is live is `owner(node)`.
+    mapping(bytes32 node => bytes32 parent) public parentOf;
+
+    /// @notice How many live names sit directly beneath `node`, the base name
+    ///         included. A name cannot be released while this is non-zero.
+    mapping(bytes32 node => uint256 count) public childCount;
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -160,14 +207,23 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         address indexed newOwner
     );
 
-    /// @notice A name was given back by its holder (WoCo addition, #464).
-    ///         `operator` is the account that AUTHORISED it — the holder, or an
-    ///         ERC-721 approvee acting for them: `msg.sender` under `release`,
-    ///         the signer under `releaseWithSignature`. Kept apart from
-    ///         `previousOwner` so a dispute can tell the two cases apart. The
-    ///         relayer that merely paid for a signed release is on the
-    ///         transaction, deliberately not here: this event answers "who let
-    ///         go", and a relayer never did.
+    /// @notice A name was reassigned by the holder of the name directly above
+    ///         it, without its own holder's consent. See `parentTransfer`.
+    ///         Like `AdminTransfer`, kept apart from the ERC-721 `Transfer` so
+    ///         that it does not read as a sale.
+    event ParentTransfer(
+        bytes32 indexed node,
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    /// @notice A name was burned (WoCo addition, #464). `previousOwner` held
+    ///         it. `operator` is the account that AUTHORISED the burn: the
+    ///         holder, or — under `release` only — the holder of the name
+    ///         directly above it. Under `releaseWithSignature` it is the
+    ///         signer, which is always the holder. The relayer that merely paid
+    ///         for a signed release is on the transaction, deliberately not
+    ///         here: this event answers "who let go", and a relayer never did.
     event Released(
         bytes32 indexed node,
         address indexed previousOwner,
@@ -201,6 +257,13 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     error ReleaseBaseNode();
     error ReleaseUnregistered(bytes32 node);
     error SignatureExpired();
+    error ExpirationTooFar();
+    error HasChildren(bytes32 node, uint256 count);
+    error ParentTransferToZero();
+    error ParentTransferUnregistered(bytes32 node);
+    error ParentTransferSameOwner();
+    error RecipientIsRegistry();
+    error SubnodeMovedDuringCreation(bytes32 node);
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -213,9 +276,14 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         _;
     }
 
+    /// @dev Expiration is L2 sequencer time: `block.timestamp` on Arbitrum,
+    ///      which the sequencer sets and which may trail real time.
     modifier unexpiredSignature(uint256 expiration) {
         if (block.timestamp > expiration) {
             revert SignatureExpired();
+        }
+        if (expiration > block.timestamp + MAX_RELEASE_SIGNATURE_TTL) {
+            revert ExpirationTooFar();
         }
         _;
     }
@@ -224,7 +292,14 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    constructor() ERC721("", "") {
+    /// @dev The EIP-712 name and version are immutables of the implementation;
+    ///      each clone rebuilds the domain with its own address and chain.
+    ///      Both strings MUST stay within 31 bytes. A longer one is read back
+    ///      by `eip712Domain()` from the implementation's STORAGE, which a clone
+    ///      does not share, so every clone would report an empty name and a
+    ///      wallet that builds the domain from ERC-5267 would sign for the
+    ///      wrong one.
+    constructor() ERC721("", "") EIP712("WoCo Names", "2") {
         _disableInitializers();
     }
 
@@ -235,6 +310,10 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///
     ///      `_mint`, not `_safeMint`: `admin` is a multisig or a DAO, and the
     ///      admin seat must not depend on it answering an ERC-721 receiver hook.
+    ///
+    ///      Every label of `tokenName` passes the rules a child label does
+    ///      (`_addLabel`): every child's wire name, and so `tokenURI`'s JSON,
+    ///      starts with these bytes (audit 937 F9 / 938 M-3).
     /// @param tokenName The parent ENS name, and name of the NFT collection
     /// @param tokenSymbol The symbol of the NFT collection
     /// @param baseURI The base URI of the NFT collection
@@ -245,9 +324,7 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         string calldata baseURI,
         address admin
     ) external initializer {
-        (bytes memory dnsEncodedName, bytes32 node) = NameEncoder.dnsEncodeName(
-            tokenName
-        );
+        (bytes memory dnsEncodedName, bytes32 node) = _encodeName(tokenName);
 
         // ERC721
         _tokenName = tokenName;
@@ -257,7 +334,6 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         // Registry
         baseNode = node;
         names[baseNode] = dnsEncodedName;
-        totalSupply++;
         _mint(admin, uint256(node));
     }
 
@@ -271,8 +347,8 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      parent, including one never minted, whose child then carried an
     ///      undecodable name (audit 924 F-8).
     ///
-    ///      ORDER. `names` and `totalSupply` are written before the mint, and the
-    ///      mint is `_mint`, which calls nothing on the recipient. v1's
+    ///      ORDER. `names` and the parent link are written before the mint, and
+    ///      the mint is `_mint`, which calls nothing on the recipient. v1's
     ///      `_safeMint` handed a contract recipient control mid-mint: releasing
     ///      the name from there made the registrar's record writes land on a
     ///      freed label, where the next registrant found them (audit 927 H3). A
@@ -281,6 +357,15 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///
     ///      The new name starts with empty records: the mint is an ownership
     ///      change, and `_update` gives it a fresh record version.
+    ///
+    ///      THE BATCH. `data` runs after the mint and the two events, with the
+    ///      caller's own authority, and must leave the new name where the mint
+    ///      put it: same holder, same record version. It is for record writes,
+    ///      so it does something only for a registrar or a caller minting to
+    ///      itself — nobody else may write the new name's records. A batch that
+    ///      moved, burned or cleared the name would have announced a name that
+    ///      no longer exists (audit 937 F1 / 938 M-8). A failing call inside it
+    ///      reverts the whole mint without its reason: `Multicallable` drops it.
     /// @param node The parent node, e.g. `namehash("name.eth")` for "name.eth"
     /// @param label The label of the subnode, e.g. "x" for "x.name.eth"
     /// @param _owner The address that will own the subnode
@@ -306,20 +391,20 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         }
 
         names[subnode] = dnsEncodedName;
-        totalSupply++;
+        parentOf[subnode] = node;
+        childCount[node]++;
         _mint(_owner, uint256(subnode));
-        _multicall(subnode, data);
 
         emit NewOwner(node, labelhash, _owner);
         emit SubnodeCreated(subnode, dnsEncodedName, _owner);
-        return subnode;
-    }
 
-    /// @notice Helper to derive a node from a name
-    /// @dev In practice, this should be performed offchain
-    function namehash(string calldata _name) external pure returns (bytes32) {
-        (, bytes32 node) = NameEncoder.dnsEncodeName(_name);
-        return node;
+        uint64 version = recordVersions[subnode];
+        _multicall(subnode, data);
+        if (_ownerOf(uint256(subnode)) != _owner || recordVersions[subnode] != version) {
+            revert SubnodeMovedDuringCreation(subnode);
+        }
+
+        return subnode;
     }
 
     /// @notice Helper to decode a DNS-encoded name
@@ -374,11 +459,15 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
 
     /// @notice Adds a new registrar address
     /// @dev Only callable by admin role. A registrar may create names beneath
-    ///      the base name and write the records of every name that exists; see
-    ///      `_canWriteRecords`. The zero address is refused: no transaction can
-    ///      come from it, so enrolling it could only ever make an authorisation
-    ///      check that is handed an unset address succeed — the shape of the v1
-    ///      defect (audit 924 F-1, F-18).
+    ///      the base name and write the records of every name that exists
+    ///      except the base name; see `_canWriteRecords`. The zero address is
+    ///      refused: no transaction can come from it, so enrolling it could only
+    ///      ever make an authorisation check that is handed an unset address
+    ///      succeed — the shape of the v1 defect (audit 924 F-1, F-18).
+    ///
+    ///      Enrolments survive a handover of the admin seat. An incoming admin
+    ///      reads `RegistrarAdded` / `RegistrarRemoved` and prunes what it did
+    ///      not enrol (audit 938 M-4).
     /// @param registrar The address to grant registrar role to
     function addRegistrar(address registrar) external onlyOwner {
         if (registrar == address(0)) revert RegistrarIsZeroAddress();
@@ -417,6 +506,9 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      The current admin is refused as a nominee: accepting would move
     ///      nothing, reset the base name's records, and log a handover that did
     ///      not happen.
+    ///
+    ///      The handover resets the base name's records like any ownership
+    ///      change: the incoming admin writes them again.
     /// @param nominee The address that may accept the seat.
     function nominateAdmin(address nominee) external onlyOwner {
         if (nominee == msg.sender) revert NomineeIsAdmin();
@@ -462,17 +554,25 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      move resets the name's records (`_update`), so the name stops
     ///      resolving to the previous holder's site in the same transaction. It
     ///      cannot mint over a live name, bypass `NotAvailable`, or move the base
-    ///      name, which changes hands only through `nominateAdmin`.
+    ///      name, which changes hands only through `nominateAdmin`. Names beneath
+    ///      the moved one stay where they are, and nothing beneath a name can
+    ///      block this: the new holder may take them with `parentTransfer`, one
+    ///      level at a time, and the admin may chase any of them here.
     ///
     ///      WHAT THE ADMIN SEAT CAN DO WITHOUT IT, stated so no policy claims
-    ///      more than this contract delivers: rewrite any name's records while
-    ///      leaving it where it is. The seat may enrol itself, or any address,
-    ///      with `addRegistrar`, and a registrar may write the records of every
-    ///      name that exists. Owner decision 2026-09-14: accepted. The check on
-    ///      that power is who holds the seat — the Safe now, a DAO later through
-    ///      `nominateAdmin` / `acceptAdmin` — together with `RegistrarAdded`,
-    ///      which puts every enrolment on chain. There is no per-name manager
-    ///      that bounds it, and this contract cannot gain one.
+    ///      more than this contract delivers:
+    ///        - rewrite the records of any name but the base name while leaving
+    ///          it where it is. The seat may enrol itself, or any address, with
+    ///          `addRegistrar`, and a registrar may write those records. Owner
+    ///          decision 2026-09-14: accepted. The check on that power is who
+    ///          holds the seat — the Safe now, a DAO later through
+    ///          `nominateAdmin` / `acceptAdmin` — together with
+    ///          `RegistrarAdded`, which puts every enrolment on chain. There is
+    ///          no per-name manager that bounds it, and this contract cannot
+    ///          gain one.
+    ///        - end a name altogether, by moving it to an address the seat
+    ///          controls and releasing it there as its holder. `release` itself
+    ///          grants the seat nothing; this is two visible steps.
     ///
     ///      NO TIMELOCK (owner decision, 2026-08-29): a compromised admin seat
     ///      can take names; that is the accepted cost of the power existing at
@@ -503,7 +603,7 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Give a name back. Burns the token, wipes its records, and
-    ///         remembers who let go of it and when. Afterwards the label is
+    ///         remembers who held it and when. Afterwards the label is
     ///         available to anyone through the ordinary mint path.
     ///
     /// @dev WoCo addition to the vendored Durin registry (WoCo-Event-App #464).
@@ -513,12 +613,18 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      registry is an unpatchable clone, that had to be decided before the
     ///      mainnet deploy or never.
     ///
-    ///      WHO MAY CALL IT: the holder, or an address the holder has approved
-    ///      under ERC-721 — the same set that may transfer the token, checked
-    ///      by the same OpenZeppelin predicate. NOT registrars and NOT the
-    ///      registry admin: this function adds no platform power. The admin
-    ///      already has `adminTransfer`; a platform-side burn would be the
-    ///      takedown capability that design deliberately excluded.
+    ///      WHO MAY CALL IT: the holder, and the holder of the name directly
+    ///      above it — except beneath the base name, where the admin's door is
+    ///      `adminTransfer`, so this function adds no platform power. NOT an
+    ///      ERC-721 approvee or operator: an approval is a listing primitive on
+    ///      marketplaces and a burn cannot be undone (audit 938 M-7). NOT a
+    ///      registrar, NOT the registry admin as such.
+    ///
+    ///      A NAME WITH CHILDREN CANNOT BE RELEASED (`HasChildren`). Its
+    ///      children would otherwise outlive it and pass, with their records,
+    ///      to whoever takes the label next (audit 938 H-2 / 937 F8). Each child
+    ///      is released first — by its holder, or by this name's holder — or
+    ///      moved away with `parentTransfer`, which keeps it counted here.
     ///
     ///      WHY BURN RATHER THAN PARK: availability throughout this contract and
     ///      the registrar is exactly `owner(node) == address(0)`, so a burn makes
@@ -530,18 +636,12 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      name's records in the same transaction, and whoever mints the label
     ///      next starts from empty records.
     ///
-    ///      WHY `names[node]` IS LEFT IN PLACE: it is only read by `tokenURI`,
-    ///      which refuses a burned token first, and by `createSubnode` for the
-    ///      PARENT of a new name — and a re-mint of this label writes the same
-    ///      bytes back. Clearing it would erase the only on-chain map from a
-    ///      released node to its label, for a gas refund nobody needs.
-    ///
-    ///      RESIDUAL, stated so it is not rediscovered: names BENEATH a released
-    ///      name are untouched. They keep their own holders and their own
-    ///      records, and resolve exactly as before; what the next holder of the
-    ///      parent gains is the ability to create NEW children beside them, not
-    ///      control of the existing ones. The registry cannot enumerate
-    ///      children, so this cannot be refused here; policy has to say it.
+    ///      WHY `names[node]` IS LEFT IN PLACE: it is read by `tokenURI`, which
+    ///      refuses a burned token first; by `createSubnode` for the PARENT of a
+    ///      new name, which must be live; and by `releaseDigest`. A re-mint of
+    ///      this label writes the same bytes back. Clearing it would erase the
+    ///      only on-chain map from a released node to its label, for a gas
+    ///      refund nobody needs.
     ///
     /// @param node The namehash of the name to release.
     function release(bytes32 node) external {
@@ -551,37 +651,52 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
 
         address holder = owner(node);
         if (holder == address(0)) revert ReleaseUnregistered(node);
-        if (!_isAuthorized(holder, msg.sender, uint256(node))) {
-            revert Unauthorized(node);
+        if (msg.sender != holder) {
+            address parentHolder = _parentHolder(node);
+            if (parentHolder == address(0) || msg.sender != parentHolder) revert Unauthorized(node);
         }
 
         _release(node, holder, msg.sender);
     }
 
-    /// @notice The exact 32 bytes a holder signs to authorise `releaseWithSignature`
-    ///         for `node` until `expiration`. EIP-191 personal-sign shape, so a
-    ///         plain wallet signs it with `personal_sign` and a contract wallet
-    ///         answers for it through ERC-1271 / ERC-6492.
+    /// @notice The EIP-712 digest a holder signs to authorise
+    ///         `releaseWithSignature` for `node` until `expiration`.
     ///
-    /// @dev Everything that makes the signature single-purpose is in here:
-    ///      `RELEASE_TYPEHASH`, so no other message a holder signs hashes to it;
-    ///      `address(this)` + `block.chainid`, so neither another registry nor
-    ///      this registry's address on another chain accepts it; and
-    ///      `recordVersions[node]`, which moves on every ownership change of the
-    ///      name and on `clearRecords`. One signature therefore releases at most
+    /// @dev Typed data, so a wallet can show what is being signed: a Release
+    ///      of the name, by its full name, until a time. Domain "WoCo Names" /
+    ///      "2" with this registry's address and chain, so neither another
+    ///      registry nor this registry's address on another chain accepts it
+    ///      (audit 937 F3 / 938 M-2: the v2 digest looked like EIP-712 and was
+    ///      not).
+    ///
+    ///      `recordVersions[node]` moves on every ownership change of the name
+    ///      and on `clearRecords`. One signature therefore releases at most
     ///      once, and dies the moment the name changes hands — including a
-    ///      re-mint of the same label to the same holder.
+    ///      re-mint of the same label to the same holder. A signature made for
+    ///      a version the name has not reached yet is bounded by
+    ///      `MAX_RELEASE_SIGNATURE_TTL` like any other (937 F2).
+    ///
+    ///      Reverts for a node that was never minted: there is no name to show.
     function releaseDigest(bytes32 node, uint256 expiration) public view returns (bytes32) {
-        return keccak256(
-            abi.encode(RELEASE_TYPEHASH, address(this), block.chainid, node, recordVersions[node], expiration)
-        ).toEthSignedMessageHash();
+        return _hashTypedDataV4(
+            keccak256(
+                abi.encode(
+                    RELEASE_TYPEHASH,
+                    keccak256(bytes(ENSDNSUtils.dnsDecode(names[node]))),
+                    node,
+                    recordVersions[node],
+                    expiration
+                )
+            )
+        );
     }
 
-    /// @notice `release`, authorised by a signature instead of by `msg.sender`,
-    ///         so that whoever submits the transaction need not be the holder.
+    /// @notice `release`, authorised by the holder's signature instead of by
+    ///         `msg.sender`, so that whoever submits the transaction need not be
+    ///         the holder.
     ///
     /// @dev WoCo addition (WoCo-Event-App #464, decided 2026-09-03). WHY IT
-    ///      EXISTS: `release` is holder-only by `msg.sender`, which means a
+    ///      EXISTS: `release` is authorised by `msg.sender`, which means a
     ///      holder with a plain wallet pays gas for it and a holder with no gas
     ///      at all cannot release. A paymaster solves that only for smart
     ///      accounts. This function is the same burn, gated on the holder's
@@ -590,19 +705,26 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      WHAT IT DOES NOT ADD: platform power. The relayer submits only what
     ///      the holder signed, for the node and the deadline the holder chose,
     ///      and can refuse to relay but never forge; the holder can always call
-    ///      `release` directly instead. The same OpenZeppelin predicate as
-    ///      `release` decides WHO may sign — the holder or an ERC-721 approvee —
-    ///      and it is checked BEFORE the signature is examined, so a stranger's
-    ///      perfectly valid signature is refused without reaching the validator
-    ///      (which, for an ERC-6492 wrapper, would run the wrapper's factory call).
+    ///      `release` directly instead. ONLY the holder may sign — not an
+    ///      approvee, and not the holder of the name above, who releases by
+    ///      direct call — and that is checked BEFORE the signature is examined,
+    ///      so any other signer is refused without reaching the validator
+    ///      (which, for an ERC-6492 wrapper, would run the wrapper's factory
+    ///      call). Every rule of `release` applies, `HasChildren` included.
     ///
     ///      HOW THE SIGNATURE IS CHECKED. Plain ECDSA first: if `signature`
     ///      recovers to `signer`, the key behind `signer` signed, and the
-    ///      validator is not consulted. `signer` is non-zero here, because
-    ///      `_isAuthorized` refuses the zero address, so a failed recovery —
-    ///      which yields the zero address — can never match it. Otherwise the
-    ///      ERC-6492 validator decides: ERC-1271 for a deployed contract
-    ///      account, a counterfactual deployment for an undeployed one.
+    ///      validator is not consulted. `signer` is the holder, which is never
+    ///      the zero address, so a failed recovery — which yields the zero
+    ///      address — can never match it. Otherwise the ERC-6492 validator
+    ///      decides: ERC-1271 for a deployed contract account, a counterfactual
+    ///      deployment for an undeployed one. It runs with `VALIDATOR_GAS`, and
+    ///      anything but a clean `true` — a revert, running out of gas, a
+    ///      malformed answer — is `Unauthorized` (audit 938 M-5 / 937 F18,
+    ///      F19). The validator may run code with lasting effects — for a
+    ///      deployed wallet it retries after a "prepare" call named in the
+    ///      signature — so the record version is read again afterwards, and
+    ///      a name that moved or was cleared meanwhile is refused (938 L-7).
     ///
     ///      The order matters for an EOA with an EIP-7702 delegation. It has
     ///      code, so the validator asks its delegate through ERC-1271, and a
@@ -613,12 +735,18 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      contract account has no key that recovers to its address, so it
     ///      still goes through ERC-1271.
     ///
+    ///      A different ECDSA encoding of the same holder's signature is the
+    ///      same authorisation, and the record version still makes it single
+    ///      use (937 F17 / 938 L-2).
+    ///
     ///      The message is `releaseDigest(node, expiration)`; see there for why
     ///      it can be used once, here, and for nothing else.
     ///
     /// @param node       The namehash of the name to release.
-    /// @param expiration Unix seconds; the signature is void after it.
-    /// @param signer     Who signed: the holder or an approvee.
+    /// @param expiration Unix seconds, L2 sequencer time; the signature is void
+    ///                   after it, and refused if it is more than
+    ///                   `MAX_RELEASE_SIGNATURE_TTL` ahead.
+    /// @param signer     Who signed: the holder.
     /// @param signature  Their signature over `releaseDigest(node, expiration)`.
     function releaseWithSignature(
         bytes32 node,
@@ -630,34 +758,75 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
 
         address holder = owner(node);
         if (holder == address(0)) revert ReleaseUnregistered(node);
-        if (!_isAuthorized(holder, signer, uint256(node))) {
-            revert Unauthorized(node);
-        }
+        if (signer != holder) revert Unauthorized(node);
 
+        uint64 version = recordVersions[node];
         bytes32 digest = releaseDigest(node, expiration);
         (address recovered, , ) = ECDSA.tryRecoverCalldata(digest, signature);
-        if (recovered != signer && !universalSignatureValidator.isValidSig(signer, digest, signature)) {
-            revert Unauthorized(node);
+        if (recovered != signer) {
+            if (!_validatorAccepts(signer, digest, signature)) revert Unauthorized(node);
+            // Every change of holder moves the version too, so this one
+            // comparison says the name is still the one that was signed for.
+            if (recordVersions[node] != version) revert Unauthorized(node);
         }
 
         _release(node, holder, signer);
     }
 
-    /// @notice Wipe `node`'s records by moving it to a fresh record version.
-    /// @dev The holder's side only: the holder, its per-token approvee, or its
-    ///      operator-for-all — the addresses that could already release or
-    ///      transfer the name, which would reset its records anyway.
+    /// @notice Move a name directly beneath one of yours to `newOwner`, without
+    ///         its holder's consent.
     ///
-    ///      Registrars, and the registry admin enrolled as one, are refused. No
-    ///      registrar flow needs this now that every ownership change resets
-    ///      records in `_update`, and in v1 it was the second step of the
-    ///      admin's wipe-in-place (audit 927 H1).
+    /// @dev The owner's decision of 2026-09-17: a name issued beneath another
+    ///      is never wholly its holder's. The holder of the parent may take it
+    ///      back or hand it on — an organiser recovering a stallholder's lost
+    ///      name, as the admin can for organisers — and a sale of the parent
+    ///      sells that authority with it.
+    ///
+    ///      ONE LEVEL AT A TIME. Only the holder of `parentOf[node]` may call
+    ///      it; a grandparent first takes the child, and then holds the
+    ///      grandchild's parent. Beneath the base name it is refused: the admin
+    ///      seat's door there is `adminTransfer`, which keeps `AdminTransfer`
+    ///      the one signal of a platform reassignment.
+    ///
+    ///      It moves the name and resets its records, as every ownership
+    ///      change does; it grants no record authority of its own. It is never
+    ///      blocked by what hangs beneath the name. A direct call only: an
+    ///      organiser on a smart account sends it as a user operation.
+    /// @param node     The namehash of the name to move.
+    /// @param newOwner Its new holder. Not the zero address: to end the name,
+    ///                 `release` it.
+    function parentTransfer(bytes32 node, address newOwner) external {
+        if (newOwner == address(0)) revert ParentTransferToZero();
+
+        address previousOwner = owner(node);
+        if (previousOwner == address(0)) revert ParentTransferUnregistered(node);
+
+        address parentHolder = _parentHolder(node);
+        if (parentHolder == address(0) || msg.sender != parentHolder) revert Unauthorized(node);
+
+        // `_transfer` permits `from == to`: a wipe-in-place, as in `adminTransfer`.
+        if (newOwner == previousOwner) revert ParentTransferSameOwner();
+
+        _transfer(previousOwner, newOwner, uint256(node));
+
+        emit ParentTransfer(node, previousOwner, newOwner);
+    }
+
+    /// @notice Wipe `node`'s records by moving it to a fresh record version.
+    /// @dev The holder only. Registrars, the registry admin enrolled as one,
+    ///      and the holder's approvees and operators are refused: in v1 this
+    ///      was the second step of the admin's wipe-in-place (audit 927 H1),
+    ///      and an operator could use it to wipe the base name (938 M-9).
+    ///
+    ///      Its real use is that it moves `recordVersions[node]`, and that is
+    ///      what voids an outstanding `releaseDigest` signature. So only the
+    ///      holder, whose signature it is, may do it.
     ///
     ///      The inherited body still runs its own `authorised` check, which the
-    ///      holder's side always passes. Moving the version also voids any
-    ///      outstanding `releaseDigest` signature for the name.
+    ///      holder always passes.
     function clearRecords(bytes32 node) public override {
-        if (!_isAuthorized(owner(node), msg.sender, uint256(node))) {
+        address holder = owner(node);
+        if (holder == address(0) || msg.sender != holder) {
             revert Unauthorized(node);
         }
         super.clearRecords(node);
@@ -669,15 +838,18 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
 
     /// @dev ONE rule for who may write a name's records. The name must exist,
     ///      and the writer must be:
-    ///        - a registrar; or
-    ///        - someone who may act for the holder under ERC-721 — the holder,
-    ///          its per-token approvee, or its operator-for-all. That is
-    ///          OpenZeppelin's `_isAuthorized`, the predicate `release` uses.
+    ///        - its holder; or
+    ///        - a registrar, for any name but the base name.
     ///
-    ///      `_isAuthorized` refuses the zero address outright, which is what the
-    ///      v1 check failed to do (audit 924 F-1). It also extends record
-    ///      authority to operators-for-all, as the ENS PublicResolver does; an
-    ///      operator can already transfer or release the name.
+    ///      NOT an ERC-721 approvee or operator (audit 938 H-1 / 937 F4): the
+    ///      approval a marketplace asks for to list a name must not let it
+    ///      repoint where the name's payments go, with no transfer to show for
+    ///      it. `writer == holder` also refuses the zero address, because a
+    ///      live name's holder never is.
+    ///
+    ///      The base name's records are its holder's alone — the admin seat's
+    ///      own. No registrar writes them (937 F7), and neither do the seat's
+    ///      approvees (938 M-9).
     ///
     ///      Existence is required of registrars too, so a registrar cannot write
     ///      records under a node that does not exist at all, where `resolve`
@@ -690,13 +862,25 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     ///      `addRegistrar`. That is accepted; see `adminTransfer`.
     function _canWriteRecords(address writer, bytes32 node) internal view override returns (bool) {
         address holder = _ownerOf(uint256(node));
-        return holder != address(0) && (registrars[writer] || _isAuthorized(holder, writer, uint256(node)));
+        return holder != address(0) && (writer == holder || (registrars[writer] && node != baseNode));
+    }
+
+    /// @dev The holder of the name directly above `node`, when that holder may
+    ///      act on it; otherwise zero. Zero for the base name and for names
+    ///      directly beneath it, whose parent's holder is the admin seat — its
+    ///      door is `adminTransfer`. A live name's parent is always live,
+    ///      because `_release` refuses a name with children.
+    function _parentHolder(bytes32 node) internal view returns (address) {
+        bytes32 parent = parentOf[node];
+        if (parent == bytes32(0) || parent == baseNode) return address(0);
+        return _ownerOf(uint256(parent));
     }
 
     /// @dev Every change of a name's owner comes through here — `_mint`,
-    ///      `transferFrom` / `safeTransferFrom`, `adminTransfer`'s `_transfer`,
-    ///      `release`'s `_burn` — except `acceptAdmin`, which enters one step
-    ///      further in. Refuses to move an existing base name; see `nominateAdmin`.
+    ///      `transferFrom` / `safeTransferFrom`, `adminTransfer`'s and
+    ///      `parentTransfer`'s `_transfer`, `release`'s `_burn` — except
+    ///      `acceptAdmin`, which enters one step further in. Refuses to move an
+    ///      existing base name; see `nominateAdmin`.
     function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
         if (bytes32(tokenId) == baseNode && _ownerOf(tokenId) != address(0)) {
             revert AdminHandoverRequired();
@@ -704,19 +888,33 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         return _updateAndBumpVersion(to, tokenId, auth);
     }
 
-    /// @dev The one place an ownership change moves a record version. Records
-    ///      are stored per version, so moving it makes every record of the
-    ///      previous holding unreadable at once.
+    /// @dev The one place an ownership change is accounted for, `acceptAdmin`
+    ///      included.
     ///
-    ///      WHY HERE AND NOT IN EACH CALLER: v1 bumped in `release` and
-    ///      `adminTransfer` only. A mint did not, so records written to a label
-    ///      before or during its mint reached the new holder (audit 924 F-3 /
-    ///      927 H2, H3), and a plain transfer did not, so a buyer received the
-    ///      seller's records (924 F-5) and the seller's outstanding release
-    ///      signature. A path added later cannot forget a bump that no path
-    ///      performs itself.
+    ///      RECORDS. Records are stored per version, so moving it makes every
+    ///      record of the previous holding unreadable at once. v1 bumped in
+    ///      `release` and `adminTransfer` only. A mint did not, so records
+    ///      written to a label before or during its mint reached the new holder
+    ///      (audit 924 F-3 / 927 H2, H3), and a plain transfer did not, so a
+    ///      buyer received the seller's records (924 F-5) and the seller's
+    ///      outstanding release signature. A path added later cannot forget a
+    ///      bump that no path performs itself.
+    ///
+    ///      SUPPLY. A mint adds one to `totalSupply` and a burn takes one away
+    ///      (938 L-5).
+    ///
+    ///      THE REGISTRY HOLDS NOTHING. A name sent here could never move again:
+    ///      the registry calls nothing on its own behalf (937 F19, 938 L-3).
     function _updateAndBumpVersion(address to, uint256 tokenId, address auth) private returns (address from) {
+        if (to == address(this)) revert RecipientIsRegistry();
+
         from = super._update(to, tokenId, auth);
+
+        if (from == address(0)) {
+            totalSupply++;
+        } else if (to == address(0)) {
+            totalSupply--;
+        }
 
         bytes32 node = bytes32(tokenId);
         recordVersions[node]++;
@@ -724,10 +922,14 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
     }
 
     /// @dev The burn both release paths share. Callers have already decided
-    ///      that `holder` owns `node` and that `operator` may act for them.
+    ///      that `holder` owns `node` and that `operator` may release it. The
+    ///      child check lives here so that every path to a burn shares it.
     function _release(bytes32 node, address holder, address operator) internal {
+        uint256 children = childCount[node];
+        if (children != 0) revert HasChildren(node, children);
+
         _burn(uint256(node));
-        totalSupply--;
+        childCount[parentOf[node]]--;
 
         lastRelease[node] = ReleaseRecord({
             previousOwner: holder,
@@ -737,9 +939,48 @@ contract L2Registry is ERC721, Initializable, L2Resolver {
         emit Released(node, holder, operator);
     }
 
+    /// @dev Whether the ERC-6492 validator says `signer` signed `digest`, asked
+    ///      with bounded gas. A low-level call rather than `try`: `try` still
+    ///      bubbles a failure to decode the answer. Anything but exactly `true`
+    ///      is no.
+    function _validatorAccepts(address signer, bytes32 digest, bytes calldata signature)
+        private
+        returns (bool)
+    {
+        (bool ok, bytes memory ret) = address(universalSignatureValidator).call{gas: VALIDATOR_GAS}(
+            abi.encodeCall(IUniversalSignatureValidator.isValidSig, (signer, digest, signature))
+        );
+        return ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
+    }
+
     function _setBaseURI(string calldata baseURI) private {
         _tokenBaseURI = baseURI;
         emit BaseURIUpdated(baseURI);
+    }
+
+    /// @dev `name_` in DNS wire format, and its namehash, with every label
+    ///      held to `_addLabel`'s rules. Split on '.' from the right, so an
+    ///      empty label — a leading, trailing or doubled dot, or an empty name —
+    ///      is refused as `LabelTooShort`.
+    function _encodeName(string calldata name_) private pure returns (bytes memory wire, bytes32 node) {
+        bytes calldata b = bytes(name_);
+        wire = hex"00";
+        uint256 end = b.length;
+        for (uint256 i = b.length; i > 0; --i) {
+            if (b[i - 1] == ".") {
+                (wire, node) = _prependLabel(string(b[i:end]), wire, node);
+                end = i - 1;
+            }
+        }
+        (wire, node) = _prependLabel(string(b[:end]), wire, node);
+    }
+
+    function _prependLabel(string memory label, bytes memory wire, bytes32 node)
+        private
+        pure
+        returns (bytes memory, bytes32)
+    {
+        return (_addLabel(label, wire), keccak256(abi.encodePacked(node, keccak256(bytes(label)))));
     }
 
     /// @dev The label rules every consumer of a name depends on. Case, unicode

@@ -53,7 +53,7 @@ contract SubEnsV2AuditRegressionTest is Test {
         vm.etch(Validator.ADDR, Validator.CODE);
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
+        registrar = new WoCoRegistrar(address(registry), sponsor, new string[](0));
         vm.prank(admin);
         registry.addRegistrar(address(registrar));
         vm.warp(NOW);

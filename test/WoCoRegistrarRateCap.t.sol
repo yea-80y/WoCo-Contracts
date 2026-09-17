@@ -3,7 +3,6 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
 
@@ -34,12 +33,13 @@ contract WoCoRegistrarRateCapTest is Test {
         hex"e40101fa011b20d1de9994b4d039f6548d191eb26786769f580809256b4685ef316805265ea162";
 
     event MintRateCapSet(uint32 maxMintsPerWindow, uint64 mintWindowSeconds);
+    event MintWindowReset(address indexed recipient);
 
     function setUp() public {
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
 
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
+        registrar = new WoCoRegistrar(address(registry), sponsor, new string[](0));
 
         vm.prank(admin);
         registry.addRegistrar(address(registrar));
@@ -84,9 +84,9 @@ contract WoCoRegistrarRateCapTest is Test {
     function test_Cap_AllowsExactlyTheCapWithinAWindow() public {
         _mintN(alice, DEFAULT_MAX, 0);
 
-        (uint64 start, uint32 count) = registrar.mintWindow(alice);
+        (uint64 end, uint32 count) = registrar.mintWindow(alice);
         assertEq(count, DEFAULT_MAX);
-        assertEq(start, uint64(T0), "window anchored at the first mint");
+        assertEq(end, uint64(T0) + DEFAULT_WINDOW, "window ends one length after the first mint");
 
         vm.expectRevert(
             abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
@@ -133,8 +133,8 @@ contract WoCoRegistrarRateCapTest is Test {
         assertEq(bobCount, 1);
 
         // The sponsor itself never accumulates a window.
-        (uint64 sponsorStart, uint32 sponsorCount) = registrar.mintWindow(sponsor);
-        assertEq(sponsorStart, 0);
+        (uint64 sponsorEnd, uint32 sponsorCount) = registrar.mintWindow(sponsor);
+        assertEq(sponsorEnd, 0);
         assertEq(sponsorCount, 0);
     }
 
@@ -154,21 +154,21 @@ contract WoCoRegistrarRateCapTest is Test {
         vm.warp(T0 + DEFAULT_WINDOW);
         _mint("fresh-window", alice);
 
-        (uint64 start, uint32 count) = registrar.mintWindow(alice);
-        assertEq(start, uint64(T0 + DEFAULT_WINDOW), "new window not anchored at this mint");
+        (uint64 end, uint32 count) = registrar.mintWindow(alice);
+        assertEq(end, uint64(T0 + 2 * DEFAULT_WINDOW), "new window not opened at this mint");
         assertEq(count, 1, "count not reset");
     }
 
-    /// A window is anchored at the recipient's FIRST mint in it, not at a
+    /// A window is opened by the recipient's FIRST mint in it, not at a
     /// global epoch — so an organiser who mints once and comes back in six
     /// weeks starts a fresh window rather than inheriting a stale one.
-    function test_Cap_WindowIsAnchoredAtTheFirstMintInIt() public {
+    function test_Cap_WindowIsOpenedByTheFirstMintInIt() public {
         _mint("first", alice);
         vm.warp(T0 + 45 days);
         _mint("second", alice);
 
-        (uint64 start, uint32 count) = registrar.mintWindow(alice);
-        assertEq(start, uint64(T0 + 45 days));
+        (uint64 end, uint32 count) = registrar.mintWindow(alice);
+        assertEq(end, uint64(T0 + 45 days) + DEFAULT_WINDOW);
         assertEq(count, 1);
     }
 
@@ -239,13 +239,75 @@ contract WoCoRegistrarRateCapTest is Test {
     }
 
     function test_Tune_OnlyOwner() public {
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, alice));
         vm.prank(alice);
         registrar.setMintRateCap(1, 1);
 
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, sponsor));
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, sponsor));
         vm.prank(sponsor);
         registrar.setMintRateCap(1, 1);
+    }
+
+    /// Audit 937 F6: an open window keeps the end it was opened with. A shorter
+    /// length applies from the next window; a lower cap applies at once.
+    function test_Tune_AnOpenWindowKeepsItsEnd() public {
+        _mintN(alice, 3, 0);
+        vm.warp(T0 + 10 days);
+        vm.prank(admin);
+        registrar.setMintRateCap(DEFAULT_MAX, 1 days);
+
+        (uint32 remaining, uint64 resetsAt) = registrar.mintAllowance(alice);
+        assertEq(resetsAt, uint64(T0) + DEFAULT_WINDOW, "retuning moved the open window's end");
+        assertEq(remaining, DEFAULT_MAX - 3);
+
+        // A recipient with no window open sees the new length.
+        (, uint64 bobResets) = registrar.mintAllowance(bob);
+        assertEq(bobResets, uint64(T0 + 10 days + 1 days));
+
+        // Lengthening does not extend it either.
+        vm.prank(admin);
+        registrar.setMintRateCap(DEFAULT_MAX, 90 days);
+        (, resetsAt) = registrar.mintAllowance(alice);
+        assertEq(resetsAt, uint64(T0) + DEFAULT_WINDOW, "lengthening moved the open window's end");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              RESETTING
+    //////////////////////////////////////////////////////////////*/
+
+    /// Audit 937 F12: a sponsor chooses the recipient, so it can spend an
+    /// allowance on names the recipient did not want. The owner gives it back.
+    function test_Reset_TheOwnerGivesOneRecipientItsAllowanceBack() public {
+        _mintN(alice, DEFAULT_MAX, 0);
+        _mintN(bob, 5, 100);
+
+        vm.expectEmit(true, false, false, true, address(registrar));
+        emit MintWindowReset(alice);
+        vm.prank(admin);
+        registrar.resetMintWindow(alice);
+
+        (uint64 end, uint32 count) = registrar.mintWindow(alice);
+        assertEq(end, 0);
+        assertEq(count, 0);
+        (uint32 remaining, uint64 resetsAt) = registrar.mintAllowance(alice);
+        assertEq(remaining, DEFAULT_MAX);
+        assertEq(resetsAt, uint64(T0) + DEFAULT_WINDOW);
+        _mint("after-reset", alice);
+
+        (, uint32 bobCount) = registrar.mintWindow(bob);
+        assertEq(bobCount, 5, "the reset reached another recipient");
+    }
+
+    function test_Reset_OnlyOwner() public {
+        _mintN(alice, 2, 0);
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, sponsor));
+        vm.prank(sponsor);
+        registrar.resetMintWindow(alice);
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, alice));
+        vm.prank(alice);
+        registrar.resetMintWindow(alice);
+        (, uint32 count) = registrar.mintWindow(alice);
+        assertEq(count, 2);
     }
 
     /// Zero is a pause or a no-op dressed as a number. Refused so a fat-fingered
@@ -305,11 +367,11 @@ contract WoCoRegistrarRateCapTest is Test {
                      INTERACTION WITH release (#464)
     //////////////////////////////////////////////////////////////*/
 
-    /// Releasing does not refund the allowance. A mint is a mint; a churn loop
-    /// of release + re-mint is exactly the pattern this exists to bound.
+    /// Releasing does not refund the allowance: a name given back still
+    /// counted when it was minted.
     function test_Cap_ReleaseDoesNotRefundTheAllowance() public {
         for (uint256 i; i < DEFAULT_MAX; ++i) {
-            bytes32 node = _mint("churn", alice);
+            bytes32 node = _mint(_label(i), alice);
             vm.prank(alice);
             registry.release(node);
         }
@@ -317,6 +379,49 @@ contract WoCoRegistrarRateCapTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
         );
+        _mint("one-more", alice);
+    }
+
+    /// Audit 937 F21: taking back a label you released yourself is not a new
+    /// name, so it costs nothing — even at the cap, where anyone else could
+    /// otherwise take it first. Churning one label is bounded by the relay and
+    /// the sponsor's gas instead (owner decision with the Fable consult,
+    /// 2026-09-17).
+    function test_Cap_RetakingYourOwnReleasedLabelIsFree() public {
+        for (uint256 i; i < DEFAULT_MAX + 5; ++i) {
+            bytes32 node = _mint("churn", alice);
+            vm.prank(alice);
+            registry.release(node);
+        }
+        (, uint32 count) = registrar.mintWindow(alice);
+        assertEq(count, 1, "only the first mint of the label counted");
+
+        _mintN(alice, DEFAULT_MAX - 1, 0);
+        vm.expectRevert(
+            abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, alice, uint64(T0) + DEFAULT_WINDOW)
+        );
+        _mint("one-more", alice);
         _mint("churn", alice);
+    }
+
+    /// Someone else's release is not yours: taking their label counts.
+    function test_Cap_TakingSomeoneElsesReleasedLabelCounts() public {
+        bytes32 node = _mint("theirs", bob);
+        vm.prank(bob);
+        registry.release(node);
+
+        _mint("theirs", alice);
+        (, uint32 count) = registrar.mintWindow(alice);
+        assertEq(count, 1);
+
+        // And after a hand-over, the label's last release names whoever held it
+        // then, not whoever minted it first.
+        vm.prank(alice);
+        registry.transferFrom(alice, bob, uint256(node));
+        vm.prank(bob);
+        registry.release(node);
+        _mint("theirs", alice);
+        (, count) = registrar.mintWindow(alice);
+        assertEq(count, 2, "alice retook a label bob released as if it were hers");
     }
 }

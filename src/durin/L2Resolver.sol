@@ -35,6 +35,8 @@ import {TextResolver} from "@ensdomains/ens-contracts/resolvers/profiles/TextRes
 /// CHANGED: `isAuthorisedForAddress` is gone. Every record write reaches ONE
 /// predicate, `_canWriteRecords`, which the registry implements.
 ///
+/// CHANGED (v2.1): `ABI` terminates for every `contentTypes`.
+///
 /// ADDED: `supportsInterface` reports `IExtendedResolver`, which this contract
 /// has always implemented (audit 924 F-16).
 abstract contract L2Resolver is
@@ -71,6 +73,26 @@ abstract contract L2Resolver is
             revert Unauthorized(node);
         }
         return true;
+    }
+
+    /// @notice Returns the ABI associated with an ENS node (EIP-205).
+    /// @dev Upstream's loop doubles `contentType` until it passes
+    ///      `contentTypes`, and a doubling past bit 255 wraps to zero, so for a
+    ///      `contentTypes` with bit 255 set and no matching record it never
+    ///      ended (audit 937 F20 / 938 M-6). Here the loop stops at the wrap.
+    function ABI(
+        bytes32 node,
+        uint256 contentTypes
+    ) external view override returns (uint256, bytes memory) {
+        mapping(uint256 => bytes) storage abiset = versionable_abis[recordVersions[node]][node];
+
+        for (uint256 contentType = 1; contentType != 0 && contentType <= contentTypes; contentType <<= 1) {
+            if ((contentType & contentTypes) != 0 && abiset[contentType].length > 0) {
+                return (contentType, abiset[contentType]);
+            }
+        }
+
+        return (0, bytes(""));
     }
 
     function supportsInterface(

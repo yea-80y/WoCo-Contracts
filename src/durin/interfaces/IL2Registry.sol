@@ -34,7 +34,6 @@ interface IL2Registry is IL2Resolver, IERC721 {
     ) external returns (bytes32);
     function owner() external view returns (address);
     function owner(bytes32 node) external view returns (address);
-    function namehash(string calldata name) external pure returns (bytes32);
     function decodeName(
         bytes calldata name
     ) external pure returns (string memory);
@@ -69,4 +68,10 @@ interface IL2Registry is IL2Resolver, IERC721 {
     function lastRelease(
         bytes32 node
     ) external view returns (address previousOwner, uint64 releasedAt);
+
+    // WoCo additions (v2.1): the parent link and child count every name keeps,
+    // and the parent holder's door to the names directly beneath it.
+    function parentOf(bytes32 node) external view returns (bytes32 parent);
+    function childCount(bytes32 node) external view returns (uint256 count);
+    function parentTransfer(bytes32 node, address newOwner) external;
 }

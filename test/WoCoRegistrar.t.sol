@@ -3,7 +3,6 @@ pragma solidity ^0.8.24;
 
 import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
@@ -11,6 +10,9 @@ import {L2Resolver} from "../src/durin/L2Resolver.sol";
 contract WoCoRegistrarTest is Test {
     L2Registry registry;
     WoCoRegistrar registrar;
+
+    event NameRegistered(bytes32 indexed node, string label, address indexed owner, bytes contenthash);
+    event ContenthashUpdated(bytes32 indexed node, string label, bytes contenthash);
 
     address admin = makeAddr("admin");
     address sponsor = makeAddr("sponsor");
@@ -24,7 +26,7 @@ contract WoCoRegistrarTest is Test {
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
 
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, _reserved());
+        registrar = new WoCoRegistrar(address(registry), sponsor, _reserved());
 
         vm.prank(admin);
         registry.addRegistrar(address(registrar));
@@ -48,16 +50,17 @@ contract WoCoRegistrarTest is Test {
                               CONSTRUCTION
     //////////////////////////////////////////////////////////////*/
 
-    /// Owner, sponsor and reserved labels are set by the constructor, so no
-    /// deployer key holds the role even for a block, and there is no rotation
-    /// to get wrong: the only ownership event is the one from the zero address.
-    function test_constructor_ownerSponsorAndReservedLabelsFromTheFirstBlock() public {
+    /// Sponsor and reserved labels are set by the constructor. There is no
+    /// owner to set: the registry's admin is the owner from the first block, so
+    /// no deployer key holds the role even for a block, and no ownership event
+    /// is ever emitted.
+    function test_constructor_sponsorAndReservedLabelsFromTheFirstBlock_ownerIsTheRegistryAdmin() public {
         vm.recordLogs();
-        WoCoRegistrar fresh = new WoCoRegistrar(address(registry), admin, sponsor, _reserved());
+        WoCoRegistrar fresh = new WoCoRegistrar(address(registry), sponsor, _reserved());
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(fresh.owner(), admin);
-        assertEq(fresh.pendingOwner(), address(0));
+        assertEq(fresh.owner(), registry.owner());
         assertTrue(fresh.authorisedSponsors(sponsor), "sponsor not authorised");
         assertTrue(fresh.reserved(keccak256("admin")), "reserved label not reserved");
         assertFalse(fresh.available("admin"));
@@ -66,21 +69,20 @@ contract WoCoRegistrarTest is Test {
 
         bytes32 ownershipTransferred = keccak256("OwnershipTransferred(address,address)");
         bytes32 transferStarted = keccak256("OwnershipTransferStarted(address,address)");
-        uint256 ownershipEvents;
         for (uint256 i; i < logs.length; ++i) {
-            assertTrue(logs[i].topics[0] != transferStarted, "a handover was started during construction");
-            if (logs[i].topics[0] == ownershipTransferred) {
-                ownershipEvents++;
-                assertEq(address(uint160(uint256(logs[i].topics[1]))), address(0), "ownership came from someone");
-                assertEq(address(uint160(uint256(logs[i].topics[2]))), admin);
-            }
+            assertTrue(logs[i].topics[0] != transferStarted, "an ownership handover was started");
+            assertTrue(logs[i].topics[0] != ownershipTransferred, "an ownership event was emitted");
         }
-        assertEq(ownershipEvents, 1, "ownership moved more than once");
     }
 
-    function test_constructor_refusesTheZeroOwner() public {
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new WoCoRegistrar(address(registry), address(0), sponsor, _reserved());
+    /// Audit 937 F11: a reserved label `register` would never see reserves
+    /// nothing. Refused at construction as it is in `setReserved`.
+    function test_constructor_refusesAReservedLabelRegisterWouldReject() public {
+        string[] memory labels = new string[](2);
+        labels[0] = "admin";
+        labels[1] = "WoCo";
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.InvalidLabel.selector, "WoCo"));
+        new WoCoRegistrar(address(registry), sponsor, labels);
     }
 
     /// No transaction comes from the zero address, so a zero sponsor authorises
@@ -88,7 +90,7 @@ contract WoCoRegistrarTest is Test {
     /// an unset sponsor pass its checks with no working one.
     function test_constructor_refusesTheZeroSponsor() public {
         vm.expectRevert(WoCoRegistrar.SponsorIsZeroAddress.selector);
-        new WoCoRegistrar(address(registry), admin, address(0), _reserved());
+        new WoCoRegistrar(address(registry), address(0), _reserved());
     }
 
     function test_addSponsor_refusesTheZeroAddress() public {
@@ -175,7 +177,7 @@ contract WoCoRegistrarTest is Test {
     /// refused — so a check moved any earlier would let this through.
     function test_register_refusesWhenTheNameMovesDuringTheLastWrite() public {
         DivertingRegistry diverting = new DivertingRegistry(stranger);
-        WoCoRegistrar r = new WoCoRegistrar(address(diverting), admin, sponsor, new string[](0));
+        WoCoRegistrar r = new WoCoRegistrar(address(diverting), sponsor, new string[](0));
         string[] memory keys = new string[](1);
         string[] memory vals = new string[](1);
         keys[0] = "url";
@@ -191,7 +193,7 @@ contract WoCoRegistrarTest is Test {
     /// divert on, registers normally. The refusal is about the move.
     function test_register_theStandInRegistersWhenNothingMoves() public {
         DivertingRegistry diverting = new DivertingRegistry(stranger);
-        WoCoRegistrar r = new WoCoRegistrar(address(diverting), admin, sponsor, new string[](0));
+        WoCoRegistrar r = new WoCoRegistrar(address(diverting), sponsor, new string[](0));
         (string[] memory keys, string[] memory vals) = _emptyText();
 
         vm.prank(sponsor);
@@ -241,6 +243,34 @@ contract WoCoRegistrarTest is Test {
         assertEq(registry.contenthash(node), SWARM_HASH);
     }
 
+    /// Audit 937 F5: a label `register` would refuse is refused here too, in
+    /// the same order — so a reserved name the platform minted through another
+    /// registrar is out of this sponsor's reach.
+    function test_setContenthash_refusesAReservedOrInvalidLabel() public {
+        bytes32 base = registry.baseNode();
+        bytes[] memory none = new bytes[](0);
+        vm.startPrank(admin);
+        registry.addRegistrar(admin);
+        bytes32 reservedNode = registry.createSubnode(base, "admin", organiser, none);
+        bytes32 casedNode = registry.createSubnode(base, "MyBand", organiser, none);
+        vm.stopPrank();
+
+        vm.startPrank(sponsor);
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.LabelIsReserved.selector, "admin"));
+        registrar.setContenthash("admin", SWARM_HASH);
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.InvalidLabel.selector, "MyBand"));
+        registrar.setContenthash("MyBand", SWARM_HASH);
+        // Invalid before reserved before empty, as in `register`.
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.InvalidLabel.selector, "MyBand"));
+        registrar.setContenthash("MyBand", "");
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.LabelIsReserved.selector, "admin"));
+        registrar.setContenthash("admin", "");
+        vm.stopPrank();
+
+        assertEq(registry.contenthash(reservedNode).length, 0);
+        assertEq(registry.contenthash(casedNode).length, 0);
+    }
+
     function test_setContenthash_refusesNonSponsor() public {
         (string[] memory keys, string[] memory vals) = _emptyText();
         vm.prank(sponsor);
@@ -274,15 +304,40 @@ contract WoCoRegistrarTest is Test {
         assertFalse(registrar.available("myband"));
     }
 
+    /// Every lever answers to the registry admin alone — not a stranger, not a
+    /// sponsor, not the registrar's own registry holder-side.
     function test_admin_everyPolicyLeverIsOwnerOnly() public {
-        vm.startPrank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        registrar.addSponsor(stranger);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        registrar.removeSponsor(sponsor);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        registrar.setReserved("myband", true);
+        address[2] memory callers = [stranger, sponsor];
+        for (uint256 i; i < callers.length; ++i) {
+            bytes memory refusal = abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, callers[i]);
+            vm.startPrank(callers[i]);
+            vm.expectRevert(refusal);
+            registrar.addSponsor(stranger);
+            vm.expectRevert(refusal);
+            registrar.removeSponsor(sponsor);
+            vm.expectRevert(refusal);
+            registrar.setReserved("myband", true);
+            vm.expectRevert(refusal);
+            registrar.setMintRateCap(1, 1);
+            vm.expectRevert(refusal);
+            registrar.resetMintWindow(organiser);
+            vm.stopPrank();
+        }
+    }
+
+    /// Audit 937 F11.
+    function test_admin_setReservedRefusesALabelRegisterWouldReject() public {
+        string[4] memory bad = ["WoCo", "ab", "-lead", "under_score"];
+        vm.startPrank(admin);
+        for (uint256 i; i < bad.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.InvalidLabel.selector, bad[i]));
+            registrar.setReserved(bad[i], true);
+            vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.InvalidLabel.selector, bad[i]));
+            registrar.setReserved(bad[i], false);
+        }
+        registrar.setReserved("woco", true);
         vm.stopPrank();
+        assertFalse(registrar.available("woco"));
     }
 
     /// `removeSponsor` is the pause: the removed key can neither mint nor repoint.
@@ -307,45 +362,51 @@ contract WoCoRegistrarTest is Test {
                               OWNERSHIP
     //////////////////////////////////////////////////////////////*/
 
-    /// Two steps: the proposed owner holds nothing until it accepts, and a
-    /// wrong address simply never can.
-    function test_ownership_handoverIsTwoStep() public {
-        address multisig2 = makeAddr("multisig2");
+    /// Audit 937 F13 / 938 M-4: the owner is the registry's admin, read live.
+    /// The seat's handover moves the registrar in the same transaction — the
+    /// nominee holds nothing before it accepts, the previous admin nothing
+    /// after.
+    function test_ownership_followsTheRegistryAdminSeat() public {
+        address dao = makeAddr("dao");
 
         vm.prank(admin);
-        registrar.transferOwnership(multisig2);
+        registry.nominateAdmin(dao);
         assertEq(registrar.owner(), admin, "ownership moved before acceptance");
-        assertEq(registrar.pendingOwner(), multisig2);
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, dao));
+        vm.prank(dao);
+        registrar.addSponsor(dao);
 
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        vm.prank(stranger);
-        registrar.acceptOwnership();
+        vm.prank(dao);
+        registry.acceptAdmin();
+        assertEq(registrar.owner(), dao);
 
-        vm.prank(multisig2);
-        registrar.acceptOwnership();
-        assertEq(registrar.owner(), multisig2);
-
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, admin));
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, admin));
         vm.prank(admin);
         registrar.addSponsor(admin);
+
+        vm.prank(dao);
+        registrar.removeSponsor(sponsor);
+        assertFalse(registrar.authorisedSponsors(sponsor));
     }
 
-    /// Renouncing would strand every owner power for good — including the one
-    /// response to a leaked sponsor key. Refused for everyone, and exercised
-    /// afterwards.
-    function test_ownership_renounceIsDisabled() public {
-        vm.expectRevert(WoCoRegistrar.RenounceDisabled.selector);
-        vm.prank(admin);
-        registrar.renounceOwnership();
-
-        vm.expectRevert(WoCoRegistrar.RenounceDisabled.selector);
-        vm.prank(stranger);
-        registrar.renounceOwnership();
-
-        assertEq(registrar.owner(), admin, "ownership must survive a renounce attempt");
-        vm.prank(admin);
-        registrar.removeSponsor(sponsor);
-        assertFalse(registrar.authorisedSponsors(sponsor), "the owner must still be able to remove a sponsor");
+    /// There is no ownership of its own to hand over or give up: the
+    /// `Ownable2Step` surface is absent, renounce included, so no call can
+    /// strand the owner powers — including the one response to a leaked sponsor
+    /// key.
+    function test_ownership_hasNoSurfaceOfItsOwn() public {
+        bytes[4] memory calls = [
+            abi.encodeWithSignature("renounceOwnership()"),
+            abi.encodeWithSignature("transferOwnership(address)", stranger),
+            abi.encodeWithSignature("acceptOwnership()"),
+            abi.encodeWithSignature("pendingOwner()")
+        ];
+        for (uint256 i; i < calls.length; ++i) {
+            vm.prank(admin);
+            (bool ok, bytes memory ret) = address(registrar).call(calls[i]);
+            assertFalse(ok, "an ownership function still answers");
+            assertEq(ret.length, 0, "an ownership call reverted from inside a function, so the function exists");
+        }
+        assertEq(registrar.owner(), admin);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -388,6 +449,35 @@ contract WoCoRegistrarTest is Test {
         assertEq(WoCoRegistrar.available.selector, bytes4(keccak256("available(string)")));
         assertEq(WoCoRegistrar.mintAllowance.selector, bytes4(keccak256("mintAllowance(address)")));
         assertEq(WoCoRegistrar.setMintRateCap.selector, bytes4(keccak256("setMintRateCap(uint32,uint64)")));
+        assertEq(
+            WoCoRegistrar.MintRateCapExceeded.selector, bytes4(keccak256("MintRateCapExceeded(address,uint64)"))
+        );
+        assertEq(WoCoRegistrar.InvalidLabel.selector, bytes4(keccak256("InvalidLabel(string)")));
+        assertEq(WoCoRegistrar.LabelIsReserved.selector, bytes4(keccak256("LabelIsReserved(string)")));
+    }
+
+    /// Audit 937 F36: the events carry the node as their indexed key, so a log
+    /// filter can find a name, and the label as readable data.
+    function test_events_areIndexedByNodeAndCarryTheLabel() public {
+        (string[] memory keys, string[] memory vals) = _emptyText();
+        bytes32 node = registry.makeNode(registry.baseNode(), "myband");
+
+        vm.expectEmit(true, true, false, true, address(registrar));
+        emit NameRegistered(node, "myband", organiser, SWARM_HASH);
+        vm.prank(sponsor);
+        registrar.register("myband", organiser, SWARM_HASH, keys, vals);
+
+        bytes memory next = hex"e40101fa011b2000000000000000000000000000000000000000000000000000000000deadbeef";
+        vm.expectEmit(true, false, false, true, address(registrar));
+        emit ContenthashUpdated(node, "myband", next);
+        vm.prank(sponsor);
+        registrar.setContenthash("myband", next);
+
+        assertEq(
+            keccak256("NameRegistered(bytes32,string,address,bytes)"),
+            WoCoRegistrar.NameRegistered.selector
+        );
+        assertEq(keccak256("ContenthashUpdated(bytes32,string,bytes)"), WoCoRegistrar.ContenthashUpdated.selector);
     }
 }
 
@@ -397,7 +487,19 @@ contract WoCoRegistrarTest is Test {
 contract DivertingRegistry {
     bytes32 public constant baseNode = keccak256("base");
     address public immutable diverted;
-    mapping(bytes32 node => address) public owner;
+    mapping(bytes32 node => address) internal holders;
+
+    function owner() external pure returns (address) {
+        return address(0xAD);
+    }
+
+    function owner(bytes32 node) external view returns (address) {
+        return holders[node];
+    }
+
+    function lastRelease(bytes32) external pure returns (address, uint64) {
+        return (address(0), 0);
+    }
 
     constructor(address diverted_) {
         diverted = diverted_;
@@ -412,7 +514,7 @@ contract DivertingRegistry {
         returns (bytes32 node)
     {
         node = makeNode(parentNode, label);
-        owner[node] = to;
+        holders[node] = to;
     }
 
     function setAddr(bytes32, uint256, bytes calldata) external {}
@@ -420,6 +522,6 @@ contract DivertingRegistry {
     function setContenthash(bytes32, bytes calldata) external {}
 
     function setText(bytes32 node, string calldata, string calldata) external {
-        owner[node] = diverted;
+        holders[node] = diverted;
     }
 }
