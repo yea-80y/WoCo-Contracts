@@ -822,11 +822,12 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      what voids an outstanding `releaseDigest` signature. So only the
     ///      holder, whose signature it is, may do it.
     ///
-    ///      The inherited body still runs its own `authorised` check, which the
-    ///      holder always passes.
+    ///      The inherited body still runs its own `authorised` check —
+    ///      `_canWriteRecords`, which the holder always passes and which already
+    ///      refuses approvees and a name nobody holds. This override's own job is
+    ///      refusing registrars, whom `_canWriteRecords` lets write records.
     function clearRecords(bytes32 node) public override {
-        address holder = owner(node);
-        if (holder == address(0) || msg.sender != holder) {
+        if (msg.sender != owner(node)) {
             revert Unauthorized(node);
         }
         super.clearRecords(node);
@@ -881,6 +882,14 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      `parentTransfer`'s `_transfer`, `release`'s `_burn` — except
     ///      `acceptAdmin`, which enters one step further in. Refuses to move an
     ///      existing base name; see `nominateAdmin`.
+    ///
+    ///      RECEIVER HOOKS. Nothing this contract does calls a recipient: mints,
+    ///      burns, `adminTransfer` and `parentTransfer` all move the token
+    ///      without one. The inherited `safeTransferFrom` still calls
+    ///      `onERC721Received`, after every state change here is complete, so a
+    ///      recipient can act again before that call returns. An integrator that
+    ///      acts on "the recipient now holds it" re-reads `owner(node)` after a
+    ///      `safeTransferFrom`, or uses `transferFrom` (audit 938 L-9).
     function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
         if (bytes32(tokenId) == baseNode && _ownerOf(tokenId) != address(0)) {
             revert AdminHandoverRequired();

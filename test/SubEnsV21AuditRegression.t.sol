@@ -987,6 +987,19 @@ contract SubEnsV21AuditRegressionTest is Test {
         assertEq(registry.owner(node), address(wallet));
     }
 
+    /// A revert is a refusal even when its data happens to be the 32 bytes of
+    /// `true`: the call's own success flag decides first.
+    function test_Validator_ARevertCarryingTrueIsStillARefusal() public {
+        Approves1271 wallet = new Approves1271();
+        (bytes32 node, uint256 exp) = _walletName(address(wallet), "venue");
+        vm.mockCallRevert(Validator.ADDR, bytes(""), abi.encode(uint256(1)));
+
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
+        vm.prank(stranger);
+        registry.releaseWithSignature(node, exp, address(wallet), hex"1271");
+        assertEq(registry.owner(node), address(wallet));
+    }
+
     /// Only a clean `true` is yes: a malformed or oversized answer is no.
     function test_Validator_AnythingButACleanTrueIsARefusal() public {
         Approves1271 wallet = new Approves1271();

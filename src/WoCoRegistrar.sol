@@ -219,10 +219,11 @@ contract WoCoRegistrar {
     ///      through another registrar (audit 937 F5).
     ///
     ///      RESIDUAL, STATED PLAINLY SO IT IS NOT REDISCOVERED: this function
-    ///      takes an ARBITRARY label. Because the registrar sits in the
-    ///      registry's `registrars` set, and a registrar may write the records
-    ///      of any name that exists, an authorised sponsor can repoint ANY
-    ///      name's contenthash, including one it did not mint. That is retained
+    ///      takes any label `register` would accept. Because the registrar sits
+    ///      in the registry's `registrars` set, and a registrar may write the
+    ///      records of any name beneath the base name that exists, an authorised
+    ///      sponsor can repoint ANY such name's contenthash, including one it did
+    ///      not mint. That is retained
     ///      deliberately — automated site redeploy needs it and the organiser is
     ///      not present to sign — but it is real standing authority sitting on
     ///      the hot key `WOCO_SPONSOR_PRIVATE_KEY`.
