@@ -267,6 +267,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     error ParentTransferSameOwner();
     error RecipientIsRegistry();
     error SubnodeMovedDuringCreation(bytes32 node);
+    error DelegationNotSupported();
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -1052,6 +1053,52 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     /*//////////////////////////////////////////////////////////////
                                OVERRIDES
     //////////////////////////////////////////////////////////////*/
+
+    /*//////////////////////////////////////////////////////////////
+                         NO ERC-721 DELEGATION
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice This registry has no approvees and no operators: only the
+    ///         holder of a name moves it. An approval is a custody delegation,
+    ///         and here custody is every holder power (records, release, the
+    ///         names beneath), so "an approval moves the token and does nothing
+    ///         else" was never a property this contract could keep (audits 937
+    ///         F4, 938 H-1 / M-7, 948 / 949, 950). Names are therefore not
+    ///         listable on approval-based marketplaces; a sale is the holder's
+    ///         own `transferFrom`, or a push into an escrow contract.
+    /// @dev EIP-721 says `approve` throws unless the caller is the holder or an
+    ///      operator; here it always throws, and so does `setApprovalForAll`.
+    function approve(address, uint256) public pure override {
+        revert DelegationNotSupported();
+    }
+
+    /// @notice See `approve`.
+    function setApprovalForAll(address, bool) public pure override {
+        revert DelegationNotSupported();
+    }
+
+    /// @dev `_update` clears the per-token approval on every move by calling
+    ///      this with `to == address(0)` (OpenZeppelin 5.6.1 ERC721.sol:227);
+    ///      that must stay, or every transfer, mint and burn would revert. Any
+    ///      other `to` is refused, so no code path can write a non-zero
+    ///      `_tokenApprovals`.
+    function _approve(address to, uint256 tokenId, address auth, bool emitEvent) internal override {
+        if (to != address(0)) revert DelegationNotSupported();
+        super._approve(to, tokenId, auth, emitEvent);
+    }
+
+    /// @dev The only writer of `_operatorApprovals`; nothing may call it.
+    function _setApprovalForAll(address, address, bool) internal pure override {
+        revert DelegationNotSupported();
+    }
+
+    /// @dev Only the holder moves a name. Stated directly rather than left to
+    ///      the two approval mappings being permanently empty. `adminTransfer`,
+    ///      `parentTransfer`, `acceptAdmin`, mint and burn pass no `auth` and
+    ///      never reach this.
+    function _isAuthorized(address holder, address spender, uint256) internal pure override returns (bool) {
+        return spender != address(0) && holder == spender;
+    }
 
     /// @dev Returns onchain JSON if no baseURI is set
     function tokenURI(

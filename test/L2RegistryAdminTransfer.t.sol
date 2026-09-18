@@ -237,14 +237,14 @@ contract L2RegistryAdminTransferTest is Test {
 
     /// The classic forced-transfer hazard: a stale approval surviving the move
     /// would let the previous holder's approvee take the name straight back.
-    /// OZ `_update` clears per-token approval, and operator approvals are keyed
-    /// to the previous owner — pinned here because this file's job is to freeze
-    /// the shape.
+    /// v2.2 refuses approvals outright, so there is none to survive; the
+    /// would-be accomplice is refused like any stranger.
     function test_AdminTransfer_StaleApprovalCannotClawBack() public {
         bytes32 node = _register("venue", organiser);
 
         address accomplice = makeAddr("accomplice");
         vm.prank(organiser);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(accomplice, uint256(node));
 
         vm.prank(admin);

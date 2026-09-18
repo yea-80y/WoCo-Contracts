@@ -150,7 +150,8 @@ contract SubEnsV2AuditRegressionTest is Test {
     }
 
     /// v1's stopgap was the holder approving itself; a transfer cleared it and
-    /// reopened the hole. Approval state no longer matters either way.
+    /// reopened the hole. Approval state no longer matters either way — and
+    /// since v2.2 there is none: even a self-approval is refused.
     function test_924F1_approvalStateNoLongerMatters() public {
         bytes32 node = _register("venue", holder, SITE);
 
@@ -159,6 +160,7 @@ contract SubEnsV2AuditRegressionTest is Test {
         registry.setContenthash(node, OTHER);
 
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(holder, uint256(node));
         registry.transferFrom(holder, victim, uint256(node));
         vm.stopPrank();
@@ -174,12 +176,14 @@ contract SubEnsV2AuditRegressionTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /// v1: an operator-for-all approved by the admin moved the base name — the
-    /// whole admin role — in one call.
+    /// whole admin role — in one call. v2.2 refuses the approval itself, and the
+    /// base name refuses every move but `acceptAdmin` whoever asks.
     function test_924F2_anOperatorForAllOfTheAdminCannotMoveTheSeat() public {
         address op = makeAddr("operator");
         address other = makeAddr("other");
         uint256 baseToken = uint256(registry.baseNode());
         vm.prank(admin);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(op, true);
 
         vm.expectRevert(L2Registry.AdminHandoverRequired.selector);

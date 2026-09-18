@@ -187,25 +187,36 @@ contract L2RegistryV2Test is Test {
         _assertNoRecords(b, "safeTransferFrom with data kept the records");
     }
 
-    function test_Version_AnOperatorsTransferResetsEveryRecord() public {
+    /// v2.2: no operator exists to make a transfer (audit 950). The holder's
+    /// own transfer still resets every record.
+    function test_Version_NoOperatorTransfers_TheHoldersResetsEveryRecord() public {
         bytes32 node = _mint("venue", holder);
         _writeAll(node, holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         vm.prank(holder);
         registry.setApprovalForAll(operator, true);
 
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, operator, uint256(node))
+        );
         vm.prank(operator);
         registry.transferFrom(holder, buyer, uint256(node));
+        assertEq(registry.contenthash(node), SITE, "a refused transfer touched the records");
 
-        _assertNoRecords(node, "an operator's transfer kept the records");
+        vm.prank(holder);
+        registry.transferFrom(holder, buyer, uint256(node));
+        _assertNoRecords(node, "the holder's transfer kept the records");
     }
 
-    /// Approvals grant authority; they do not change the holding.
+    /// v2.2 refuses approvals; a refused one changes nothing.
     function test_Version_ApprovalsAreNotOwnershipChanges() public {
         bytes32 node = _mint("venue", holder);
         _writeAll(node, holder);
 
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(node));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.stopPrank();
 
@@ -396,7 +407,9 @@ contract L2RegistryV2Test is Test {
     function test_BaseName_ApproveesAndOperatorsCannotMoveIt() public {
         uint256 baseToken = uint256(registry.baseNode());
         vm.startPrank(admin);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, baseToken);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.stopPrank();
 
@@ -474,13 +487,15 @@ contract L2RegistryV2Test is Test {
         assertEq(registry.totalSupply(), 1, "a refused mint was counted");
     }
 
-    /// Creation stays with the holder alone: approvals are for moving and
-    /// writing a name, not for minting beneath it.
+    /// Creation stays with the holder alone. v2.2 refuses approvals, so the
+    /// would-be approvee and operator are strangers here, as is the admin.
     function test_Create_ApproveesOperatorsAndTheAdminCannotCreate() public {
         bytes32 venue = _mint("venue", holder);
         bytes[] memory none = new bytes[](0);
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(venue));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.stopPrank();
 
@@ -661,13 +676,16 @@ contract L2RegistryV2Test is Test {
     //////////////////////////////////////////////////////////////*/
 
     /// Audit 938 H-1 / 937 F4: the approval a marketplace asks for must not
-    /// let it repoint where the name's payments go.
+    /// let it repoint where the name's payments go. v2.2 refuses the approval
+    /// itself (audit 950); the would-be delegates still cannot write.
     function test_Records_TheHolderWritesAndApprovalsDoNot() public {
         bytes32 byHolder = _mint("by-holder", holder);
         bytes32 byApprovee = _mint("by-approvee", holder);
         bytes32 byOperator = _mint("by-operator", holder);
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(byApprovee));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.stopPrank();
 
@@ -680,7 +698,9 @@ contract L2RegistryV2Test is Test {
     function test_Records_OnlyTheAdminWritesTheBaseName() public {
         bytes32 base = registry.baseNode();
         vm.startPrank(admin);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(base));
         vm.stopPrank();
 
@@ -725,7 +745,9 @@ contract L2RegistryV2Test is Test {
     function test_Records_TheSellerAndEveryoneActingForItLoseAuthorityOnTransfer() public {
         bytes32 node = _mint("venue", holder);
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(node));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         registry.transferFrom(holder, buyer, uint256(node));
         vm.stopPrank();
@@ -738,7 +760,9 @@ contract L2RegistryV2Test is Test {
     function test_Records_ARevokedApproveeIsRefused() public {
         bytes32 node = _mint("venue", holder);
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(node));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(address(0), uint256(node));
         vm.stopPrank();
 
@@ -788,7 +812,9 @@ contract L2RegistryV2Test is Test {
         _writeAll(byApprovee, holder);
         _writeAll(byOperator, holder);
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(byApprovee));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.stopPrank();
 

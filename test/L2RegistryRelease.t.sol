@@ -155,12 +155,14 @@ contract L2RegistryReleaseTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /// Audit 938 M-7. v2 followed the ERC-721 convention — whoever may
-    /// transfer the token may burn it. An approval is what a marketplace asks
-    /// for to list a name, and a burn cannot be undone, so v2.1 refuses both
-    /// kinds of approval. They still move the token.
+    /// transfer the token may burn it. v2.1 kept approvals for moving the
+    /// token and refused them the burn; audit 950 showed a move to oneself IS
+    /// the burn, so v2.2 refuses the approval itself. The would-be approvee is
+    /// a stranger: it can neither burn the name nor move it.
     function test_Release_RevertForPerTokenApprovee() public {
         bytes32 node = _register("venue", organiser);
         vm.prank(organiser);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(operator, uint256(node));
 
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
@@ -168,14 +170,18 @@ contract L2RegistryReleaseTest is Test {
         registry.release(node);
         assertEq(registry.owner(node), organiser, "an approvee burned the name");
 
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, operator, uint256(node))
+        );
         vm.prank(operator);
         registry.transferFrom(organiser, operator, uint256(node));
-        assertEq(registry.owner(node), operator, "the approval no longer moves the token");
+        assertEq(registry.owner(node), organiser, "a refused approval moved the token");
     }
 
     function test_Release_RevertForOperatorForAll() public {
         bytes32 node = _register("venue", organiser);
         vm.prank(organiser);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
 
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
@@ -210,7 +216,9 @@ contract L2RegistryReleaseTest is Test {
     function test_Release_RevokedApproveeCannotRelease() public {
         bytes32 node = _register("venue", organiser);
         vm.startPrank(organiser);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(operator, uint256(node));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(address(0), uint256(node));
         vm.stopPrank();
 

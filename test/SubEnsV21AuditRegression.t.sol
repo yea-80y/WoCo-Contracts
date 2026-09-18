@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
@@ -134,7 +135,9 @@ contract SubEnsV21AuditRegressionTest is Test {
     /*//////////////////////////////////////////////////////////////
         938 [H-1] = 937 [F4] — an ERC-721 approval was also a
         record-write approval. v2.1: records are the holder's; an
-        approval moves the token and nothing else.
+        approval moved the token and nothing else. v2.2 (audit 950):
+        moving the token to oneself IS everything else, so approvals
+        are refused outright.
     //////////////////////////////////////////////////////////////*/
 
     function test_H1_F4_anOperatorForAllCannotRepointPayments() public {
@@ -145,6 +148,7 @@ contract SubEnsV21AuditRegressionTest is Test {
 
         // The approval every marketplace listing flow asks for.
         vm.prank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
 
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
@@ -155,8 +159,14 @@ contract SubEnsV21AuditRegressionTest is Test {
         assertEq(registry.owner(node), holder);
         assertEq(registry.recordVersions(node), versionBefore);
 
-        // What the approval IS for still works — and the sale resets the records.
+        // v2.2: the would-be operator cannot move it either. The holder's own
+        // sale still resets the records.
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, operator, uint256(node))
+        );
         vm.prank(operator);
+        registry.transferFrom(holder, buyer, uint256(node));
+        vm.prank(holder);
         registry.transferFrom(holder, buyer, uint256(node));
         assertEq(registry.owner(node), buyer);
         assertEq(registry.addr(node, 60).length, 0, "the buyer received the seller's addr");
@@ -165,6 +175,7 @@ contract SubEnsV21AuditRegressionTest is Test {
     function test_H1_F4_aPerTokenApproveeCannotRepointPaymentsEither() public {
         bytes32 node = _mint("alice", holder);
         vm.prank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(node));
 
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
@@ -174,20 +185,24 @@ contract SubEnsV21AuditRegressionTest is Test {
         assertEq(registry.addr(node, 60).length, 0);
         assertEq(registry.owner(node), holder);
 
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, approvee, uint256(node))
+        );
         vm.prank(approvee);
         registry.transferFrom(holder, buyer, uint256(node));
-        assertEq(registry.owner(node), buyer, "the approvee could not move the token");
+        assertEq(registry.owner(node), holder, "a refused approval moved the token");
     }
 
     /*//////////////////////////////////////////////////////////////
         938 [M-7] — the same approvals reached `release`, which is
         irreversible, while `createSubnode` refused them. v2.1: both
-        refuse them.
+        refuse them. v2.2: the approvals themselves are refused.
     //////////////////////////////////////////////////////////////*/
 
     function test_M7_anOperatorForAllCannotBurnTheName() public {
         bytes32 node = _mint("alice", holder);
         vm.prank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
 
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
@@ -203,6 +218,7 @@ contract SubEnsV21AuditRegressionTest is Test {
     function test_M7_andTheSameOperatorStillCannotCreateASubname() public {
         bytes32 node = _mint("alice", holder);
         vm.prank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
 
         bytes[] memory none = new bytes[](0);
@@ -363,6 +379,7 @@ contract SubEnsV21AuditRegressionTest is Test {
         registry.setText(base, "url", "https://woco.example");
 
         vm.prank(admin);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, base));
         vm.prank(operator);
@@ -666,6 +683,7 @@ contract SubEnsV21AuditRegressionTest is Test {
         bytes32 venue = _mint("venue", holder);
         bytes32 shop = _child(venue, "shop", stranger);
         vm.prank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
 
         address[4] memory callers = [operator, bareRegistrar, admin, buyer];

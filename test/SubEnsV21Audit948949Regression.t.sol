@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
 import {UniversalSigValidatorFixture as Validator} from "./fixtures/UniversalSigValidatorFixture.sol";
@@ -18,6 +19,12 @@ import {UniversalSigValidatorFixture as Validator} from "./fixtures/UniversalSig
  * records through a move to its own holder — is fixed here, and its tests are
  * turned round. The rest asserted facts that hold either way and stand as they
  * were written.
+ *
+ * v2.2 (audit 950, Fable consult Branch A): the registry refuses ERC-721
+ * delegation outright. The M1 tests below now show that the approval itself
+ * is refused, that the would-be delegate cannot move the name, and that the
+ * holder's OWN self-transfer still changes nothing — the property b9f7f16
+ * fixed, which remains worth pinning.
  */
 contract SubEnsV21Audit948949RegressionTest is Test {
     L2Registry registry;
@@ -70,11 +77,18 @@ contract SubEnsV21Audit948949RegressionTest is Test {
         vm.startPrank(holder);
         registry.setContenthash(node, SITE);
         registry.setAddr(node, holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.stopPrank();
         uint64 versionBefore = registry.recordVersions(node);
 
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, operator, uint256(node))
+        );
         vm.prank(operator);
+        registry.transferFrom(holder, holder, uint256(node));
+
+        vm.prank(holder);
         registry.transferFrom(holder, holder, uint256(node));
 
         assertEq(registry.owner(node), holder, "the name moved");
@@ -98,27 +112,32 @@ contract SubEnsV21Audit948949RegressionTest is Test {
         }
     }
 
-    /// The same through a per-token approval, repeated: no number of
-    /// self-transfers touches the records. A REAL transfer still resets them.
+    /// The same through a per-token approval, which is refused too. The
+    /// holder's own self-transfer, repeated, never touches the records. A REAL
+    /// transfer still resets them.
     function test_M1_aPerTokenApproveeCannotEither_ButARealTransferStillResets() public {
         bytes32 node = _mint("venue", holder);
         vm.startPrank(holder);
         registry.setContenthash(node, SITE);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(node));
         vm.stopPrank();
+        assertEq(registry.getApproved(uint256(node)), address(0));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, approvee, uint256(node))
+        );
+        vm.prank(approvee);
+        registry.transferFrom(holder, holder, uint256(node));
 
         for (uint256 i; i < 3; ++i) {
             vm.prank(holder);
-            registry.approve(approvee, uint256(node)); // the move clears the approval
-            vm.prank(approvee);
             registry.transferFrom(holder, holder, uint256(node));
-            assertEq(registry.contenthash(node), SITE, "an approvee wiped the site pointer");
+            assertEq(registry.contenthash(node), SITE, "a self-transfer wiped the site pointer");
         }
         assertEq(registry.recordVersions(node), 1, "the version moved without an ownership change");
 
         vm.prank(holder);
-        registry.approve(approvee, uint256(node));
-        vm.prank(approvee);
         registry.transferFrom(holder, relayer, uint256(node));
         assertEq(registry.owner(node), relayer);
         assertEq(registry.recordVersions(node), 2, "a real transfer must move the version");
@@ -129,30 +148,42 @@ contract SubEnsV21Audit948949RegressionTest is Test {
     /// the digest's nonce, and nothing moved it.
     function test_M1_itDoesNotVoidAPendingReleaseSignature() public {
         bytes32 node = _mint("venue", holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         vm.prank(holder);
         registry.setApprovalForAll(operator, true);
         uint256 expiration = block.timestamp + 10 minutes;
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(HOLDER_KEY, registry.releaseDigest(node, expiration));
         bytes memory sig = abi.encodePacked(r, s, v);
 
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, operator, uint256(node))
+        );
         vm.prank(operator);
+        registry.transferFrom(holder, holder, uint256(node));
+
+        vm.prank(holder);
         registry.transferFrom(holder, holder, uint256(node));
 
         vm.prank(relayer);
         registry.releaseWithSignature(node, expiration, holder, sig);
-        assertEq(registry.owner(node), address(0), "an operator voided the holder's signature");
+        assertEq(registry.owner(node), address(0), "a self-transfer voided the holder's signature");
     }
 
-    /// The base name is out of reach: `_update` refuses every move of it.
+    /// The base name is out of reach: `_update` refuses every move of it,
+    /// before any authorisation is looked at, whoever asks.
     function test_M1_theBaseNameIsNotReachableThisWay() public {
         bytes32 base = registry.baseNode();
         vm.startPrank(admin);
         registry.setContenthash(base, SITE);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(operator, true);
         vm.stopPrank();
 
         vm.expectRevert(L2Registry.AdminHandoverRequired.selector);
         vm.prank(operator);
+        registry.transferFrom(admin, admin, uint256(base));
+        vm.expectRevert(L2Registry.AdminHandoverRequired.selector);
+        vm.prank(admin);
         registry.transferFrom(admin, admin, uint256(base));
         assertEq(registry.contenthash(base), SITE, "the base name's records survive");
     }

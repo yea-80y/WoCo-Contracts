@@ -152,6 +152,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
     function test_ReleaseWithSignature_RevertForPerTokenApprovee() public {
         bytes32 node = _register("venue", holder);
         vm.prank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(node));
         bytes memory sig = _signRelease(APPROVEE_KEY, node);
         vm.mockCallRevert(Validator.ADDR, bytes(""), "validator must not be reached");
@@ -165,6 +166,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
     function test_ReleaseWithSignature_RevertForOperatorForAll() public {
         bytes32 node = _register("venue", holder);
         vm.prank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.setApprovalForAll(approvee, true);
         bytes memory sig = _signRelease(APPROVEE_KEY, node);
         vm.mockCallRevert(Validator.ADDR, bytes(""), "validator must not be reached");
@@ -306,7 +308,9 @@ contract L2RegistryReleaseWithSignatureTest is Test {
     function test_ReleaseWithSignature_RevokedApproveeCannotRelease() public {
         bytes32 node = _register("venue", holder);
         vm.startPrank(holder);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(approvee, uint256(node));
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(address(0), uint256(node));
         vm.stopPrank();
         bytes memory sig = _signRelease(APPROVEE_KEY, node);
