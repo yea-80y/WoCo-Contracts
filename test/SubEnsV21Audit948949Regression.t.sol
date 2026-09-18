@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
@@ -9,16 +9,17 @@ import {L2Resolver} from "../src/durin/L2Resolver.sol";
 import {UniversalSigValidatorFixture as Validator} from "./fixtures/UniversalSigValidatorFixture.sol";
 
 /**
- * TRIAGE of the $1 audit reports on sub-ENS v2.1: LeftClaw engagements 948
- * (whole system) and 949 (registry + resolver in depth), both pinned to
- * `eb8216e`. Reports: `~/projects/woco-571-handover/AUDIT_94{8,9}_*.md`.
+ * Regression tests for the $1 audit reports on sub-ENS v2.1: LeftClaw
+ * engagements 948 (whole system) and 949 (registry + resolver in depth), both
+ * read `eb8216e`. Reports: `~/projects/woco-571-handover/AUDIT_94{8,9}_*.md`.
  *
- * Each test reproduces ONE claim against the code as it stands, and asserts
- * what the contract does TODAY. A green run means the claim is real as stated.
- * Nothing here is a fix: when one lands, its test is inverted, as the 937/938
- * triage was.
+ * Each began as a reproduction of one claim (commit `fefd3c3`, all green). The
+ * Medium both reports found — an ERC-721 approvee or operator wiping a name's
+ * records through a move to its own holder — is fixed here, and its tests are
+ * turned round. The rest asserted facts that hold either way and stand as they
+ * were written.
  */
-contract AuditTriage948949Test is Test {
+contract SubEnsV21Audit948949RegressionTest is Test {
     L2Registry registry;
 
     address admin = makeAddr("admin");
@@ -57,13 +58,14 @@ contract AuditTriage948949Test is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-        948 [1] = 949 [1] (Medium, both reports, independently) — an
-        ERC-721 approvee or operator moves the record version, and so
-        wipes the records and voids a pending release signature, by
-        transferring the name to its own holder.
+        948 [1] = 949 [1] (Medium, both reports, independently): an
+        ERC-721 approvee or operator moved the record version — wiping
+        the records and voiding a pending release signature — by
+        transferring the name to its own holder. A move to the current
+        holder now changes nothing.
     //////////////////////////////////////////////////////////////*/
 
-    function test_M1_anOperatorWipesTheRecordsWithASelfTransfer() public {
+    function test_M1_anOperatorCannotWipeTheRecordsWithASelfTransfer() public {
         bytes32 node = _mint("venue", holder);
         vm.startPrank(holder);
         registry.setContenthash(node, SITE);
@@ -75,32 +77,57 @@ contract AuditTriage948949Test is Test {
         vm.prank(operator);
         registry.transferFrom(holder, holder, uint256(node));
 
-        assertEq(registry.owner(node), holder, "the name did not move");
-        assertEq(registry.recordVersions(node), versionBefore + 1, "CLAIM FAILS: the version did not move");
-        assertEq(registry.contenthash(node).length, 0, "CLAIM FAILS: the site pointer survived");
-        assertEq(registry.addr(node), address(0), "CLAIM FAILS: addr survived");
+        assertEq(registry.owner(node), holder, "the name moved");
+        assertEq(registry.recordVersions(node), versionBefore, "an operator moved the record version");
+        assertEq(registry.contenthash(node), SITE, "an operator wiped the site pointer");
+        assertEq(registry.addr(node), holder, "an operator wiped addr");
     }
 
-    /// The same through a per-token approval, and repeatable: the approval is
-    /// not consumed by the move.
-    function test_M1_aPerTokenApproveeCanDoItRepeatedly() public {
+    /// A move to the current holder emits its ERC-721 `Transfer` and nothing
+    /// else: no `VersionChanged`, because nothing changed hands.
+    function test_M1_aSelfTransferLogsNoVersionChange() public {
         bytes32 node = _mint("venue", holder);
-        for (uint256 i; i < 3; ++i) {
-            vm.startPrank(holder);
-            registry.setContenthash(node, SITE);
-            registry.approve(approvee, uint256(node));
-            vm.stopPrank();
+        vm.recordLogs();
+        vm.prank(holder);
+        registry.transferFrom(holder, holder, uint256(node));
 
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 versionChanged = keccak256("VersionChanged(bytes32,uint64)");
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != versionChanged, "a self-transfer logged a version change");
+        }
+    }
+
+    /// The same through a per-token approval, repeated: no number of
+    /// self-transfers touches the records. A REAL transfer still resets them.
+    function test_M1_aPerTokenApproveeCannotEither_ButARealTransferStillResets() public {
+        bytes32 node = _mint("venue", holder);
+        vm.startPrank(holder);
+        registry.setContenthash(node, SITE);
+        registry.approve(approvee, uint256(node));
+        vm.stopPrank();
+
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(holder);
+            registry.approve(approvee, uint256(node)); // the move clears the approval
             vm.prank(approvee);
             registry.transferFrom(holder, holder, uint256(node));
-            assertEq(registry.contenthash(node).length, 0, "CLAIM FAILS: the site pointer survived");
+            assertEq(registry.contenthash(node), SITE, "an approvee wiped the site pointer");
         }
-        assertEq(registry.recordVersions(node), 4, "one bump per self-transfer");
+        assertEq(registry.recordVersions(node), 1, "the version moved without an ownership change");
+
+        vm.prank(holder);
+        registry.approve(approvee, uint256(node));
+        vm.prank(approvee);
+        registry.transferFrom(holder, relayer, uint256(node));
+        assertEq(registry.owner(node), relayer);
+        assertEq(registry.recordVersions(node), 2, "a real transfer must move the version");
+        assertEq(registry.contenthash(node).length, 0, "a buyer received the seller's records");
     }
 
-    /// And it voids a release the holder has already signed and handed to a
-    /// relayer — the version is the digest's nonce.
-    function test_M1_itVoidsAPendingReleaseSignature() public {
+    /// And a pending release the holder signed survives it — the version is
+    /// the digest's nonce, and nothing moved it.
+    function test_M1_itDoesNotVoidAPendingReleaseSignature() public {
         bytes32 node = _mint("venue", holder);
         vm.prank(holder);
         registry.setApprovalForAll(operator, true);
@@ -112,9 +139,8 @@ contract AuditTriage948949Test is Test {
         registry.transferFrom(holder, holder, uint256(node));
 
         vm.prank(relayer);
-        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         registry.releaseWithSignature(node, expiration, holder, sig);
-        assertEq(registry.owner(node), holder, "CLAIM FAILS: the signature still released the name");
+        assertEq(registry.owner(node), address(0), "an operator voided the holder's signature");
     }
 
     /// The base name is out of reach: `_update` refuses every move of it.
@@ -131,9 +157,8 @@ contract AuditTriage948949Test is Test {
         assertEq(registry.contenthash(base), SITE, "the base name's records survive");
     }
 
-    /// What the same-owner move does NOT do, so a fix is scoped: supply and
-    /// holder are untouched, and `adminTransfer` / `parentTransfer` already
-    /// refuse it by name.
+    /// The rest of the bookkeeping a same-owner move leaves alone, and the two
+    /// paths that refuse such a move by name rather than ignoring it.
     function test_M1_whatTheSelfTransferLeavesAlone() public {
         bytes32 node = _mint("venue", holder);
         uint256 supplyBefore = registry.totalSupply();

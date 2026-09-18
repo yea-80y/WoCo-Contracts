@@ -11,7 +11,8 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
  *
  *   A name's records hold ONLY writes made since its current holding began,
  *   by its holder or an enrolled registrar. An approvee or operator moves the
- *   name and does nothing else (v2.1, audits 937 F4 / 938 H-1, M-7).
+ *   name and does nothing else (v2.1, audits 937 F4 / 938 H-1, M-7) — a move to
+ *   the name's own holder changes nothing at all (948 / 949).
  *
  * The handler keeps its own MODEL of who holds each name, who is approved,
  * who is an operator and whether the registrar is enrolled, built from the
@@ -61,6 +62,8 @@ contract RecordsHandler is Test {
     /// Attempts by an approvee or operator of the holder, who must be refused
     /// records, clears and burns — the v2.1 rule this campaign most needs to see.
     uint256 public delegateAttempts;
+    /// Moves to the name's current holder, which must change nothing.
+    uint256 public selfTransfers;
 
     bool public modelDisagreed;
     string public disagreement;
@@ -109,7 +112,15 @@ contract RecordsHandler is Test {
         vm.prank(by);
         try registry.transferFrom(holder, to, uint256(node)) {
             _agree(expected, true, "transferFrom");
-            _newHolding(node, to);
+            if (to == holder) {
+                // A move to the current holder is not a change of holding: the
+                // records stay, the version stays, and only the per-token
+                // approval is cleared, by OpenZeppelin (audits 948 / 949).
+                selfTransfers++;
+                modelApproved[node] = address(0);
+            } else {
+                _newHolding(node, to);
+            }
         } catch {
             _agree(expected, false, "transferFrom");
         }
@@ -213,6 +224,12 @@ contract RecordsHandler is Test {
         vm.prank(delegate);
         try registry.release(node) {
             _agree(false, true, "a delegate's release");
+        } catch {}
+        // And the move that changes nothing: the records must survive it.
+        vm.prank(delegate);
+        try registry.transferFrom(holder, holder, uint256(node)) {
+            selfTransfers++;
+            modelApproved[node] = address(0);
         } catch {}
     }
 
@@ -376,5 +393,6 @@ contract L2RegistryRecordsInvariantTest is Test {
         assertGt(handler.refusedClears(), 0, "campaign never had a clear refused");
         assertGt(handler.writesToAbsentNames(), 0, "campaign never tried to write a name that does not exist");
         assertGt(handler.delegateAttempts(), 0, "campaign never had an approvee or operator try to act");
+        assertGt(handler.selfTransfers(), 0, "campaign never moved a name to its own holder");
     }
 }

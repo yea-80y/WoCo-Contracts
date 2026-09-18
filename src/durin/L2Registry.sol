@@ -46,7 +46,8 @@ import {L2Resolver} from "./L2Resolver.sol";
 ///
 /// v2.1 (after audits 937 and 938):
 ///   - A name's records, `clearRecords` and `release` belong to its HOLDER.
-///     An ERC-721 approval moves the token and does nothing else.
+///     An ERC-721 approval moves the token and does nothing else — including a
+///     move to the holder itself, which changes nothing at all (948 / 949).
 ///   - The base name's records are written by its holder only, never by a
 ///     registrar.
 ///   - Every name records the name above it (`parentOf`) and counts the live
@@ -911,6 +912,17 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      outstanding release signature. A path added later cannot forget a
     ///      bump that no path performs itself.
     ///
+    ///      A MOVE TO THE CURRENT HOLDER IS NOT ONE. `transferFrom` permits
+    ///      `from == to`, and an ERC-721 approvee or operator may call it, so
+    ///      bumping there handed exactly the party this registry excludes from
+    ///      records, `clearRecords` and `release` a way to wipe a name's records
+    ///      and void an outstanding release signature, repeatably, without the
+    ///      name ever moving (audits 948 / 949, both Medium; the same defect in
+    ///      v2). `adminTransfer` and `parentTransfer` refuse a same-owner move
+    ///      by name for the same reason. Mint, burn and `acceptAdmin` can never
+    ///      reach it: one side is always the zero address, and a nominee is
+    ///      never the sitting admin.
+    ///
     ///      SUPPLY. A mint adds one to `totalSupply` and a burn takes one away
     ///      (938 L-5).
     ///
@@ -927,9 +939,11 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
             totalSupply--;
         }
 
-        bytes32 node = bytes32(tokenId);
-        recordVersions[node]++;
-        emit VersionChanged(node, recordVersions[node]);
+        if (from != to) {
+            bytes32 node = bytes32(tokenId);
+            recordVersions[node]++;
+            emit VersionChanged(node, recordVersions[node]);
+        }
     }
 
     /// @dev The burn both release paths share. Callers have already decided
