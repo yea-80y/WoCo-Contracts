@@ -12,6 +12,7 @@ import {IExtendedResolver} from "@ensdomains/ens-contracts/resolvers/profiles/IE
 import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
+import {WoCoSubEnsDeployer} from "../src/WoCoSubEnsDeployer.sol";
 
 /**
  * Regression tests for the $1 re-audit of sub-ENS v2.1: LeftClaw engagement
@@ -356,6 +357,69 @@ contract SubEnsV22Audit950RegressionTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+        950 Low 12: the validator's answer was copied into memory in
+        full before its length was checked, so a validator answering
+        with a huge buffer billed the submitter for it. Only one word is
+        ever copied now.
+    //////////////////////////////////////////////////////////////*/
+
+    /// The validator answers with ~600 KB, spending most of its own budget to
+    /// do so. The submitter's cost stays within the bound and the refusal is
+    /// ours. Against v2.1's Solidity `.call` the copy alone adds ~0.8M gas and
+    /// this bound fails — which is what makes the assembly worth its place.
+    function test_950_L12_aReturnDataBombCostsTheSubmitterNothingExtra() public {
+        vm.etch(0x164af34fAF9879394370C7f09064127C043A35E9, address(new ReturnsHugeAnswer()).code);
+        bytes32 node = _mint("venue", holder);
+        uint256 exp = block.timestamp + 10 minutes;
+        bytes memory call_ = abi.encodeCall(L2Registry.releaseWithSignature, (node, exp, holder, hex"1271"));
+
+        uint256 before = gasleft();
+        vm.prank(attacker);
+        (bool ok, bytes memory ret) = address(registry).call{gas: 20_000_000}(call_);
+        uint256 used = before - gasleft();
+
+        assertFalse(ok);
+        assertEq(ret, abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node), "not our refusal");
+        assertLt(used, 1_150_000, "the submitter paid for the validator's answer");
+        assertEq(registry.owner(node), holder);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        950 Low 16: anyone could initialise an uninitialised clone of
+        the production implementation. Only the contract that created
+        the implementation may now.
+    //////////////////////////////////////////////////////////////*/
+
+    function test_950_L16_onlyTheImplementationsCreatorInitialisesAClone() public {
+        L2Registry impl = new L2Registry(); // this test contract is the creator
+        L2Registry clone = L2Registry(Clones.clone(address(impl)));
+
+        vm.expectRevert(abi.encodeWithSelector(L2Registry.NotDeployer.selector, attacker));
+        vm.prank(attacker);
+        clone.initialize("evil.eth", "x", "", attacker);
+
+        clone.initialize("woco.eth", "WoCo Names", "", admin);
+        assertEq(clone.owner(), admin);
+    }
+
+    /// The production path: the deployer contract creates the implementation
+    /// and initialises its clone in one transaction. A clone of THAT
+    /// implementation made by anyone else can never be initialised.
+    function test_950_L16_aCloneOfTheProductionImplementationIsInert() public {
+        WoCoSubEnsDeployer d = new WoCoSubEnsDeployer("woco.eth", admin, sponsor, new string[](0));
+        assertEq(d.registry().owner(), admin);
+
+        L2Registry rogue = L2Registry(Clones.clone(address(d.implementation())));
+        address[2] memory callers = [attacker, address(this)];
+        for (uint256 i; i < callers.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(L2Registry.NotDeployer.selector, callers[i]));
+            vm.prank(callers[i]);
+            rogue.initialize("woco.eth", "WoCo Names", "", callers[i]);
+        }
+        assertEq(rogue.owner(), address(0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
         THE ROOT (Fable consult §1): every 950 variant as SEPARATE
         plain calls, across blocks, no batch. Green on v2.1; each is
         now refused at the approval.
@@ -691,6 +755,15 @@ contract SeatExecutor {
                     revert(add(ret, 0x20), mload(ret))
                 }
             }
+        }
+    }
+}
+
+/// @dev A validator whose answer is a ~600 KB buffer of zeros. Test-only.
+contract ReturnsHugeAnswer {
+    fallback() external {
+        assembly {
+            return(0, 600000)
         }
     }
 }

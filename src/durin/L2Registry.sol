@@ -115,6 +115,11 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     IUniversalSignatureValidator internal immutable universalSignatureValidator =
         IUniversalSignatureValidator(0x164af34fAF9879394370C7f09064127C043A35E9);
 
+    /// @dev The contract that created this implementation, the only one that
+    ///      may initialise a clone of it (audit 950 Low 16). An immutable lives
+    ///      in the implementation's code, so every clone reads the same value.
+    address private immutable _deployer;
+
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -279,6 +284,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     error RecipientIsRegistry();
     error SubnodeMovedDuringCreation(bytes32 node);
     error DelegationNotSupported();
+    error NotDeployer(address caller);
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -314,14 +320,21 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      does not share, so every clone would report an empty name and a
     ///      wallet that builds the domain from ERC-5267 would sign for the
     ///      wrong one.
+    ///
+    ///      Records its creator as the one address that may initialise a clone.
     constructor() ERC721("", "") EIP712("WoCo Names", "2") {
+        _deployer = msg.sender;
         _disableInitializers();
     }
 
     /// @notice Initializes the registry
-    /// @dev Must run in the transaction that creates the clone — see
-    ///      `WoCoSubEnsDeployer`. Until it runs, anyone can call it, and whoever
-    ///      does takes the admin seat.
+    /// @dev Callable only by the contract that created the implementation, and
+    ///      run in the transaction that creates the clone — see
+    ///      `WoCoSubEnsDeployer`. v2.1 let anyone initialise an uninitialised
+    ///      clone and take its admin seat, which the deployer contract made
+    ///      unreachable by procedure only; the pin makes it structural, for a
+    ///      clone of the production implementation made by anyone (audit 950
+    ///      Low 16).
     ///
     ///      `_mint`, not `_safeMint`: `admin` is a multisig or a DAO, and the
     ///      admin seat must not depend on it answering an ERC-721 receiver hook.
@@ -339,6 +352,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
         string calldata baseURI,
         address admin
     ) external initializer {
+        if (msg.sender != _deployer) revert NotDeployer(msg.sender);
         (bytes memory dnsEncodedName, bytes32 node) = _encodeName(tokenName);
 
         // ERC721
@@ -997,14 +1011,27 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      with bounded gas. A low-level call rather than `try`: `try` still
     ///      bubbles a failure to decode the answer. Anything but exactly `true`
     ///      is no.
+    ///
+    ///      In assembly so that nothing but one word of the answer is ever
+    ///      copied: Solidity's `call` copies ALL return data into memory before
+    ///      any length check, so a validator answering with a huge buffer would
+    ///      bill the submitter for the memory (audit 950 Low 12). A call to an
+    ///      address with no code succeeds with no return data, and is refused.
     function _validatorAccepts(address signer, bytes32 digest, bytes calldata signature)
         private
-        returns (bool)
+        returns (bool accepted)
     {
-        (bool ok, bytes memory ret) = address(universalSignatureValidator).call{gas: VALIDATOR_GAS}(
-            abi.encodeCall(IUniversalSignatureValidator.isValidSig, (signer, digest, signature))
-        );
-        return ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
+        bytes memory data = abi.encodeCall(IUniversalSignatureValidator.isValidSig, (signer, digest, signature));
+        address validator = address(universalSignatureValidator);
+        uint256 gasBudget = VALIDATOR_GAS;
+        assembly ("memory-safe") {
+            let ok := call(gasBudget, validator, 0, add(data, 0x20), mload(data), 0, 0)
+            // Exactly one word back, equal to 1. Scratch space only.
+            if and(ok, eq(returndatasize(), 32)) {
+                returndatacopy(0, 0, 32)
+                accepted := eq(mload(0), 1)
+            }
+        }
     }
 
     function _setBaseURI(string calldata baseURI) private {
