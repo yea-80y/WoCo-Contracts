@@ -27,6 +27,11 @@ import {IL2Registry} from "./durin/interfaces/IL2Registry.sol";
 ///      read live (`owner()`), so a handover of the admin seat hands over this
 ///      registrar in the same transaction and nothing is left behind (937 F13,
 ///      938 M-4). With it went `Ownable2Step` and its renounce.
+///
+///      Its ENROLMENT does not follow the seat. Since registry v2.2 an
+///      `acceptAdmin` drops every registrar (audit 950 Medium 3), so the
+///      incoming admin re-enrols this contract with `addRegistrar` in the same
+///      executor batch as `acceptAdmin`, or new names stop until it does.
 contract WoCoRegistrar {
     /// @notice The Durin L2Registry this registrar mints into.
     IL2Registry public immutable registry;

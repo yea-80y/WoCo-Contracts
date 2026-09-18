@@ -45,11 +45,9 @@ import {L2Resolver} from "./L2Resolver.sol";
 ///   - `addRegistrar(address(0))` is refused.
 ///
 /// v2.1 (after audits 937 and 938):
-///   - A name's records, `clearRecords` and `release` belong to its HOLDER.
-///     An ERC-721 approval moves the token and does nothing else — including a
-///     move to the holder itself, which changes nothing of this registry's own.
-///     OpenZeppelin still clears the per-token approval there, as on any
-///     transfer (948 / 949).
+///   - A name's records, `clearRecords` and `release` belong to its HOLDER. A
+///     move to the holder itself changes nothing of this registry's own
+///     (948 / 949).
 ///   - The base name's records are written by its holder only, never by a
 ///     registrar.
 ///   - Every name records the name above it (`parentOf`) and counts the live
@@ -66,8 +64,21 @@ import {L2Resolver} from "./L2Resolver.sol";
 ///   - `initialize` holds the base name to the same label rules as any other.
 ///   - `ABI` answers for every `contentTypes` (`L2Resolver`).
 ///
-/// The tests that freeze these are the L2Registry*.t.sol suites,
-/// SubEnsV2AuditRegression.t.sol and SubEnsV21AuditRegression.t.sol. This
+/// v2.2 (after audit 950; Fable design consult, Branch A):
+///   - No ERC-721 delegation. `approve` and `setApprovalForAll` revert
+///     `DelegationNotSupported`, and only the holder moves a name. v2.1 said
+///     an approval moved the token and did nothing else; that could never
+///     hold, because moving the token to oneself IS every holder power here.
+///   - No public `multicall` (`L2Resolver`). `createSubnode`'s batch is
+///     internal, node-checked, and fails with its inner reason.
+///   - A registrar grant lasts only as long as the admin seat that made it:
+///     `acceptAdmin` drops every registrar, WoCoRegistrar included.
+///   - Only one word of the ERC-6492 validator's answer is ever copied.
+///   - Only the contract that created the implementation may initialise a
+///     clone of it.
+///
+/// The tests that freeze these are the L2Registry*.t.sol suites and the
+/// SubEnsV2*Audit*Regression.t.sol files. This
 /// contract is deployed as an EIP-1167 clone and CANNOT be upgraded: anything
 /// wrong here is permanent.
 contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
@@ -84,14 +95,29 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
 
     /// @notice The furthest ahead of the submitting block a release signature
     ///         may expire.
-    /// @dev A ceiling, not the product's policy: the relay accepts 15 minutes
-    ///      and the client asks for 10. It is this long because the clock it is
-    ///      compared with is the Arbitrum sequencer's, which may run up to a day
-    ///      behind (audit 937 F25): a signature that expires ten minutes from
-    ///      the wallet's clock must still be in range there, and the L1
-    ///      force-inclusion path, about a day, must stay usable. Without any
-    ///      ceiling a signature could be made to outlive every intent behind
-    ///      it (937 F2, F3).
+    /// @dev WHAT IT BOUNDS, exactly: a signature is never ACCEPTED more than
+    ///      this long before its expiration. It does not bound a signature's
+    ///      age — no contract can know when a signature was made — so one
+    ///      signed with an expiration years ahead is refused until the last
+    ///      48 hours before it, and accepted then (audit 950 Low 4). What ends
+    ///      a signature early is the record version it names: any change of
+    ///      holder, and the holder's own `clearRecords`, void it. A ceiling,
+    ///      not the product's policy: WoCo's relay accepts 15 minutes and its
+    ///      client asks for 10. Without any ceiling a signature could be made
+    ///      acceptable for as long as the name stood still (937 F2, F3).
+    ///
+    ///      WHY THIS LONG: the clock it is compared with is the Arbitrum
+    ///      sequencer's, which may run up to a day behind real time (937 F25)
+    ///      and up to an hour ahead. Behind: a signature that expires ten
+    ///      minutes from the wallet's clock must still be in range. Ahead: a
+    ///      short one may arrive already expired, so a relay should take the
+    ///      expiration from the chain's latest block rather than the wall
+    ///      clock (950 Low 13).
+    ///
+    ///      NOT FOR CENSORSHIP: a transaction forced in through L1 is stamped a
+    ///      day or more after it was sent, when a ten-minute signature has long
+    ///      expired (950 Low 14). The censorship-resistant path is the holder's
+    ///      own `release`, which has no deadline.
     uint256 public constant MAX_RELEASE_SIGNATURE_TTL = 48 hours;
 
     /// @dev The DNS limits (RFC 1035 §2.3.4), in wire format: 63 bytes per
@@ -393,8 +419,10 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      so it does something only for a registrar or a caller minting to
     ///      itself — nobody else may write the new name's records. A batch that
     ///      moved, burned or cleared the name would have announced a name that
-    ///      no longer exists (audit 937 F1 / 938 M-8). A failing call inside it
-    ///      reverts the whole mint without its reason: `Multicallable` drops it.
+    ///      no longer exists (audit 937 F1 / 938 M-8). Every item must name the
+    ///      new node as its first argument (`BatchNodeMismatch`), and a failing
+    ///      item reverts the whole mint with its own reason (v2.1's inherited
+    ///      batch dropped it, audit 950 Low 6).
     /// @param node The parent node, e.g. `namehash("name.eth")` for "name.eth"
     /// @param label The label of the subnode, e.g. "x" for "x.name.eth"
     /// @param _owner The address that will own the subnode
@@ -502,9 +530,15 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      ever make an authorisation check that is handed an unset address
     ///      succeed — the shape of the v1 defect (audit 924 F-1, F-18).
     ///
-    ///      Enrolments survive a handover of the admin seat. An incoming admin
-    ///      reads `RegistrarAdded` / `RegistrarRemoved` and prunes what it did
-    ///      not enrol (audit 938 M-4).
+    ///      An enrolment lasts only as long as the admin seat that made it.
+    ///      `acceptAdmin` bumps `adminEpoch`, and a grant stamped under an
+    ///      earlier epoch reads as not enrolled — including one the outgoing
+    ///      admin made after the nominee last looked (audit 950 Medium 3; v2.1
+    ///      left the incoming admin to prune, which raced the outgoing one,
+    ///      938 M-4). The incoming admin enrols what it wants in the same
+    ///      executor batch as `acceptAdmin`. No `RegistrarRemoved` is logged
+    ///      for the grants a handover ends: read `AdminAccepted` as "every
+    ///      registrar removed".
     /// @param registrar The address to grant registrar role to
     function addRegistrar(address registrar) external onlyOwner {
         if (registrar == address(0)) revert RegistrarIsZeroAddress();
@@ -538,7 +572,8 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      `_update` now refuses every move of the base name except the one
     ///      `acceptAdmin` makes, and only the address nominated here can make it,
     ///      so the seat only ever reaches an address that has shown it can
-    ///      transact. This is how a DAO takes the seat from the Safe.
+    ///      transact. This is how a DAO takes the seat from the Safe. (Since
+    ///      v2.2 there are no operators at all.)
     ///
     ///      The current admin is refused as a nominee: accepting would move
     ///      nothing and log a handover that did not happen.
@@ -562,6 +597,14 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      outright rather than left to "no transaction comes from the zero
     ///      address": if one ever did, the move below would be a burn of the
     ///      admin seat.
+    ///
+    ///      EVERY REGISTRAR IS DROPPED, WoCoRegistrar included: `adminEpoch`
+    ///      moves, and no grant made under the previous seat counts (audit 950
+    ///      Medium 3). The nominee sends this and `addRegistrar` for the
+    ///      registrars it keeps as ONE executor batch — a Safe MultiSend, or a
+    ///      DAO proposal's calls. Accepted alone, it stops new names and the
+    ///      registrar's record writes until the second call lands; existing
+    ///      names keep resolving and holders' own writes are unaffected.
     function acceptAdmin() external {
         address nominee = pendingAdmin;
         if (nominee == address(0) || msg.sender != nominee) revert NotPendingAdmin(msg.sender);
@@ -653,16 +696,21 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///
     ///      WHO MAY CALL IT: the holder, and the holder of the name directly
     ///      above it — except beneath the base name, where the admin's door is
-    ///      `adminTransfer`, so this function adds no platform power. NOT an
-    ///      ERC-721 approvee or operator: an approval is a listing primitive on
-    ///      marketplaces and a burn cannot be undone (audit 938 M-7). NOT a
-    ///      registrar, NOT the registry admin as such.
+    ///      `adminTransfer`, so this function adds no platform power. NOT a
+    ///      registrar, NOT the registry admin as such. There are no approvees
+    ///      or operators to exclude: v2.1 refused them here (audit 938 M-7) and
+    ///      they still reached a burn by moving the name to themselves first,
+    ///      so v2.2 refuses delegation outright (audit 950).
     ///
     ///      A NAME WITH CHILDREN CANNOT BE RELEASED (`HasChildren`). Its
     ///      children would otherwise outlive it and pass, with their records,
     ///      to whoever takes the label next (audit 938 H-2 / 937 F8). Each child
-    ///      is released first — by its holder, or by this name's holder — or
-    ///      moved away with `parentTransfer`, which keeps it counted here.
+    ///      is released first — by its holder, or by this name's holder.
+    ///      `parentTransfer` changes a child's holder, not its parent, so it
+    ///      never clears this gate. A child's holder may hang names beneath it,
+    ///      which this name's holder then unwinds bottom-up — take the child
+    ///      with `parentTransfer`, release beneath it, release it — before its
+    ///      own release: a bounded nuisance, always unwindable (950 Low 7).
     ///
     ///      WHY BURN RATHER THAN PARK: availability throughout this contract and
     ///      the registrar is exactly `owner(node) == address(0)`, so a burn makes
@@ -743,9 +791,9 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      WHAT IT DOES NOT ADD: platform power. The relayer submits only what
     ///      the holder signed, for the node and the deadline the holder chose,
     ///      and can refuse to relay but never forge; the holder can always call
-    ///      `release` directly instead. ONLY the holder may sign — not an
-    ///      approvee, and not the holder of the name above, who releases by
-    ///      direct call — and that is checked BEFORE the signature is examined,
+    ///      `release` directly instead. ONLY the holder may sign — not the
+    ///      holder of the name above, who releases by direct call — and that is
+    ///      checked BEFORE the signature is examined,
     ///      so any other signer is refused without reaching the validator
     ///      (which, for an ERC-6492 wrapper, would run the wrapper's factory
     ///      call). Every rule of `release` applies, `HasChildren` included.
@@ -854,10 +902,10 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     }
 
     /// @notice Wipe `node`'s records by moving it to a fresh record version.
-    /// @dev The holder only. Registrars, the registry admin enrolled as one,
-    ///      and the holder's approvees and operators are refused: in v1 this
-    ///      was the second step of the admin's wipe-in-place (audit 927 H1),
-    ///      and an operator could use it to wipe the base name (938 M-9).
+    /// @dev The holder only. Registrars, and the registry admin enrolled as
+    ///      one, are refused: in v1 this was the second step of the admin's
+    ///      wipe-in-place (audit 927 H1). (v2 let an operator wipe the base
+    ///      name with it, 938 M-9; v2.2 has no operators.)
     ///
     ///      Its real use is that it moves `recordVersions[node]`, and that is
     ///      what voids an outstanding `releaseDigest` signature. So only the
@@ -865,8 +913,9 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///
     ///      The inherited body still runs its own `authorised` check —
     ///      `_canWriteRecords`, which the holder always passes and which already
-    ///      refuses approvees and a name nobody holds. This override's own job is
-    ///      refusing registrars, whom `_canWriteRecords` lets write records.
+    ///      refuses everyone but the holder and a registrar, and a name nobody
+    ///      holds. This override's own job is refusing registrars, whom
+    ///      `_canWriteRecords` lets write records.
     function clearRecords(bytes32 node) public override {
         if (msg.sender != owner(node)) {
             revert Unauthorized(node);
@@ -883,15 +932,13 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///        - its holder; or
     ///        - a registrar, for any name but the base name.
     ///
-    ///      NOT an ERC-721 approvee or operator (audit 938 H-1 / 937 F4): the
-    ///      approval a marketplace asks for to list a name must not let it
-    ///      repoint where the name's payments go, with no transfer to show for
-    ///      it. `writer == holder` also refuses the zero address, because a
-    ///      live name's holder never is.
+    ///      Nobody acting for the holder. v2.1 refused ERC-721 approvees and
+    ///      operators here (audit 938 H-1 / 937 F4); v2.2 has none (audit 950).
+    ///      `writer == holder` also refuses the zero address, because a live
+    ///      name's holder never is.
     ///
     ///      The base name's records are its holder's alone — the admin seat's
-    ///      own. No registrar writes them (937 F7), and neither do the seat's
-    ///      approvees (938 M-9).
+    ///      own. No registrar writes them (937 F7).
     ///
     ///      Existence is required of registrars too, so a registrar cannot write
     ///      records under a node that does not exist at all, where `resolve`
@@ -951,15 +998,14 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      bump that no path performs itself.
     ///
     ///      A MOVE TO THE CURRENT HOLDER IS NOT ONE. `transferFrom` permits
-    ///      `from == to`, and an ERC-721 approvee or operator may call it, so
-    ///      bumping there handed exactly the party this registry excludes from
-    ///      records, `clearRecords` and `release` a way to wipe a name's records
-    ///      and void an outstanding release signature, repeatably, without the
-    ///      name ever moving (audits 948 / 949, both Medium; the same defect in
-    ///      v2). What a self-transfer still does is OpenZeppelin's own: it
-    ///      clears the per-token approval and emits `Transfer`, which under
-    ///      EIP-721 is itself the signal that the approval is gone. Nothing of
-    ///      this registry's changes, so no event of this registry's fires.
+    ///      `from == to`. In v2.1 an ERC-721 approvee or operator could call it,
+    ///      and bumping there let exactly the party the registry excluded from
+    ///      records wipe them and void an outstanding release signature,
+    ///      repeatably, without the name ever moving (audits 948 / 949, both
+    ///      Medium; the same defect in v2). Since v2.2 only the holder can make
+    ///      that call, and it still changes nothing of this registry's own: it
+    ///      emits OpenZeppelin's `Transfer`, and no event of this registry's
+    ///      fires.
     ///      `adminTransfer` and `parentTransfer` refuse a same-owner move by
     ///      name for a DIFFERENT reason: they would log a seizure or a take-back
     ///      that did not happen. Mint, burn and `acceptAdmin` can never reach
@@ -1115,6 +1161,14 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///         own `transferFrom`, or a push into an escrow contract.
     /// @dev EIP-721 says `approve` throws unless the caller is the holder or an
     ///      operator; here it always throws, and so does `setApprovalForAll`.
+    ///      `getApproved` and `isApprovedForAll` are inherited and truthful:
+    ///      zero and false for every live name and pair.
+    ///
+    ///      FOR INTEGRATORS. Custody is push-only: a vault or escrow receives a
+    ///      name by its holder's `safeTransferFrom`; it cannot pull one. And a
+    ///      name held in custody is not custodial-safe by ERC-721 norms: the
+    ///      admin may `adminTransfer` it, and the holder of the name above may
+    ///      `parentTransfer` or `release` it, whoever holds it (audit 950 Low 8).
     function approve(address, uint256) public pure override {
         revert DelegationNotSupported();
     }

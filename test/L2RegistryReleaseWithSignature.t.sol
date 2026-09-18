@@ -501,7 +501,9 @@ contract L2RegistryReleaseWithSignatureTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                  NO SIGNATURE LIVES LONGER THAN THE CEILING
+        NO SIGNATURE IS ACCEPTED MORE THAN THE CEILING BEFORE IT
+        EXPIRES. The ceiling bounds acceptance, not age (audit 950
+        Low 4): the record version is what ends a signature early.
     //////////////////////////////////////////////////////////////*/
 
     function test_ReleaseWithSignature_RevertWhenExpirationIsPastTheCeiling() public {
@@ -526,6 +528,35 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         vm.prank(relayer);
         registry.releaseWithSignature(node, far, holder, sig);
         assertEq(registry.owner(node), address(0));
+    }
+
+    /// A far-dated signature is dormant, not dead: refused now, accepted in
+    /// the last `MAX_RELEASE_SIGNATURE_TTL` before its expiration. What the
+    /// holder does to withdraw it is `clearRecords`, which moves the record
+    /// version the signature names (audit 950 Low 4).
+    function test_ReleaseWithSignature_AFarDatedSignatureIsDormantUntilTheHolderClears() public {
+        bytes32 node = _register("venue", holder);
+        uint256 far = NOW + 3650 days;
+        bytes memory sig = _sign(HOLDER_KEY, registry.releaseDigest(node, far));
+
+        vm.prank(relayer);
+        vm.expectRevert(L2Registry.ExpirationTooFar.selector);
+        registry.releaseWithSignature(node, far, holder, sig);
+
+        uint256 snap = vm.snapshotState();
+        vm.warp(far - registry.MAX_RELEASE_SIGNATURE_TTL());
+        vm.prank(relayer);
+        registry.releaseWithSignature(node, far, holder, sig);
+        assertEq(registry.owner(node), address(0), "dormant, then accepted: the ceiling bounds acceptance only");
+        vm.revertToState(snap);
+
+        vm.prank(holder);
+        registry.clearRecords(node);
+        vm.warp(far - registry.MAX_RELEASE_SIGNATURE_TTL());
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
+        registry.releaseWithSignature(node, far, holder, sig);
+        assertEq(registry.owner(node), holder, "clearRecords did not withdraw the signature");
     }
 
     /*//////////////////////////////////////////////////////////////
