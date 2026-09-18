@@ -47,7 +47,9 @@ import {L2Resolver} from "./L2Resolver.sol";
 /// v2.1 (after audits 937 and 938):
 ///   - A name's records, `clearRecords` and `release` belong to its HOLDER.
 ///     An ERC-721 approval moves the token and does nothing else — including a
-///     move to the holder itself, which changes nothing at all (948 / 949).
+///     move to the holder itself, which changes nothing of this registry's own.
+///     OpenZeppelin still clears the per-token approval there, as on any
+///     transfer (948 / 949).
 ///   - The base name's records are written by its holder only, never by a
 ///     registrar.
 ///   - Every name records the name above it (`parentOf`) and counts the live
@@ -505,8 +507,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      transact. This is how a DAO takes the seat from the Safe.
     ///
     ///      The current admin is refused as a nominee: accepting would move
-    ///      nothing, reset the base name's records, and log a handover that did
-    ///      not happen.
+    ///      nothing and log a handover that did not happen.
     ///
     ///      The handover resets the base name's records like any ownership
     ///      change: the incoming admin writes them again.
@@ -590,8 +591,9 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
 
         address previousOwner = owner(node);
         if (previousOwner == address(0)) revert AdminTransferUnregistered(node);
-        // `_transfer` permits `from == to`, which would move nothing yet reset
-        // the name's records: a one-call wipe-in-place with no transfer use.
+        // `_transfer` permits `from == to`. The funnel no longer resets records
+        // for it (948 / 949), but this path would still log an `AdminTransfer`
+        // for a seizure that did not happen. Refuse it by name.
         if (newOwner == previousOwner) revert AdminTransferSameOwner();
 
         _transfer(previousOwner, newOwner, uint256(node));
@@ -807,7 +809,8 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
         address parentHolder = _parentHolder(node);
         if (parentHolder == address(0) || msg.sender != parentHolder) revert Unauthorized(node);
 
-        // `_transfer` permits `from == to`: a wipe-in-place, as in `adminTransfer`.
+        // `_transfer` permits `from == to`: a `ParentTransfer` logged for a
+        // take-back that did not happen, as in `adminTransfer`.
         if (newOwner == previousOwner) revert ParentTransferSameOwner();
 
         _transfer(previousOwner, newOwner, uint256(node));
@@ -918,9 +921,14 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      records, `clearRecords` and `release` a way to wipe a name's records
     ///      and void an outstanding release signature, repeatably, without the
     ///      name ever moving (audits 948 / 949, both Medium; the same defect in
-    ///      v2). `adminTransfer` and `parentTransfer` refuse a same-owner move
-    ///      by name for the same reason. Mint, burn and `acceptAdmin` can never
-    ///      reach it: one side is always the zero address, and a nominee is
+    ///      v2). What a self-transfer still does is OpenZeppelin's own: it
+    ///      clears the per-token approval and emits `Transfer`, which under
+    ///      EIP-721 is itself the signal that the approval is gone. Nothing of
+    ///      this registry's changes, so no event of this registry's fires.
+    ///      `adminTransfer` and `parentTransfer` refuse a same-owner move by
+    ///      name for a DIFFERENT reason: they would log a seizure or a take-back
+    ///      that did not happen. Mint, burn and `acceptAdmin` can never reach
+    ///      the guard: one side is always the zero address, and a nominee is
     ///      never the sitting admin.
     ///
     ///      SUPPLY. A mint adds one to `totalSupply` and a burn takes one away

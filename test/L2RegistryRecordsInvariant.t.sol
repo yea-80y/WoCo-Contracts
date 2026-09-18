@@ -64,6 +64,9 @@ contract RecordsHandler is Test {
     uint256 public delegateAttempts;
     /// Moves to the name's current holder, which must change nothing.
     uint256 public selfTransfers;
+    /// Of those, the ones made while the name actually HELD a record — without
+    /// these the "records survive a self-transfer" clause is vacuous.
+    uint256 public selfTransfersOverRecords;
 
     bool public modelDisagreed;
     string public disagreement;
@@ -116,8 +119,7 @@ contract RecordsHandler is Test {
                 // A move to the current holder is not a change of holding: the
                 // records stay, the version stays, and only the per-token
                 // approval is cleared, by OpenZeppelin (audits 948 / 949).
-                selfTransfers++;
-                modelApproved[node] = address(0);
+                _countSelfTransfer(node);
             } else {
                 _newHolding(node, to);
             }
@@ -199,6 +201,20 @@ contract RecordsHandler is Test {
         bytes32 node = nodeAt(labelSeed);
         address holder = modelOwner[node];
         if (holder == address(0)) return;
+        // The clause this action exists to exercise is "the records survive a move
+        // to the holder". Ownership churn wipes records constantly, so left to
+        // chance the name is usually empty and the clause is vacuous. Give it one.
+        if (!_hasRecord(node)) {
+            bytes memory seeded =
+                abi.encodePacked(hex"e40101fa011b20", keccak256(abi.encode(labelSeed, delegateSeed)));
+            vm.prank(holder);
+            try registry.setContenthash(node, seeded) {
+                modelContenthash[node] = seeded;
+            } catch {
+                _agree(true, false, "the holder's own record write");
+            }
+        }
+
         address delegate = people[delegateSeed % people.length];
         if (delegate == holder) delegate = people[(delegateSeed % people.length + 1) % people.length];
 
@@ -225,12 +241,15 @@ contract RecordsHandler is Test {
         try registry.release(node) {
             _agree(false, true, "a delegate's release");
         } catch {}
-        // And the move that changes nothing: the records must survive it.
+        // And the move that changes nothing: the records must survive it. The
+        // delegate is authorised by construction, so a refusal here is a
+        // disagreement, not an uninteresting outcome.
         vm.prank(delegate);
         try registry.transferFrom(holder, holder, uint256(node)) {
-            selfTransfers++;
-            modelApproved[node] = address(0);
-        } catch {}
+            _countSelfTransfer(node);
+        } catch {
+            _agree(true, false, "a delegate's self-transfer");
+        }
     }
 
     // ── Records ────────────────────────────────────────────────────────────
@@ -310,6 +329,21 @@ contract RecordsHandler is Test {
         if (k < people.length) return people[k];
         if (k == people.length) return modelApproved[node] == address(0) ? people[0] : modelApproved[node];
         return k == people.length + 1 ? registrarActor : admin;
+    }
+
+    /// A self-transfer changes nothing of the registry's own. OpenZeppelin still
+    /// clears the per-token approval, as it does on any transfer.
+    function _hasRecord(bytes32 node) internal view returns (bool) {
+        return modelContenthash[node].length > 0 || bytes(modelText[node]).length > 0
+            || modelAddr[node].length > 0;
+    }
+
+    function _countSelfTransfer(bytes32 node) internal {
+        selfTransfers++;
+        if (_hasRecord(node)) {
+            selfTransfersOverRecords++;
+        }
+        modelApproved[node] = address(0);
     }
 
     function _newHolding(bytes32 node, address to) internal {
@@ -394,5 +428,10 @@ contract L2RegistryRecordsInvariantTest is Test {
         assertGt(handler.writesToAbsentNames(), 0, "campaign never tried to write a name that does not exist");
         assertGt(handler.delegateAttempts(), 0, "campaign never had an approvee or operator try to act");
         assertGt(handler.selfTransfers(), 0, "campaign never moved a name to its own holder");
+        assertGt(
+            handler.selfTransfersOverRecords(),
+            0,
+            "campaign never moved a name that held a record to its own holder"
+        );
     }
 }
