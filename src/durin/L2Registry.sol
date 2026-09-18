@@ -136,8 +136,11 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     /// @notice Mapping of node (namehash) to name (DNS-encoded)
     mapping(bytes32 node => bytes name) public names;
 
-    /// @notice Mapping of approved registrar controllers
-    mapping(address registrar => bool approved) public registrars;
+    /// @dev Registrar enrolments, each stamped with the admin seat that made
+    ///      it: `adminEpoch + 1` at the time of the grant, zero when never
+    ///      granted or removed. Read through `registrars`, which counts only a
+    ///      grant made under the CURRENT seat.
+    mapping(address registrar => uint64 grantedEpoch) private _registrarEpoch;
 
     /// @notice What the registry remembers about a name after `release`
     ///         (WoCo addition, #464). One storage slot.
@@ -169,6 +172,14 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     /// @notice The address the admin has nominated to take the admin seat, or
     ///         zero when no handover is open. See `nominateAdmin`.
     address public pendingAdmin;
+
+    /// @notice The admin-seat epoch: bumped by every `acceptAdmin`, so a
+    ///         registrar grant is valid only under the seat that made it
+    ///         (audit 950 Medium 3). Declared beside `pendingAdmin` so the two
+    ///         share a storage slot.
+    /// @dev A counter, not a block number: on Arbitrum `block.number` is the
+    ///      L1 block, which many L2 transactions share.
+    uint64 public adminEpoch;
 
     /// @notice The name directly above `node`. Zero for the base name and for
     ///         a node never minted.
@@ -382,7 +393,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
         address _owner,
         bytes[] calldata data
     ) external returns (bytes32) {
-        if (owner(node) != msg.sender && !(node == baseNode && registrars[msg.sender])) {
+        if (owner(node) != msg.sender && !(node == baseNode && registrars(msg.sender))) {
             revert Unauthorized(node);
         }
 
@@ -431,6 +442,14 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
         return keccak256(abi.encodePacked(parentNode, labelhash));
     }
 
+    /// @notice Whether `registrar` is enrolled under the CURRENT admin seat.
+    ///         Same ABI as the mapping getter it replaces.
+    /// @dev Equality with `adminEpoch + 1`, not "greater than the epoch", so a
+    ///      grant from any earlier seat never reads as live.
+    function registrars(address registrar) public view returns (bool) {
+        return _registrarEpoch[registrar] == adminEpoch + 1;
+    }
+
     /// @notice The admin of the registry: the holder of the base name
     function owner() public view returns (address) {
         return owner(baseNode);
@@ -475,7 +494,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     /// @param registrar The address to grant registrar role to
     function addRegistrar(address registrar) external onlyOwner {
         if (registrar == address(0)) revert RegistrarIsZeroAddress();
-        registrars[registrar] = true;
+        _registrarEpoch[registrar] = adminEpoch + 1;
         emit RegistrarAdded(registrar);
     }
 
@@ -483,7 +502,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     /// @param registrar The address to revoke registrar role from
     /// @dev Only callable by admin role
     function removeRegistrar(address registrar) external onlyOwner {
-        registrars[registrar] = false;
+        delete _registrarEpoch[registrar];
         emit RegistrarRemoved(registrar);
     }
 
@@ -535,6 +554,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
 
         address previousAdmin = owner();
         delete pendingAdmin;
+        adminEpoch++; // every registrar grant made under the previous seat is dead
         _updateAndBumpVersion(nominee, uint256(baseNode), address(0));
 
         emit AdminAccepted(previousAdmin, nominee);
@@ -870,7 +890,7 @@ contract L2Registry is ERC721, EIP712, Initializable, L2Resolver {
     ///      `addRegistrar`. That is accepted; see `adminTransfer`.
     function _canWriteRecords(address writer, bytes32 node) internal view override returns (bool) {
         address holder = _ownerOf(uint256(node));
-        return holder != address(0) && (writer == holder || (registrars[writer] && node != baseNode));
+        return holder != address(0) && (writer == holder || (registrars(writer) && node != baseNode));
     }
 
     /// @dev The holder of the name directly above `node`, when that holder may

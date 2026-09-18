@@ -228,6 +228,134 @@ contract SubEnsV22Audit950RegressionTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+        950 [3] (Medium): registrar grants survived `acceptAdmin`, and
+        the incoming admin's prune raced the outgoing admin, who could
+        add a registrar after the nominee's snapshot. v2.2 stamps every
+        grant with the admin epoch; `acceptAdmin` bumps it, so EVERY
+        grant dies at a handover — WoCoRegistrar's included.
+    //////////////////////////////////////////////////////////////*/
+
+    function test_950_M3_everyGrantDiesAtAcceptAdmin_lateOneIncluded() public {
+        address nominee = makeAddr("nominee");
+        address r1 = makeAddr("r1");
+        address rLate = makeAddr("rLate");
+        vm.startPrank(admin);
+        registry.addRegistrar(r1);
+        registry.nominateAdmin(nominee);
+        registry.addRegistrar(rLate); // after any snapshot the nominee took
+        vm.stopPrank();
+        assertTrue(registry.registrars(r1) && registry.registrars(rLate));
+        assertEq(registry.adminEpoch(), 0, "nominating moved the epoch");
+
+        vm.prank(nominee);
+        registry.acceptAdmin();
+
+        assertEq(registry.adminEpoch(), 1);
+        assertFalse(registry.registrars(r1), "an old grant survived the handover");
+        assertFalse(registry.registrars(rLate), "the late grant survived the handover");
+        assertFalse(registry.registrars(address(registrar)), "WoCoRegistrar survived the handover");
+        assertFalse(registry.registrars(bareRegistrar));
+
+        // The new seat enrols what it wants; removing a dead grant is harmless.
+        vm.startPrank(nominee);
+        registry.removeRegistrar(rLate);
+        registry.addRegistrar(r1);
+        vm.stopPrank();
+        assertTrue(registry.registrars(r1));
+        assertFalse(registry.registrars(rLate));
+    }
+
+    /// A dead grant can neither mint nor write the records of a name that
+    /// exists, and WoCoRegistrar's own mint path stops with it.
+    function test_950_M3_aDeadGrantCannotMintOrWrite() public {
+        bytes32 venue = _mint("venue", holder);
+        address nominee = makeAddr("nominee");
+        vm.prank(admin);
+        registry.nominateAdmin(nominee);
+        vm.prank(nominee);
+        registry.acceptAdmin();
+
+        bytes32 base = registry.baseNode();
+        bytes[] memory none = new bytes[](0);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, base));
+        vm.prank(bareRegistrar);
+        registry.createSubnode(base, "late", bareRegistrar, none);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, venue));
+        vm.prank(bareRegistrar);
+        registry.setContenthash(venue, SITE);
+
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, base));
+        vm.prank(sponsor);
+        registrar.register("next", holder, "", new string[](0), new string[](0));
+
+        // The holder's own writes never depended on a registrar.
+        vm.prank(holder);
+        registry.setContenthash(venue, SITE);
+        assertEq(registry.contenthash(venue), SITE);
+    }
+
+    /// The runbook shape: the nominee accepts and re-enrols WoCoRegistrar in
+    /// ONE executor batch (a Safe MultiSend, or a DAO proposal's calls), so
+    /// minting never stops. The registrar's owner follows the seat.
+    function test_950_M3_theAcceptanceBatchKeepsMinting() public {
+        SeatExecutor safe = new SeatExecutor();
+        vm.prank(admin);
+        registry.nominateAdmin(address(safe));
+
+        address[] memory targets = new address[](2);
+        bytes[] memory calls = new bytes[](2);
+        targets[0] = address(registry);
+        calls[0] = abi.encodeCall(L2Registry.acceptAdmin, ());
+        targets[1] = address(registry);
+        calls[1] = abi.encodeCall(L2Registry.addRegistrar, (address(registrar)));
+        safe.execute(targets, calls);
+
+        assertEq(registry.owner(), address(safe));
+        assertEq(registrar.owner(), address(safe), "the registrar's owner is the live seat");
+        assertTrue(registry.registrars(address(registrar)));
+        assertFalse(registry.registrars(bareRegistrar), "only what the batch enrolled is live");
+
+        bytes32 node = _mint("after", holder);
+        assertEq(registry.owner(node), holder, "minting stopped across the handover");
+    }
+
+    /// A grant stamped under an earlier seat never reads as live again, however
+    /// many handovers follow; each seat's own grant does.
+    function test_950_M3_aStaleStampNeverRevives() public {
+        address r = makeAddr("r");
+        vm.prank(admin);
+        registry.addRegistrar(r); // stamped under epoch 0
+
+        address seat = admin;
+        for (uint256 i = 1; i <= 3; ++i) {
+            address next = makeAddr(string.concat("seat", vm.toString(i)));
+            vm.prank(seat);
+            registry.nominateAdmin(next);
+            vm.prank(next);
+            registry.acceptAdmin();
+            seat = next;
+            assertEq(registry.adminEpoch(), i);
+            assertFalse(registry.registrars(r), "a stale grant revived");
+        }
+        vm.prank(seat);
+        registry.addRegistrar(r);
+        assertTrue(registry.registrars(r));
+    }
+
+    /// Cancelling or replacing a nomination is not a handover and kills
+    /// nothing.
+    function test_950_M3_aNominationAloneKillsNothing() public {
+        vm.startPrank(admin);
+        registry.nominateAdmin(makeAddr("first"));
+        registry.nominateAdmin(makeAddr("second"));
+        registry.nominateAdmin(address(0));
+        vm.stopPrank();
+        assertEq(registry.adminEpoch(), 0);
+        assertTrue(registry.registrars(address(registrar)));
+        assertTrue(registry.registrars(bareRegistrar));
+    }
+
+    /*//////////////////////////////////////////////////////////////
         THE ROOT (Fable consult §1): every 950 variant as SEPARATE
         plain calls, across blocks, no batch. Green on v2.1; each is
         now refused at the approval.
@@ -548,5 +676,21 @@ contract NameEscrow is IERC721Receiver {
         require(msg.sender == l.seller, "not the seller");
         delete listings[id];
         registry.safeTransferFrom(address(this), l.seller, id);
+    }
+}
+
+/// @dev A one-signer executor standing in for a Safe or a DAO timelock: runs
+///      its calls in order, in one transaction, and reverts them all if one
+///      fails. Test-only.
+contract SeatExecutor {
+    function execute(address[] calldata targets, bytes[] calldata calls) external {
+        for (uint256 i; i < targets.length; ++i) {
+            (bool ok, bytes memory ret) = targets[i].call(calls[i]);
+            if (!ok) {
+                assembly ("memory-safe") {
+                    revert(add(ret, 0x20), mload(ret))
+                }
+            }
+        }
     }
 }

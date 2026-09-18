@@ -376,9 +376,13 @@ contract WoCoRegistrarTest is Test {
         vm.prank(dao);
         registrar.addSponsor(dao);
 
+        assertTrue(registry.registrars(address(registrar)));
         vm.prank(dao);
         registry.acceptAdmin();
         assertEq(registrar.owner(), dao);
+        // Ownership follows the seat; ENROLMENT does not (v2.2, audit 950
+        // Medium 3). The new admin re-enrols in its acceptance batch.
+        assertFalse(registry.registrars(address(registrar)), "the enrolment survived the handover");
 
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, admin));
         vm.prank(admin);
