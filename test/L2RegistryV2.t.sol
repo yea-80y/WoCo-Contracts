@@ -528,7 +528,8 @@ contract L2RegistryV2Test is Test {
         bytes[] memory data = new bytes[](1);
         data[0] = abi.encodeWithSignature("setContenthash(bytes32,bytes)", shop, SITE);
 
-        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
+        // v2.2 bubbles the inner reason (950 Low 6).
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, shop));
         vm.prank(holder);
         registry.createSubnode(venue, "shop", buyer, data);
         assertEq(registry.owner(shop), address(0));
@@ -744,18 +745,25 @@ contract L2RegistryV2Test is Test {
         _assertCannotWrite(approvee, node, "a revoked approvee");
     }
 
-    function test_Records_AMulticallCarriesNoAuthorityOfItsOwn() public {
+    /// v2.2 (audit 950): the public batch entry points are gone. Both
+    /// selectors reach no function, for a stranger and for the holder alike.
+    function test_Records_ThePublicMulticallEntryPointsAreGone() public {
         bytes32 node = _mint("venue", holder);
         bytes[] memory calls = new bytes[](1);
         calls[0] = abi.encodeWithSignature("setContenthash(bytes32,bytes)", node, OTHER);
 
-        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
-        vm.prank(stranger);
-        registry.multicall(calls);
-
-        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
-        vm.prank(stranger);
-        registry.multicallWithNodeCheck(node, calls);
+        address[2] memory callers = [stranger, holder];
+        for (uint256 i; i < callers.length; ++i) {
+            vm.prank(callers[i]);
+            (bool ok,) = address(registry).call(abi.encodeWithSelector(IMulticallable.multicall.selector, calls));
+            assertFalse(ok, "multicall(bytes[]) must not exist");
+            vm.prank(callers[i]);
+            (ok,) = address(registry).call(
+                abi.encodeWithSelector(IMulticallable.multicallWithNodeCheck.selector, node, calls)
+            );
+            assertFalse(ok, "multicallWithNodeCheck(bytes32,bytes[]) must not exist");
+        }
+        assertEq(registry.contenthash(node).length, 0);
     }
 
     /// Audit 924 F-18.
@@ -852,7 +860,7 @@ contract L2RegistryV2Test is Test {
         assertTrue(registry.supportsInterface(type(ITextResolver).interfaceId), "ITextResolver");
         assertTrue(registry.supportsInterface(type(IABIResolver).interfaceId), "IABIResolver");
         assertTrue(registry.supportsInterface(type(IVersionableResolver).interfaceId), "IVersionableResolver");
-        assertTrue(registry.supportsInterface(type(IMulticallable).interfaceId), "IMulticallable");
+        assertFalse(registry.supportsInterface(type(IMulticallable).interfaceId), "IMulticallable (v2.2 removed it)");
         assertTrue(registry.supportsInterface(type(IERC721).interfaceId), "IERC721");
         assertTrue(registry.supportsInterface(type(IERC165).interfaceId), "IERC165");
         assertFalse(registry.supportsInterface(0xffffffff), "the ERC-165 invalid id");

@@ -295,9 +295,10 @@ contract L2RegistryReleaseTest is Test {
     }
 
     /// The cleanup a parent's holder owes before releasing it: one `release`
-    /// per child, batched through the public `multicall`, which keeps the
-    /// caller (Fable sign-off F4). A stranger's same batch fails as a whole.
-    function test_Release_AParentClearsItsChildrenInOneMulticall() public {
+    /// per child, then the parent. v2.2 removed the public `multicall`, so an
+    /// EOA holder sends them one at a time; a smart account batches them in
+    /// its own user operation. A stranger is refused at the first.
+    function test_Release_AParentClearsItsChildrenOneCallAtATime() public {
         bytes32 venue = _register("venue", organiser);
         address childHolder = makeAddr("childHolder");
         bytes[] memory noData = new bytes[](0);
@@ -306,18 +307,20 @@ contract L2RegistryReleaseTest is Test {
         bytes32 bar = registry.createSubnode(venue, "bar", childHolder, noData);
         vm.stopPrank();
 
-        bytes[] memory calls = new bytes[](3);
-        calls[0] = abi.encodeCall(L2Registry.release, (shop));
-        calls[1] = abi.encodeCall(L2Registry.release, (bar));
-        calls[2] = abi.encodeCall(L2Registry.release, (venue));
-
-        vm.expectRevert(bytes("")); // Multicallable's bare `require(success)` drops the inner revert data
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, shop));
         vm.prank(stranger);
-        registry.multicall(calls);
-        assertEq(registry.owner(shop), childHolder, "a stranger's batch released something");
+        registry.release(shop);
+        assertEq(registry.owner(shop), childHolder, "a stranger released something");
 
+        vm.expectRevert(abi.encodeWithSelector(L2Registry.HasChildren.selector, venue, uint256(2)));
         vm.prank(organiser);
-        registry.multicall(calls);
+        registry.release(venue);
+
+        vm.startPrank(organiser);
+        registry.release(shop);
+        registry.release(bar);
+        registry.release(venue);
+        vm.stopPrank();
         assertEq(registry.owner(shop), address(0));
         assertEq(registry.owner(bar), address(0));
         assertEq(registry.owner(venue), address(0));
