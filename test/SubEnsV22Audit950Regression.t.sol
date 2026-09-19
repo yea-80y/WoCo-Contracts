@@ -653,6 +653,66 @@ contract SubEnsV22Audit950RegressionTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+        EACH LAYER ON ITS OWN. Delegation is refused twice over — the
+        public functions, and the internal writers and predicate behind
+        them — so removing one layer while the other stands changes
+        nothing a caller can see. These pin each layer directly, so a
+        later edit that drops one "because the other covers it" fails.
+    //////////////////////////////////////////////////////////////*/
+
+    /// `_isAuthorized` is holder-only even if an approval mapping were somehow
+    /// non-zero: plant one in storage and it is still ignored.
+    function test_Layer_isAuthorizedIgnoresAPlantedOperatorApproval() public {
+        bytes32 node = _mint("venue", holder);
+        bytes32 slot = keccak256(abi.encode(attacker, keccak256(abi.encode(holder, uint256(5)))));
+        vm.store(address(registry), slot, bytes32(uint256(1)));
+        assertTrue(registry.isApprovedForAll(holder, attacker), "premise: the plant reached _operatorApprovals");
+
+        _expectNotApproved(attacker, node);
+        vm.prank(attacker);
+        registry.transferFrom(holder, attacker, uint256(node));
+        assertEq(registry.owner(node), holder);
+    }
+
+    function test_Layer_isAuthorizedIgnoresAPlantedTokenApproval() public {
+        bytes32 node = _mint("venue", holder);
+        vm.store(address(registry), keccak256(abi.encode(uint256(node), uint256(4))), bytes32(uint256(uint160(attacker))));
+        assertEq(registry.getApproved(uint256(node)), attacker, "premise: the plant reached _tokenApprovals");
+
+        _expectNotApproved(attacker, node);
+        vm.prank(attacker);
+        registry.transferFrom(holder, attacker, uint256(node));
+
+        // The holder's own move still clears it, through the one `_approve`
+        // path that stays open.
+        vm.prank(holder);
+        registry.transferFrom(holder, buyer, uint256(node));
+        assertEq(registry.getApproved(uint256(node)), address(0));
+    }
+
+    /// The internal writers, reached directly through a test-only subclass.
+    function test_Layer_theInternalWritersRefuseOnTheirOwn() public {
+        ExposedL2Registry exposed = ExposedL2Registry(Clones.clone(address(new ExposedL2Registry())));
+        exposed.initialize("woco.eth", "WoCo Names", "", admin);
+        bytes32 base = exposed.baseNode();
+        bytes[] memory none = new bytes[](0);
+        vm.prank(admin);
+        bytes32 node = exposed.createSubnode(base, "venue", holder, none);
+
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
+        exposed.exposedApprove(attacker, uint256(node), holder, true);
+        exposed.exposedApprove(address(0), uint256(node), address(0), false); // the clear _update makes
+
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
+        exposed.exposedSetApprovalForAll(holder, attacker, true);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
+        exposed.exposedSetApprovalForAll(holder, attacker, false);
+
+        assertEq(exposed.getApproved(uint256(node)), address(0));
+        assertFalse(exposed.isApprovedForAll(holder, attacker));
+    }
+
+    /*//////////////////////////////////////////////////////////////
         A SALE STILL WORKS WITHOUT APPROVALS (owner's question,
         2026-09-18). The seller PUSHES the name into an escrow
         contract, which as the holder sends it on when paid. The escrow
@@ -765,5 +825,16 @@ contract ReturnsHugeAnswer {
         assembly {
             return(0, 600000)
         }
+    }
+}
+
+/// @dev Reaches the internal approval writers directly. Test-only.
+contract ExposedL2Registry is L2Registry {
+    function exposedApprove(address to, uint256 tokenId, address auth, bool emitEvent) external {
+        _approve(to, tokenId, auth, emitEvent);
+    }
+
+    function exposedSetApprovalForAll(address holder_, address operator, bool approved) external {
+        _setApprovalForAll(holder_, operator, approved);
     }
 }
