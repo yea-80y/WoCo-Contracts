@@ -947,9 +947,11 @@ contract SubEnsV21AuditRegressionTest is Test {
 
     /// The admin seat cannot reach the registry either: a nominee must call
     /// `acceptAdmin` itself, and the registry never calls out as itself. The
-    /// only self-call left is `createSubnode`'s batch, which keeps the caller
-    /// and refuses an item that does not name the new node — `acceptAdmin()`
-    /// names nothing, so it is refused before it runs.
+    /// only self-call left is `createSubnode`'s batch, which keeps the caller.
+    /// A bare `acceptAdmin()` is refused for its length; one padded with the
+    /// new node passes the node check and RUNS, as the caller, against
+    /// `acceptAdmin`'s own gate, so the registry still cannot take the seat
+    /// (951 F-5). Both shapes are asserted.
     function test_Self_TheSeatCannotBeAcceptedByTheRegistry() public {
         vm.prank(admin);
         registry.nominateAdmin(address(registry));
@@ -963,6 +965,11 @@ contract SubEnsV21AuditRegressionTest is Test {
         bytes[] memory data = new bytes[](1);
         data[0] = abi.encodeCall(L2Registry.acceptAdmin, ());
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.BatchNodeMismatch.selector, node));
+        vm.prank(bareRegistrar);
+        registry.createSubnode(base, "venue", bareRegistrar, data);
+
+        data[0] = abi.encodePacked(L2Registry.acceptAdmin.selector, node);
+        vm.expectRevert(abi.encodeWithSelector(L2Registry.NotPendingAdmin.selector, bareRegistrar));
         vm.prank(bareRegistrar);
         registry.createSubnode(base, "venue", bareRegistrar, data);
 
