@@ -15,17 +15,24 @@ import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
 import {UniversalSigValidatorFixture as Validator} from "./fixtures/UniversalSigValidatorFixture.sol";
 
 /**
- * Triage of LeftClaw jobs 951 (L2Registry / L2Resolver) and 952 (WoCoRegistrar),
- * both against `bc00d91`. Reports:
+ * Regression tests for LeftClaw jobs 951 (L2Registry / L2Resolver) and 952
+ * (WoCoRegistrar), both against `bc00d91`. Reports:
  * `~/projects/woco-571-handover/AUDIT_951_SUBENS_V22_REGISTRY.md` and
  * `AUDIT_952_SUBENS_V22_REGISTRAR.md`.
  *
- * Each test reproduces one claim AS THE AUDITOR STATED IT, written before any
- * ruling, so green means "the mechanism is real" and says nothing yet about
- * severity or whether to change anything. Where the report's own example or
- * proposed fix is wrong, the test shows that too.
+ * Began as `test/Audit951952Triage.t.sol` (commit `38823b8`): each test
+ * reproduces one claim AS THE AUDITOR STATED IT, written before any ruling,
+ * so green means "the mechanism is real", not that it matters. Where the
+ * report's own example or proposed fix is wrong, the test shows that too.
+ *
+ * Fable's ruling (`FABLE_951952_RULING_REPORT.md`, 2026-09-20): no contract
+ * change. Nothing here fails on `bc00d91`, by design: these tests pin what the
+ * frozen code does, including the two structural fixes the auditors proposed
+ * and the ruling refused because each hands out a veto (951 F-1's finality
+ * flag to the seat's chosen recipient, F-2's `childCount` gate to the seized
+ * name's child holder). The last five tests are Fable's, from that ruling.
  */
-contract Audit951952TriageTest is Test {
+contract SubEnsV22Audit951952RegressionTest is Test {
     L2Registry registry;
     WoCoRegistrar registrar;
     bytes32 base;
@@ -37,6 +44,7 @@ contract Audit951952TriageTest is Test {
     address infringer = makeAddr("infringer");
     address stranger = makeAddr("stranger");
     address buyer = makeAddr("buyer");
+    address bob = makeAddr("bob");
 
     uint256 constant HOLDER_KEY = 0xA11CE;
     address signer = vm.addr(HOLDER_KEY);
@@ -506,6 +514,105 @@ contract Audit951952TriageTest is Test {
         registry.release(n);
         _mint("alice", buyer);
         assertEq(registry.contenthash(n), "");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        Fable's ruling, 951 F-1 / F-2: why both structural fixes were
+        refused. Top-down terminates today; the auditor's bottom-up is
+        re-armed by the party it is meant to bind.
+    //////////////////////////////////////////////////////////////*/
+
+    /// Once the seat holds `p`, the infringer mints under nothing it no longer
+    /// holds, and every `parentTransfer` closes one more door. Its mint surface
+    /// only ever shrinks, so the unwind terminates.
+    function test_951_F2_topDownSeizureShrinksTheInfringersMintSurface() public {
+        bytes32 p = _mint("nike", infringer);
+        bytes32 c = _mintUnder(p, "shop", infringer);
+        bytes32 g = _mintUnder(c, "deep", infringer);
+
+        vm.prank(admin);
+        registry.adminTransfer(p, brand);
+
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, p));
+        vm.prank(infringer);
+        registry.createSubnode(p, "new", infringer, new bytes[](0));
+
+        vm.prank(infringer);
+        registry.createSubnode(c, "c1", infringer, new bytes[](0)); // still open
+
+        vm.prank(brand);
+        registry.parentTransfer(c, brand);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, c));
+        vm.prank(infringer);
+        registry.createSubnode(c, "c2", infringer, new bytes[](0)); // closed
+
+        vm.prank(infringer);
+        registry.createSubnode(g, "g1", infringer, new bytes[](0)); // still open
+        vm.prank(brand);
+        registry.parentTransfer(g, brand);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, g));
+        vm.prank(infringer);
+        registry.createSubnode(g, "g2", infringer, new bytes[](0)); // closed
+    }
+
+    /// The auditor's bottom-up (the `childCount` gate): while the infringer
+    /// holds `p`, a leaf the seat clears is replaced before the seat's next
+    /// step. The precondition the gate keys on is re-armed by the party it is
+    /// meant to bind.
+    function test_951_F2_bottomUpIsReArmedByTheInfringerWhileItHoldsTheParent() public {
+        bytes32 p = _mint("nike", infringer);
+        bytes32 c = _mintUnder(p, "shop", infringer);
+        vm.prank(admin);
+        registry.adminTransfer(c, brand);
+        vm.prank(brand);
+        registry.release(c);
+        assertEq(registry.childCount(p), 0);
+        _mintUnder(p, "shop", infringer);
+        assertEq(registry.childCount(p), 1, "re-armed");
+    }
+
+    /// The second undo the report names: the parent holder burns the seized
+    /// name and re-mints the label to itself.
+    function test_951_F1_theParentHolderCanAlsoBurnTheSeizedNameAndRemintIt() public {
+        bytes32 p = _mint("alice", alice);
+        bytes32 n = _mintUnder(p, "nike", alice);
+        vm.prank(admin);
+        registry.adminTransfer(n, brand);
+        vm.prank(alice);
+        registry.release(n);
+        assertEq(registry.owner(n), address(0));
+        _mintUnder(p, "nike", alice);
+        assertEq(registry.owner(n), alice);
+    }
+
+    /// A cooperative first-level holder is the enforcer beneath itself: it
+    /// hands a deep infringing name to the brand with no admin involved, and
+    /// the holder beneath is left with nothing above it.
+    function test_951_F1_theFirstLevelHolderEnforcesBeneathItself() public {
+        bytes32 p = _mint("alice", alice);
+        bytes32 q = _mintUnder(p, "shop", bob);
+        bytes32 n = _mintUnder(q, "nike", bob);
+        vm.startPrank(alice);
+        registry.parentTransfer(q, alice);
+        registry.parentTransfer(n, brand);
+        vm.stopPrank();
+        assertEq(registry.owner(n), brand);
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, n));
+        vm.prank(bob);
+        registry.parentTransfer(n, bob);
+    }
+
+    /// Why the finality flag was refused: `HasChildren` has no admin
+    /// exception, so a parent-immune seized child would pin its parent for as
+    /// long as the child's holder chooses. Shown on the code as it stands.
+    function test_951_F1_aParentWithALiveChildCannotBeReleased() public {
+        bytes32 p = _mint("alice", alice);
+        bytes32 n = _mintUnder(p, "nike", alice);
+        vm.prank(admin);
+        registry.adminTransfer(n, brand);
+        vm.expectRevert(abi.encodeWithSelector(L2Registry.HasChildren.selector, p, 1));
+        vm.prank(alice);
+        registry.release(p);
     }
 }
 
