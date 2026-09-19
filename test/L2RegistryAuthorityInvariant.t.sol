@@ -170,10 +170,17 @@ contract AuthorityHandler is Test {
         for (uint256 i; i < N; ++i) {
             Snap memory a = _snap(i);
             if (_hadAuthority(caller, i, before)) continue;
-            if (g.live && g.idx == i && grantBurned) {
+            if (g.live && grantBurned && _inSubtree(i, g.idx)) {
                 // The one signed burn, and a re-mint of the freed label by
                 // whoever may mint it: beneath the base name, the registrar.
-                if (a.holder == address(0) || (parentIdx[i] == 0 && caller == registrarActor)) continue;
+                if (i == g.idx && (a.holder == address(0) || (parentIdx[i] == 0 && caller == registrarActor))) continue;
+                // ...which then HOLDS it, and may create beneath it what nobody
+                // held when the transaction began. A grant is only made over a
+                // name with nothing beneath it, so that is every name below:
+                // this admits creation of the unheld, never a move of the held.
+                if (i != g.idx && parentIdx[g.idx] == 0 && caller == registrarActor && before[i].holder == address(0)) {
+                    continue;
+                }
             }
             if (a.holder != before[i].holder) _violate("a non-authority moved or burned a name", i);
             else if (a.version != before[i].version) _violate("a name came back to its holder with its records gone", i);
@@ -575,6 +582,16 @@ contract AuthorityHandler is Test {
             if (m == 0) break; // the base name's holder is the admin, handled above
         }
         return false;
+    }
+
+    /// Whether name `i` is `root` or lies beneath it.
+    function _inSubtree(uint256 i, uint256 root) internal view returns (bool) {
+        uint256 m = i;
+        while (true) {
+            if (m == root) return true;
+            if (m == 0) return false;
+            m = parentIdx[m];
+        }
     }
 
     function _parentHolderLive(uint256 i) internal view returns (address) {
