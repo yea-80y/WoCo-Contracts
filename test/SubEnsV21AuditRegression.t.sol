@@ -125,10 +125,9 @@ contract SubEnsV21AuditRegressionTest is Test {
     }
 
     function _register30(address to, string memory prefix) internal {
-        string[] memory keys = new string[](0);
         for (uint256 i; i < 30; ++i) {
             vm.prank(sponsor);
-            registrar.register(string.concat(prefix, vm.toString(i)), to, SITE, keys, keys);
+            registrar.register(string.concat(prefix, vm.toString(i)), to);
         }
     }
 
@@ -496,14 +495,16 @@ contract SubEnsV21AuditRegressionTest is Test {
         registry.setContenthash(node, SITE);
         vm.stopPrank();
 
-        string[] memory keys = new string[](0);
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.LabelIsReserved.selector, "app"));
         vm.prank(sponsor);
-        registrar.register("app", stranger, SITE, keys, keys);
+        registrar.register("app", stranger);
 
+        // v2.2: the only pointer write is the holder-signed one, and it refuses
+        // a reserved label before it looks at any signature.
+        uint256 expiration = block.timestamp + 10 minutes;
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.LabelIsReserved.selector, "app"));
         vm.prank(sponsor);
-        registrar.setContenthash("app", EVIL);
+        registrar.setContenthashWithSignature("app", EVIL, expiration, hex"00");
         assertEq(registry.contenthash(node), SITE, "the sponsor repointed a reserved name");
     }
 
@@ -521,15 +522,14 @@ contract SubEnsV21AuditRegressionTest is Test {
         assertEq(remaining, 0, "tightening refunded the allowance");
         assertEq(resetsAt, uint64(T0 + 30 days), "the open window's end moved");
 
-        string[] memory keys = new string[](0);
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, holder, uint64(T0 + 30 days)));
         vm.prank(sponsor);
-        registrar.register("thirty-first", holder, SITE, keys, keys);
+        registrar.register("thirty-first", holder);
 
         // The window ends when it was opened to end; the next one is 1 day long.
         vm.warp(T0 + 30 days);
         vm.prank(sponsor);
-        registrar.register("thirty-first", holder, SITE, keys, keys);
+        registrar.register("thirty-first", holder);
         (uint64 end,) = registrar.mintWindow(holder);
         assertEq(end, uint64(T0 + 31 days));
     }
@@ -537,11 +537,10 @@ contract SubEnsV21AuditRegressionTest is Test {
     function test_F12_theOwnerCanGiveASpentAllowanceBack() public {
         _register30(holder, "junk-");
 
-        string[] memory keys = new string[](0);
         (, uint64 resetsAt) = registrar.mintAllowance(holder);
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, holder, resetsAt));
         vm.prank(sponsor);
-        registrar.register("the-one-they-wanted", holder, SITE, keys, keys);
+        registrar.register("the-one-they-wanted", holder);
 
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, sponsor));
         vm.prank(sponsor);
@@ -553,7 +552,7 @@ contract SubEnsV21AuditRegressionTest is Test {
         assertEq(remaining, 30);
 
         vm.prank(sponsor);
-        registrar.register("the-one-they-wanted", holder, SITE, keys, keys);
+        registrar.register("the-one-they-wanted", holder);
         assertEq(registry.owner(registry.makeNode(registry.baseNode(), "the-one-they-wanted")), holder);
     }
 
@@ -564,9 +563,8 @@ contract SubEnsV21AuditRegressionTest is Test {
         vm.prank(holder);
         registry.release(node);
 
-        string[] memory keys = new string[](0);
         vm.prank(sponsor);
-        registrar.register("name-0", holder, SITE, keys, keys); // the previous holder can...
+        registrar.register("name-0", holder); // the previous holder can...
         assertEq(registry.owner(node), holder, "the holder could not take its own label back");
         (, uint32 count) = registrar.mintWindow(holder);
         assertEq(count, 30, "taking one's own label back cost a mint");
@@ -575,16 +573,16 @@ contract SubEnsV21AuditRegressionTest is Test {
         (, uint64 resetsAt) = registrar.mintAllowance(holder);
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, holder, resetsAt));
         vm.prank(sponsor);
-        registrar.register("brand-new", holder, SITE, keys, keys);
+        registrar.register("brand-new", holder);
 
         bytes32 buyersOld = registry.makeNode(base, "buyers-old");
         vm.prank(sponsor);
-        registrar.register("buyers-old", buyer, SITE, keys, keys);
+        registrar.register("buyers-old", buyer);
         vm.prank(buyer);
         registry.release(buyersOld);
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.MintRateCapExceeded.selector, holder, resetsAt));
         vm.prank(sponsor);
-        registrar.register("buyers-old", holder, SITE, keys, keys);
+        registrar.register("buyers-old", holder);
     }
 
     /*//////////////////////////////////////////////////////////////

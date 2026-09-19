@@ -141,10 +141,9 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
 
         bytes32 base = registry.baseNode();
         address organiser = makeAddr("organiser");
-        string[] memory none = new string[](0);
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, base));
         vm.prank(SCRIPT_SPONSOR);
-        WoCoRegistrar(registrarAddr).register("venue", organiser, hex"e301", none, none);
+        WoCoRegistrar(registrarAddr).register("venue", organiser);
     }
 
     /// The printed calldata is exactly what the Safe sends, and it works.
@@ -153,9 +152,8 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         _wire(registryAddr, registrarAddr);
 
         address organiser = makeAddr("organiser");
-        string[] memory none = new string[](0);
         vm.prank(SCRIPT_SPONSOR);
-        bytes32 node = WoCoRegistrar(registrarAddr).register("venue", organiser, hex"e301", none, none);
+        bytes32 node = WoCoRegistrar(registrarAddr).register("venue", organiser);
         assertEq(L2Registry(registryAddr).owner(node), organiser);
     }
 
@@ -167,9 +165,8 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
 
         address organiser = makeAddr("organiser");
         address claimant = makeAddr("claimant");
-        string[] memory none = new string[](0);
         vm.prank(SCRIPT_SPONSOR);
-        bytes32 node = WoCoRegistrar(registrarAddr).register("venue", organiser, hex"e301", none, none);
+        bytes32 node = WoCoRegistrar(registrarAddr).register("venue", organiser);
 
         vm.prank(address(safe));
         registry.adminTransfer(node, claimant);

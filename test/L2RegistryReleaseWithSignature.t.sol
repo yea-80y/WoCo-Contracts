@@ -69,14 +69,15 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         vm.warp(NOW);
     }
 
+    /// A bare sponsored mint, then the HOLDER writes its own records — the
+    /// registrar no longer writes records at mint (sponsor-key consult).
     function _register(string memory label, address owner_) internal returns (bytes32 node) {
-        string[] memory keys = new string[](1);
-        string[] memory vals = new string[](1);
-        keys[0] = "url";
-        vals[0] = "https://old-holder.example";
         vm.prank(sponsor);
-        registrar.register(label, owner_, SWARM_HASH, keys, vals);
-        node = registry.makeNode(registry.baseNode(), label);
+        node = registrar.register(label, owner_);
+        vm.startPrank(owner_);
+        registry.setContenthash(node, SWARM_HASH);
+        registry.setText(node, "url", "https://old-holder.example");
+        vm.stopPrank();
     }
 
     function _sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
@@ -414,7 +415,7 @@ contract L2RegistryReleaseWithSignatureTest is Test {
         vm.prank(admin);
         other.addRegistrar(address(otherRegistrar));
         vm.prank(sponsor);
-        otherRegistrar.register("venue", holder, SWARM_HASH, new string[](0), new string[](0));
+        otherRegistrar.register("venue", holder);
         assertEq(other.owner(node), holder, "precondition: same node, same holder, other registry");
         assertEq(other.recordVersions(node), registry.recordVersions(node), "precondition: same record version");
 

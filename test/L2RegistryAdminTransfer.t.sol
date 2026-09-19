@@ -52,12 +52,13 @@ contract L2RegistryAdminTransferTest is Test {
         registry.addRegistrar(address(registrar));
     }
 
+    /// A bare sponsored mint, then the HOLDER points the name at its site —
+    /// the registrar no longer writes records at mint (sponsor-key consult).
     function _register(string memory label, address owner_) internal returns (bytes32 node) {
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.prank(sponsor);
-        registrar.register(label, owner_, SWARM_HASH, keys, vals);
-        node = registry.makeNode(registry.baseNode(), label);
+        node = registrar.register(label, owner_);
+        vm.prank(owner_);
+        registry.setContenthash(node, SWARM_HASH);
     }
 
     // ── The power works ───────────────────────────────────────────────────────
@@ -189,11 +190,9 @@ contract L2RegistryAdminTransferTest is Test {
     function test_AdminTransfer_DoesNotEnableMintingOverALiveName() public {
         _register("venue", organiser);
 
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.expectRevert();
         vm.prank(sponsor);
-        registrar.register("venue", claimant, SWARM_HASH, keys, vals);
+        registrar.register("venue", claimant);
     }
 
     /// After reassignment the previous holder has no residual control.
@@ -260,14 +259,10 @@ contract L2RegistryAdminTransferTest is Test {
     /// Records cleared must mean ALL record types, not just the contenthash —
     /// the address records are the money-relevant ones.
     function test_AdminTransfer_ClearsAddrAndTextNotJustContenthash() public {
-        string[] memory keys = new string[](1);
-        string[] memory vals = new string[](1);
-        keys[0] = "url";
-        vals[0] = "https://squatter.example";
-
         vm.prank(sponsor);
-        registrar.register("venue", organiser, SWARM_HASH, keys, vals);
-        bytes32 node = registry.makeNode(registry.baseNode(), "venue");
+        bytes32 node = registrar.register("venue", organiser);
+        vm.prank(organiser);
+        registry.setText(node, "url", "https://squatter.example");
 
         assertEq(registry.addr(node), organiser, "precondition: addr set at mint");
         assertEq(registry.text(node, "url"), "https://squatter.example");

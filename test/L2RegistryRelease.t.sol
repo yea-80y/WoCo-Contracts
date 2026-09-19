@@ -60,14 +60,15 @@ contract L2RegistryReleaseTest is Test {
         vm.warp(1_800_000_000);
     }
 
+    /// A bare sponsored mint, then the HOLDER writes its own records — the
+    /// registrar no longer writes records at mint (sponsor-key consult).
     function _register(string memory label, address owner_) internal returns (bytes32 node) {
-        string[] memory keys = new string[](1);
-        string[] memory vals = new string[](1);
-        keys[0] = "url";
-        vals[0] = "https://old-holder.example";
         vm.prank(sponsor);
-        registrar.register(label, owner_, SWARM_HASH, keys, vals);
-        node = registry.makeNode(registry.baseNode(), label);
+        node = registrar.register(label, owner_);
+        vm.startPrank(owner_);
+        registry.setContenthash(node, SWARM_HASH);
+        registry.setText(node, "url", "https://old-holder.example");
+        vm.stopPrank();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -350,32 +351,33 @@ contract L2RegistryReleaseTest is Test {
         vm.prank(organiser);
         registry.release(node);
 
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.prank(sponsor);
-        bytes32 reminted = registrar.register("venue", stranger, OTHER_HASH, keys, vals);
+        bytes32 reminted = registrar.register("venue", stranger);
 
         assertEq(reminted, node, "same label, same node");
         assertEq(registry.owner(node), stranger, "re-mint did not land");
-        assertEq(registry.contenthash(node), OTHER_HASH, "new holder's site not set");
+        assertEq(registry.contenthash(node).length, 0, "the re-mint carried a pointer");
+        vm.prank(stranger);
+        registry.setContenthash(node, OTHER_HASH);
+        assertEq(registry.contenthash(node), OTHER_HASH, "the new holder could not point its name");
         assertEq(registry.names(node), nameBefore, "names[node] changed across a release + re-mint");
         assertEq(registry.totalSupply(), 2, "totalSupply drifted across release + re-mint");
     }
 
     /// The re-minter must not inherit anything the previous holder wrote. The
-    /// registrar overwrites addr + contenthash on mint, so the TEXT record is
-    /// the one that would leak — it is exactly what the version bump exists for.
+    /// registrar rewrites only the address records at mint (v2.2), so the
+    /// contenthash AND the text records would leak — exactly what the version
+    /// bump exists for.
     function test_Release_ReMintDoesNotInheritThePreviousHoldersRecords() public {
         bytes32 node = _register("venue", organiser);
         vm.prank(organiser);
         registry.release(node);
 
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.prank(sponsor);
-        registrar.register("venue", stranger, OTHER_HASH, keys, vals);
+        registrar.register("venue", stranger);
 
         assertEq(registry.text(node, "url"), "", "new holder inherited the old text record");
+        assertEq(registry.contenthash(node).length, 0, "new holder inherited the old site pointer");
         assertEq(registry.addr(node, 60), abi.encodePacked(stranger), "addr(60) is not the new holder");
     }
 
@@ -387,10 +389,8 @@ contract L2RegistryReleaseTest is Test {
         registry.release(node);
         (, uint64 at) = registry.lastRelease(node);
 
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.prank(sponsor);
-        registrar.register("venue", stranger, OTHER_HASH, keys, vals);
+        registrar.register("venue", stranger);
 
         (address by, uint64 atAfter) = registry.lastRelease(node);
         assertEq(by, organiser, "history was cleared by the re-mint");
@@ -466,10 +466,8 @@ contract L2RegistryReleaseTest is Test {
         assertEq(registry.childCount(venue), 0);
 
         // Re-mint the parent to someone else: nothing hangs beneath it.
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.prank(sponsor);
-        registrar.register("venue", stranger, SWARM_HASH, keys, vals);
+        registrar.register("venue", stranger);
         assertEq(registry.owner(shop), address(0), "a child outlived its parent");
         assertEq(registry.contenthash(shop).length, 0, "a child's records outlived it");
 

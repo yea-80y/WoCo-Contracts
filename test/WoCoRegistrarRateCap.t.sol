@@ -60,10 +60,8 @@ contract WoCoRegistrarRateCapTest is Test {
     }
 
     function _mintAs(address by, string memory label, address to) internal returns (bytes32) {
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.prank(by);
-        return registrar.register(label, to, SWARM_HASH, keys, vals);
+        return registrar.register(label, to);
     }
 
     function _mintN(address to, uint256 n, uint256 seed) internal {

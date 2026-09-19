@@ -59,7 +59,7 @@ contract SubEnsV22Audit950RegressionTest is Test {
 
     function _mint(string memory label, address to) internal returns (bytes32) {
         vm.prank(sponsor);
-        return registrar.register(label, to, "", new string[](0), new string[](0));
+        return registrar.register(label, to);
     }
 
     function _mintUnder(bytes32 parent, string memory label, address to) internal returns (bytes32 node) {
@@ -287,7 +287,7 @@ contract SubEnsV22Audit950RegressionTest is Test {
 
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, base));
         vm.prank(sponsor);
-        registrar.register("next", holder, "", new string[](0), new string[](0));
+        registrar.register("next", holder);
 
         // The holder's own writes never depended on a registrar.
         vm.prank(holder);
@@ -488,7 +488,7 @@ contract SubEnsV22Audit950RegressionTest is Test {
         bytes32 base = registry.baseNode();
         vm.expectRevert(abi.encodeWithSelector(L2Registry.NotAvailable.selector, "venue", base));
         vm.prank(sponsor);
-        registrar.register("venue", attacker, "", new string[](0), new string[](0));
+        registrar.register("venue", attacker);
     }
 
     /// Unchanged, and by design (the owner's fusion decision, 2026-09-17): a

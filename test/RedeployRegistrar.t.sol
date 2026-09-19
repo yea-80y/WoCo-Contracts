@@ -67,10 +67,9 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
 
         bytes32 base = registry.baseNode();
         address organiser = makeAddr("organiser");
-        string[] memory none = new string[](0);
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, base));
         vm.prank(sponsor);
-        registrar.register("myvenue", organiser, hex"e301", none, none);
+        registrar.register("myvenue", organiser);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -78,13 +77,14 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
     //////////////////////////////////////////////////////////////*/
 
     /// The whole point of the batch: afterwards the new registrar mints, and the
-    /// previous one can neither mint nor repoint — through its sponsor or the
-    /// registry.
+    /// previous one can neither mint nor repoint — not through its sponsor, and
+    /// not even with the holder's own signature, because the registry no longer
+    /// enrols it.
     function test_Redeploy_TheBatchSwapsTheRegistrarIn() public {
         // The previous registrar is live and has minted a name.
-        string[] memory none = new string[](0);
+        (address oldHolder, uint256 oldHolderKey) = makeAddrAndKey("old-holder");
         vm.prank(sponsor);
-        previous.register("oldname", makeAddr("old-holder"), hex"e301", none, none);
+        bytes32 oldNode = previous.register("oldname", oldHolder);
 
         RedeployRegistrar script = new WithInputs(address(previous));
         WoCoRegistrar next = WoCoRegistrar(script.run());
@@ -92,7 +92,7 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
 
         address organiser = makeAddr("organiser");
         vm.prank(sponsor);
-        bytes32 node = next.register("myvenue", organiser, hex"e301", none, none);
+        bytes32 node = next.register("myvenue", organiser);
         assertEq(registry.owner(node), organiser, "the new registrar cannot mint");
 
         assertFalse(registry.registrars(address(previous)), "the previous registrar is still enrolled");
@@ -100,7 +100,12 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
 
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotAuthorisedSponsor.selector, sponsor));
         vm.prank(sponsor);
-        previous.setContenthash("oldname", hex"e302");
+        previous.register("another", organiser);
+
+        uint256 expiration = block.timestamp + 10 minutes;
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(oldHolderKey, previous.setContenthashDigest(oldNode, hex"e302", expiration));
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, oldNode));
+        previous.setContenthashWithSignature("oldname", hex"e302", expiration, abi.encodePacked(r, s, v));
     }
 
     /// Enrolment first, so that at no point in the batch is nothing enrolled;

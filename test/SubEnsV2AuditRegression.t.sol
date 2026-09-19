@@ -59,11 +59,15 @@ contract SubEnsV2AuditRegressionTest is Test {
         vm.warp(NOW);
     }
 
+    /// A bare sponsored mint; a site pointer, when given, is then written by
+    /// the HOLDER — the registrar no longer writes records at mint.
     function _register(string memory label, address owner_, bytes memory ch) internal returns (bytes32 node) {
-        string[] memory none = new string[](0);
         vm.prank(sponsor);
-        registrar.register(label, owner_, ch, none, none);
-        node = registry.makeNode(registry.baseNode(), label);
+        node = registrar.register(label, owner_);
+        if (ch.length > 0) {
+            vm.prank(owner_);
+            registry.setContenthash(node, ch);
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -204,9 +208,12 @@ contract SubEnsV2AuditRegressionTest is Test {
     function test_927H2_nothingCanBeSeededOnAnUnmintedLabel() public {
         bytes32 node = registry.makeNode(registry.baseNode(), "future");
 
+        // v2.2: the registrar's only pointer write is holder-signed, and it
+        // refuses an unminted label by name before it looks at a signature.
+        uint256 expiration = block.timestamp + 10 minutes;
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.LabelNotRegistered.selector, "future"));
         vm.prank(sponsor);
-        registrar.setContenthash("future", OTHER);
+        registrar.setContenthashWithSignature("future", OTHER, expiration, hex"00");
 
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, node));
         vm.prank(address(registrar));
@@ -277,39 +284,36 @@ contract SubEnsV2AuditRegressionTest is Test {
 
     /// v1: `_safeMint` called the recipient, which released the name; the
     /// registrar's records landed on the freed label for the next registrant.
-    /// Now nothing calls the recipient: it keeps the name, with its records.
+    /// Now nothing calls the recipient: it keeps the name, with the only
+    /// records a v2.2 mint writes — its own address.
     function test_927H3_theRecipientIsNotCalledSoCannotReleaseMidMint() public {
         ReleasesOnReceive receiver = new ReleasesOnReceive(registry);
-        string[] memory keys = new string[](1);
-        string[] memory vals = new string[](1);
-        keys[0] = "avatar";
-        vals[0] = "chosen-by-first-recipient";
 
         vm.prank(sponsor);
-        registrar.register("coolbrand", address(receiver), OTHER, keys, vals);
+        registrar.register("coolbrand", address(receiver));
         bytes32 node = registry.makeNode(registry.baseNode(), "coolbrand");
 
         assertEq(receiver.calls(), 0, "the recipient was called during the mint");
         assertEq(registry.owner(node), address(receiver));
         assertFalse(registrar.available("coolbrand"));
-        assertEq(registry.contenthash(node), OTHER);
-        assertEq(registry.text(node, "avatar"), "chosen-by-first-recipient");
+        assertEq(registry.addr(node), address(receiver));
+        assertEq(registry.contenthash(node).length, 0, "the registrar wrote a pointer at mint");
     }
 
     /// And when that holder does release, later, the next registrant of the
     /// label starts from empty records.
     function test_927H3_aReleasedLabelsNextRegistrantStartsClean() public {
         ReleasesOnReceive receiver = new ReleasesOnReceive(registry);
-        string[] memory keys = new string[](1);
-        string[] memory vals = new string[](1);
-        keys[0] = "avatar";
-        vals[0] = "chosen-by-first-recipient";
         vm.prank(sponsor);
-        registrar.register("coolbrand", address(receiver), OTHER, keys, vals);
+        registrar.register("coolbrand", address(receiver));
         bytes32 node = registry.makeNode(registry.baseNode(), "coolbrand");
 
-        vm.prank(address(receiver));
+        // The first holder writes its own records, then lets the name go.
+        vm.startPrank(address(receiver));
+        registry.setContenthash(node, OTHER);
+        registry.setText(node, "avatar", "chosen-by-first-recipient");
         registry.release(node);
+        vm.stopPrank();
 
         _register("coolbrand", victim, "");
         assertEq(registry.owner(node), victim);
