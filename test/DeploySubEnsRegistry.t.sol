@@ -393,6 +393,22 @@ contract DeploySubEnsRegistryTest is ScriptEnvFixture {
         bad.run();
     }
 
+    /// Clause 6, the regression that matters for THIS redeploy: v2.1 as it
+    /// stands at 7dc5638 — every earlier probe answers as ours does — still
+    /// delegating. A deploy from the v2.1 branch lands here.
+    function test_Tripwire_RejectsAV21ShapedImplementation() public {
+        ClonesV21Shape bad = new ClonesV21Shape();
+        vm.expectRevert("registry implementation still delegates - it is not the v2.2 bytecode");
+        bad.run();
+    }
+
+    /// Clause 6, the other half: approvals refused, the public batch kept.
+    function test_Tripwire_RejectsAnImplementationThatStillAnswersMulticall() public {
+        ClonesStillAnswersMulticall bad = new ClonesStillAnswersMulticall();
+        vm.expectRevert("registry implementation still answers multicall - it is not the v2.2 bytecode");
+        bad.run();
+    }
+
     /// Clause 3's signature probe must reach the body: an implementation that
     /// refuses every expiration as too far — so never gets past its modifier —
     /// is not answering as ours does.
@@ -753,6 +769,32 @@ contract ClonesRefusesEveryExpiration is DeploySubEnsRegistry {
     }
 }
 
+contract ClonesV21Shape is DeploySubEnsRegistry {
+    function _deploy(string memory parentName, address admin, address, string[] memory)
+        internal
+        override
+        returns (address registryAddr, address implAddr, address registrarAddr)
+    {
+        implAddr = address(new V21ShapedRegistry());
+        registryAddr = Clones.clone(implAddr);
+        V21ShapedRegistry(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+        registrarAddr = address(0);
+    }
+}
+
+contract ClonesStillAnswersMulticall is DeploySubEnsRegistry {
+    function _deploy(string memory parentName, address admin, address, string[] memory)
+        internal
+        override
+        returns (address registryAddr, address implAddr, address registrarAddr)
+    {
+        implAddr = address(new StillAnswersMulticall());
+        registryAddr = Clones.clone(implAddr);
+        StillAnswersMulticall(registryAddr).initialize(parentName, "WoCo Names", "", admin);
+        registrarAddr = address(0);
+    }
+}
+
 contract ClonesStillAnswersNonces is DeploySubEnsRegistry {
     function _deploy(string memory parentName, address admin, address, string[] memory)
         internal
@@ -947,6 +989,47 @@ contract RefusesEveryExpiration is ReleaseOnlyRegistry {
 
     function parentTransfer(bytes32 node, address) external pure {
         revert ParentTransferUnregistered(node);
+    }
+}
+
+/// @dev v2.1 as it stands at 7dc5638: every v2.1 probe answers as ours does;
+///      `approve` refuses the probe name the OpenZeppelin way (it does not
+///      exist), and the inherited `multicall` answers an empty batch.
+contract V21ShapedRegistry is ReleaseOnlyRegistry {
+    error NotPendingAdmin(address caller);
+    error ExpirationTooFar();
+    error ParentTransferUnregistered(bytes32 node);
+    error ERC721NonexistentToken(uint256 tokenId);
+
+    function releaseWithSignature(bytes32 node, uint256 expiration, address, bytes calldata) external view {
+        if (expiration > block.timestamp + 48 hours) revert ExpirationTooFar();
+        revert ReleaseUnregistered(node);
+    }
+
+    function acceptAdmin() external view {
+        revert NotPendingAdmin(msg.sender);
+    }
+
+    function parentTransfer(bytes32 node, address) external pure {
+        revert ParentTransferUnregistered(node);
+    }
+
+    function approve(address, uint256 tokenId) external pure virtual {
+        revert ERC721NonexistentToken(tokenId);
+    }
+
+    function multicall(bytes[] calldata data) external pure returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+    }
+}
+
+/// @dev v2.1 with approvals refused as v2.2 refuses them — and the public
+///      batch still there.
+contract StillAnswersMulticall is V21ShapedRegistry {
+    error DelegationNotSupported();
+
+    function approve(address, uint256) external pure override {
+        revert DelegationNotSupported();
     }
 }
 

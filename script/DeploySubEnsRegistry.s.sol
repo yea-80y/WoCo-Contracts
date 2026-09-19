@@ -207,7 +207,7 @@ contract DeploySubEnsRegistry is Script {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Refuses to continue unless the registry about to go live executes
-    ///         the v2.1 `L2Registry` source in THIS repo.
+    ///         the v2.2 `L2Registry` source in THIS repo.
     ///
     /// @dev Independent checks, because one is not enough to survive a careless
     ///      edit:
@@ -235,6 +235,11 @@ contract DeploySubEnsRegistry is Script {
     ///        (5) v2.1, NOT v2 — a release signature expiring at the end of
     ///            time is refused as too far ahead, which v2 never checked, and
     ///            `parentTransfer` answers with its own error.
+    ///
+    ///        (6) v2.2, NOT v2.1 — `approve` answers with v2.2's own error
+    ///            (v2.1 refused it on the implementation only because the probe
+    ///            name does not exist), and `multicall`, which v2.1 inherited
+    ///            and answered for an empty batch, does not exist at all.
     ///
     ///      If a WoCo function is ever removed from `L2Registry`, its probe must
     ///      be re-pointed at whatever replaces it; deleting the probe is not the
@@ -313,6 +318,19 @@ contract DeploySubEnsRegistry is Script {
                 L2Registry.ParentTransferUnregistered.selector
             ),
             "registry implementation does not run v2.1's parentTransfer - it is not the v2.1 bytecode"
+        );
+        // v2.2 (audit 950): no ERC-721 delegation, and no public batch.
+        require(
+            _revertsWith(
+                implAddr,
+                abi.encodeWithSignature("approve(address,uint256)", address(1), uint256(PROBE_NODE)),
+                L2Registry.DelegationNotSupported.selector
+            ),
+            "registry implementation still delegates - it is not the v2.2 bytecode"
+        );
+        require(
+            _revertsEmpty(implAddr, abi.encodeWithSignature("multicall(bytes[])", new bytes[](0))),
+            "registry implementation still answers multicall - it is not the v2.2 bytecode"
         );
     }
 
