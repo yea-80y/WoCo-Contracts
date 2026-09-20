@@ -44,7 +44,7 @@ contract SubEnsV2CutoverForkTest is Test {
     address constant NABIL = 0x73478eb498679DB88E2C2A72C38f81f8861f8C75;
     address constant TEST = 0xeA1478b3818F3a06B83ceB7Ec6f710a51115D879;
     bytes constant NABIL_SITE = hex"e40101fa011b20d66c6ff7650a468c2fd98439c8f04547b5b8a4b933d349ff16db1d0b00c23adc";
-    bytes constant TEST_SITE = hex"e40101fa011b206a20bc33c1b52baf70c847a0d13f0da83e286c6cb9f9059009332886e1cacf9a";
+    bytes constant TEST_SITE = hex"e40101fa011b20eb869cf3a4481315dfb675c022a26e843aa128ac00a8649754b401c9301ceacc";
 
     function test_fork_cutoverEndToEnd() public {
         string memory arbRpc = vm.envOr("ARB_ONE_RPC_URL", string(""));
