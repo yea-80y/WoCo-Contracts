@@ -40,7 +40,7 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
     /// repo — used as-is for the G9 happy path so no fixture file has to be forged
     /// for it.
     uint64 constant L2_CHAIN_ID = 421614;
-    address constant L2_REGISTRY_ADDRESS = 0x145f9771186844c16AD63e56513b103A5331923c;
+    address constant L2_REGISTRY_ADDRESS = 0xAf3124EE7360c7B9FD06311102f635392da44886;
     string constant DEPLOYMENT_RECORD = "deployments/421614-subens.json";
 
     MockENS ens;

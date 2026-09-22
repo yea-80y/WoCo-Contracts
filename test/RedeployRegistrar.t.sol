@@ -13,10 +13,11 @@ import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
  * Tests for the registrar redeploy script.
  *
  * Redeploying the registrar is the ROUTINE operation — the registry is frozen,
- * so every policy change ships this way. The v2 script owns the new registrar by
- * the Safe from construction, never wires it (no deployer key can), and prints
- * the Safe batch that enrols it AND retires the previous registrar — the step v1
- * only reminded the operator about (audit 927 M2).
+ * so every policy change ships this way. The script never wires the new
+ * registrar (no deployer key can), and prints the Safe batch that enrols it AND
+ * retires the previous registrar — the step v1 only reminded the operator about
+ * (audit 927 M2). Since v2.1 the new registrar has no owner of its own: it
+ * answers to the registry's admin, so there is no owner input to get wrong.
  */
 contract RedeployRegistrarTest is ScriptEnvFixture {
     L2Registry registry;
@@ -31,7 +32,7 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
 
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", address(safe));
-        previous = new WoCoRegistrar(address(registry), address(safe), sponsor, new string[](0));
+        previous = new WoCoRegistrar(address(registry), sponsor, new string[](0));
         vm.prank(address(safe));
         registry.addRegistrar(address(previous));
 
@@ -40,21 +41,19 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
         // `_config()` override instead, never through the environment.
         _setSharedScriptEnv();
         vm.setEnv("L2_REGISTRY_ADDRESS", vm.toString(address(registry)));
-        vm.setEnv("REGISTRAR_ADMIN", vm.toString(address(safe)));
     }
 
     /*//////////////////////////////////////////////////////////////
-                    THE SAFE OWNS IT; THE SCRIPT WIRES NOTHING
+          THE REGISTRY'S ADMIN OWNS IT; THE SCRIPT WIRES NOTHING
     //////////////////////////////////////////////////////////////*/
 
     /// Read through the real environment, so the env wiring is exercised once.
-    function test_Redeploy_TheSafeOwnsTheNewRegistrarFromConstruction() public {
+    function test_Redeploy_TheRegistryAdminOwnsTheNewRegistrar() public {
         uint64 nonceBefore = vm.getNonce(deployer);
         WoCoRegistrar registrar = WoCoRegistrar(new RedeployRegistrar().run());
 
         assertEq(vm.getNonce(deployer), nonceBefore + 1, "the redeploy sent more than one transaction");
         assertEq(registrar.owner(), address(safe));
-        assertEq(registrar.pendingOwner(), address(0));
         assertEq(address(registrar.registry()), address(registry));
         assertTrue(registrar.authorisedSponsors(sponsor), "sponsor not authorised");
         assertFalse(registrar.available("admin"), "reserved label is mintable");
@@ -68,10 +67,9 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
 
         bytes32 base = registry.baseNode();
         address organiser = makeAddr("organiser");
-        string[] memory none = new string[](0);
         vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, base));
         vm.prank(sponsor);
-        registrar.register("myvenue", organiser, hex"e301", none, none);
+        registrar.register("myvenue", organiser);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -79,21 +77,22 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
     //////////////////////////////////////////////////////////////*/
 
     /// The whole point of the batch: afterwards the new registrar mints, and the
-    /// previous one can neither mint nor repoint — through its sponsor or the
-    /// registry.
+    /// previous one can neither mint nor repoint — not through its sponsor, and
+    /// not even with the holder's own signature, because the registry no longer
+    /// enrols it.
     function test_Redeploy_TheBatchSwapsTheRegistrarIn() public {
         // The previous registrar is live and has minted a name.
-        string[] memory none = new string[](0);
+        (address oldHolder, uint256 oldHolderKey) = makeAddrAndKey("old-holder");
         vm.prank(sponsor);
-        previous.register("oldname", makeAddr("old-holder"), hex"e301", none, none);
+        bytes32 oldNode = previous.register("oldname", oldHolder);
 
-        RedeployRegistrar script = new WithInputs(address(safe), address(previous));
+        RedeployRegistrar script = new WithInputs(address(previous));
         WoCoRegistrar next = WoCoRegistrar(script.run());
         _executeAsSafe(script, address(next), address(previous));
 
         address organiser = makeAddr("organiser");
         vm.prank(sponsor);
-        bytes32 node = next.register("myvenue", organiser, hex"e301", none, none);
+        bytes32 node = next.register("myvenue", organiser);
         assertEq(registry.owner(node), organiser, "the new registrar cannot mint");
 
         assertFalse(registry.registrars(address(previous)), "the previous registrar is still enrolled");
@@ -101,7 +100,12 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
 
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotAuthorisedSponsor.selector, sponsor));
         vm.prank(sponsor);
-        previous.setContenthash("oldname", hex"e302");
+        previous.register("another", organiser);
+
+        uint256 expiration = block.timestamp + 10 minutes;
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(oldHolderKey, previous.setContenthashDigest(oldNode, hex"e302", expiration));
+        vm.expectRevert(abi.encodeWithSelector(L2Resolver.Unauthorized.selector, oldNode));
+        previous.setContenthashWithSignature("oldname", hex"e302", expiration, abi.encodePacked(r, s, v));
     }
 
     /// Enrolment first, so that at no point in the batch is nothing enrolled;
@@ -134,7 +138,7 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
     /// A mistyped previous registrar would print a retirement that retires
     /// nothing while the real one keeps minting.
     function test_Redeploy_RefusesAPreviousRegistrarThatIsNotEnrolled() public {
-        RedeployRegistrar script = new WithInputs(address(safe), makeAddr("typo"));
+        RedeployRegistrar script = new WithInputs(makeAddr("typo"));
         vm.expectRevert("PREVIOUS_REGISTRAR is not enrolled in this registry");
         script.run();
     }
@@ -142,48 +146,56 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
     /// The batch's `removeSponsor` succeeds only from the previous registrar's
     /// owner, and the whole batch comes from the registry admin: when they
     /// differ, the batch would revert as a unit. Refused up front, with the way
-    /// out named — the state the Arbitrum Sepolia pair is in today.
+    /// out named. A v2.1 registrar is owned by ITS registry's admin, so the
+    /// mismatch is a registrar bound to another registry.
     function test_Redeploy_RefusesAPreviousRegistrarTheRegistryAdminDoesNotOwn() public {
-        MockSafe otherOwner = new MockSafe();
-        WoCoRegistrar foreign = new WoCoRegistrar(address(registry), address(otherOwner), sponsor, new string[](0));
+        L2Registry other = L2Registry(Clones.clone(address(new L2Registry())));
+        other.initialize("woco.eth", "WoCo Names", "", address(new MockSafe()));
+        WoCoRegistrar foreign = new WoCoRegistrar(address(other), sponsor, new string[](0));
         vm.prank(address(safe));
         registry.addRegistrar(address(foreign));
 
-        RedeployRegistrar script = new WithInputs(address(safe), address(foreign));
+        RedeployRegistrar script = new WithInputs(address(foreign));
         vm.expectRevert("PREVIOUS_REGISTRAR is not owned by the registry admin - retire its sponsor separately");
         script.run();
     }
 
+    /// A registry for another name is refused before anything is deployed
+    /// (Fable sign-off F5).
+    function test_Redeploy_RefusesARegistryForAnotherName() public {
+        L2Registry other = L2Registry(Clones.clone(address(new L2Registry())));
+        other.initialize("wocoo.eth", "WoCo Names", "", address(safe));
+        uint64 nonceBefore = vm.getNonce(deployer);
+
+        RedeployRegistrar script = new WithRegistry(address(other));
+        vm.expectRevert("L2_REGISTRY_ADDRESS is not a woco.eth registry - its base node is not namehash(woco.eth)");
+        script.run();
+        assertEq(vm.getNonce(deployer), nonceBefore, "something was deployed");
+    }
+
     /*//////////////////////////////////////////////////////////////
-                    THE ADMIN MUST BE SHAPED LIKE A SAFE
+                    OWNERSHIP FOLLOWS THE ADMIN SEAT
     //////////////////////////////////////////////////////////////*/
 
-    function test_Redeploy_RefusesTheZeroAddressAdmin() public {
-        RedeployRegistrar script = new WithInputs(address(0), address(0));
-        vm.expectRevert("REGISTRAR_ADMIN must not be the zero address");
-        script.run();
-    }
+    /// Audit 937 F13: a handover of the admin seat leaves no registrar
+    /// ownership behind. The DAO that accepts the seat can retire the sponsor;
+    /// the Safe that gave it up no longer can.
+    function test_Redeploy_TheNewRegistrarFollowsTheSeatThroughAHandover() public {
+        WoCoRegistrar registrar = WoCoRegistrar(new RedeployRegistrar().run());
+        address dao = address(new MockSafe());
+        vm.prank(address(safe));
+        registry.nominateAdmin(dao);
+        vm.prank(dao);
+        registry.acceptAdmin();
 
-    function test_Redeploy_RefusesABareKeyAdmin() public {
-        RedeployRegistrar script = new WithInputs(makeAddr("bare-key"), address(0));
-        vm.expectRevert("REGISTRAR_ADMIN has no code - expected the Safe");
-        script.run();
-    }
+        assertEq(registrar.owner(), dao);
+        vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotRegistryAdmin.selector, address(safe)));
+        vm.prank(address(safe));
+        registrar.removeSponsor(sponsor);
 
-    /// The Safe's own signer is an EIP-7702 delegated EOA, which has code.
-    function test_Redeploy_RefusesAnEip7702DelegatedAdmin() public {
-        address account = makeAddr("delegated-signer");
-        vm.etch(account, abi.encodePacked(hex"ef0100", address(safe)));
-        RedeployRegistrar script = new WithInputs(account, address(0));
-        vm.expectRevert("REGISTRAR_ADMIN is an EIP-7702 delegated EOA - expected the Safe, not a signer account");
-        script.run();
-    }
-
-    /// The designator's prefix is refused, not a size.
-    function test_Redeploy_TheDesignatorPrefixIsRefusedNotTheSize() public {
-        address twentyThree = makeAddr("twenty-three-bytes");
-        vm.etch(twentyThree, abi.encodePacked(hex"600000", address(safe)));
-        assertEq(WoCoRegistrar(new WithInputs(twentyThree, address(0)).run()).owner(), twentyThree);
+        vm.prank(dao);
+        registrar.removeSponsor(sponsor);
+        assertFalse(registrar.authorisedSponsors(sponsor));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -206,20 +218,31 @@ contract RedeployRegistrarTest is ScriptEnvFixture {
 
 /// @dev Overrides only the inputs; every guard in `run()` is the real one.
 contract WithInputs is RedeployRegistrar {
-    address internal immutable configuredAdmin;
     address internal immutable configuredPrevious;
 
-    constructor(address admin_, address previous_) {
-        configuredAdmin = admin_;
+    constructor(address previous_) {
         configuredPrevious = previous_;
     }
 
     function _config() internal view override returns (Config memory c) {
         c = super._config();
-        c.registrarAdmin = configuredAdmin;
         c.previousRegistrar = configuredPrevious;
     }
 }
 
-/// @dev A contract, because `REGISTRAR_ADMIN` must not be a bare key.
+/// @dev Overrides only the registry; every guard in `run()` is the real one.
+contract WithRegistry is RedeployRegistrar {
+    address internal immutable configuredRegistry;
+
+    constructor(address registry_) {
+        configuredRegistry = registry_;
+    }
+
+    function _config() internal view override returns (Config memory c) {
+        c = super._config();
+        c.registryAddress = configuredRegistry;
+    }
+}
+
+/// @dev Stands in for a multisig: a contract with no behaviour.
 contract MockSafe {}

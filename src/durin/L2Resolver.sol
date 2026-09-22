@@ -13,7 +13,6 @@ import {AddrResolver} from "@ensdomains/ens-contracts/resolvers/profiles/AddrRes
 import {ContentHashResolver} from "@ensdomains/ens-contracts/resolvers/profiles/ContentHashResolver.sol";
 import {ExtendedResolver} from "@ensdomains/ens-contracts/resolvers/profiles/ExtendedResolver.sol";
 import {IExtendedResolver} from "@ensdomains/ens-contracts/resolvers/profiles/IExtendedResolver.sol";
-import {Multicallable} from "@ensdomains/ens-contracts/resolvers/Multicallable.sol";
 import {TextResolver} from "@ensdomains/ens-contracts/resolvers/profiles/TextResolver.sol";
 
 /// @title Durin Resolver
@@ -35,10 +34,22 @@ import {TextResolver} from "@ensdomains/ens-contracts/resolvers/profiles/TextRes
 /// CHANGED: `isAuthorisedForAddress` is gone. Every record write reaches ONE
 /// predicate, `_canWriteRecords`, which the registry implements.
 ///
+/// CHANGED (v2.1): `ABI` terminates for every `contentTypes`.
+///
 /// ADDED: `supportsInterface` reports `IExtendedResolver`, which this contract
 /// has always implemented (audit 924 F-16).
+///
+/// REMOVED (v2.2, after audit 950): `Multicallable`, and with it the public
+/// `multicall` and `multicallWithNodeCheck`. Neither is `virtual`, so leaving
+/// the inheritance was the only way to remove them. They granted no authority,
+/// but every "X then Y" finding read as enabled by them, the unchecked
+/// `multicall` ran any function as the caller through a self-`delegatecall`,
+/// and a failing item lost its reason (950 Low 6). Nothing WoCo runs called
+/// them: the app batches reads through Multicall3, and ENS's UniversalResolver
+/// wraps each item in `resolve` itself. `IMulticallable` is no longer reported.
+/// What `createSubnode` needs survives as the internal, node-checked
+/// `_multicall` below.
 abstract contract L2Resolver is
-    Multicallable,
     ABIResolver,
     AddrResolver,
     ContentHashResolver,
@@ -50,6 +61,7 @@ abstract contract L2Resolver is
     //////////////////////////////////////////////////////////////*/
 
     error Unauthorized(bytes32 node);
+    error BatchNodeMismatch(bytes32 node);
 
     /*//////////////////////////////////////////////////////////////
                            INTERNAL FUNCTIONS
@@ -60,6 +72,32 @@ abstract contract L2Resolver is
     ///      `msg.sender` as the writer — so there is one rule to audit, not one
     ///      per setter.
     function _canWriteRecords(address writer, bytes32 node) internal view virtual returns (bool);
+
+    /// @dev The batch `createSubnode` runs after a mint. Vendored from ENS's
+    ///      `Multicallable._multicall` with three changes: it is INTERNAL only;
+    ///      every item must name `nodehash` as its first argument, with no
+    ///      "zero skips the check" case (upstream's public `multicall` passed
+    ///      zero); and an inner revert is bubbled with its reason (950 Low 6).
+    ///      The explicit length check refuses an item too short to name a node,
+    ///      where upstream's slice would panic.
+    ///
+    ///      Each item runs through a self-`delegatecall`, so it keeps
+    ///      `msg.sender` and has exactly the caller's own authority. The return
+    ///      data it bubbles is this contract's own.
+    function _multicall(bytes32 nodehash, bytes[] calldata data) internal returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            bytes calldata item = data[i];
+            if (item.length < 36 || bytes32(item[4:36]) != nodehash) revert BatchNodeMismatch(nodehash);
+            (bool success, bytes memory result) = address(this).delegatecall(item);
+            if (!success) {
+                assembly ("memory-safe") {
+                    revert(add(result, 0x20), mload(result))
+                }
+            }
+            results[i] = result;
+        }
+    }
 
     /*//////////////////////////////////////////////////////////////
                            REQUIRED OVERRIDES
@@ -73,6 +111,26 @@ abstract contract L2Resolver is
         return true;
     }
 
+    /// @notice Returns the ABI associated with an ENS node (EIP-205).
+    /// @dev Upstream's loop doubles `contentType` until it passes
+    ///      `contentTypes`, and a doubling past bit 255 wraps to zero, so for a
+    ///      `contentTypes` with bit 255 set and no matching record it never
+    ///      ended (audit 937 F20 / 938 M-6). Here the loop stops at the wrap.
+    function ABI(
+        bytes32 node,
+        uint256 contentTypes
+    ) external view override returns (uint256, bytes memory) {
+        mapping(uint256 => bytes) storage abiset = versionable_abis[recordVersions[node]][node];
+
+        for (uint256 contentType = 1; contentType != 0 && contentType <= contentTypes; contentType <<= 1) {
+            if ((contentType & contentTypes) != 0 && abiset[contentType].length > 0) {
+                return (contentType, abiset[contentType]);
+            }
+        }
+
+        return (0, bytes(""));
+    }
+
     function supportsInterface(
         bytes4 interfaceId
     )
@@ -80,7 +138,6 @@ abstract contract L2Resolver is
         view
         virtual
         override(
-            Multicallable,
             ABIResolver,
             AddrResolver,
             ContentHashResolver,

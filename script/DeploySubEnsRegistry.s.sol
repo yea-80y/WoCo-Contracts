@@ -8,10 +8,11 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
 
 /// @title DeploySubEnsRegistry
-/// @notice Deploys WoCo's sub-ENS registry (v2) for `woco.eth` and its
+/// @notice Deploys WoCo's sub-ENS registry (v2.1) for `woco.eth` and its
 ///         WoCoRegistrar in ONE transaction through `WoCoSubEnsDeployer`, with
-///         both admin roles on `REGISTRY_ADMIN` from the start, and proves the
-///         registry runs OUR implementation before anything is broadcast.
+///         the admin seat on `REGISTRY_ADMIN` from the start — which makes it
+///         the registrar's owner too — and proves the registry runs OUR
+///         implementation before anything is broadcast.
 ///
 /// @dev Run against Arbitrum Sepolia first, with a Safe there as the admin:
 ///        forge script script/DeploySubEnsRegistry.s.sol --rpc-url arb_sepolia --broadcast
@@ -20,8 +21,9 @@ import {L2Resolver} from "../src/durin/L2Resolver.sol";
 ///        DEPLOYER_PRIVATE_KEY — pays for the one transaction. Holds no role at
 ///                               any point.
 ///        SPONSOR_ADDRESS      — platform gas-sponsor wallet authorised to mint.
-///        REGISTRY_ADMIN       — the Safe. Holds the admin seat and owns the
-///                               registrar from construction. REQUIRED.
+///        REGISTRY_ADMIN       — the Safe. Holds the admin seat from
+///                               construction, and so owns the registrar.
+///                               REQUIRED.
 ///
 ///      The parent name is NOT configurable: see `PARENT_NAME`.
 ///
@@ -87,7 +89,7 @@ contract DeploySubEnsRegistry is Script {
     bytes32 constant PROBE_NODE = keccak256("woco/deploy/tripwire-probe");
 
     /// @return registryAddress  The initialised registry clone, admin seat on `REGISTRY_ADMIN`.
-    /// @return registrarAddress The `WoCoRegistrar`, owned by `REGISTRY_ADMIN`, not yet wired in.
+    /// @return registrarAddress The `WoCoRegistrar`, answering to `REGISTRY_ADMIN`, not yet wired in.
     function run() external returns (address registryAddress, address registrarAddress) {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address sponsor = vm.envAddress("SPONSOR_ADDRESS");
@@ -205,7 +207,7 @@ contract DeploySubEnsRegistry is Script {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Refuses to continue unless the registry about to go live executes
-    ///         the v2 `L2Registry` source in THIS repo.
+    ///         the v2.2 `L2Registry` source in THIS repo.
     ///
     /// @dev Independent checks, because one is not enough to survive a careless
     ///      edit:
@@ -229,6 +231,15 @@ contract DeploySubEnsRegistry is Script {
     ///        (4) v2, NOT v1 — `acceptAdmin` answers with v2's own error, and
     ///            `nonces`, which v1's signed record setters needed and v1
     ///            answers like any view, does not exist at all.
+    ///
+    ///        (5) v2.1, NOT v2 — a release signature expiring at the end of
+    ///            time is refused as too far ahead, which v2 never checked, and
+    ///            `parentTransfer` answers with its own error.
+    ///
+    ///        (6) v2.2, NOT v2.1 — `approve` answers with v2.2's own error
+    ///            (v2.1 refused it on the implementation only because the probe
+    ///            name does not exist), and `multicall`, which v2.1 inherited
+    ///            and answered for an empty batch, does not exist at all.
     ///
     ///      If a WoCo function is ever removed from `L2Registry`, its probe must
     ///      be re-pointed at whatever replaces it; deleting the probe is not the
@@ -261,15 +272,16 @@ contract DeploySubEnsRegistry is Script {
             ),
             "registry implementation does not run WoCo's release - it is not our bytecode"
         );
-        // #464, the signature rail. Same unregistered probe node; `expiration`
-        // is max so the expiry modifier passes and the body's own guard is what
-        // answers. No signature is examined before that guard, so the validator
-        // (absent on a fork, real on chain) is never reached.
+        // #464, the signature rail. Same unregistered probe node; expiring in
+        // this very block, so both halves of the expiry modifier pass and the
+        // body's own guard is what answers. No signature is examined before
+        // that guard, so the validator (absent on a fork, real on chain) is
+        // never reached.
         require(
             _revertsWith(
                 implAddr,
                 abi.encodeCall(
-                    L2Registry.releaseWithSignature, (PROBE_NODE, type(uint256).max, address(1), bytes(""))
+                    L2Registry.releaseWithSignature, (PROBE_NODE, block.timestamp, address(1), bytes(""))
                 ),
                 L2Registry.ReleaseUnregistered.selector
             ),
@@ -284,6 +296,41 @@ contract DeploySubEnsRegistry is Script {
         require(
             _revertsEmpty(implAddr, abi.encodeWithSignature("nonces(bytes32)", PROBE_NODE)),
             "registry implementation still answers nonces - it carries v1's signed record setters"
+        );
+        // v2.1's signature ceiling. The expiry modifier refuses before the body,
+        // so v2 — which answers this probe with `ReleaseUnregistered` — fails it.
+        require(
+            _revertsWith(
+                implAddr,
+                abi.encodeCall(
+                    L2Registry.releaseWithSignature, (PROBE_NODE, type(uint256).max, address(1), bytes(""))
+                ),
+                L2Registry.ExpirationTooFar.selector
+            ),
+            "registry implementation does not bound release signatures - it is not the v2.1 bytecode"
+        );
+        // v2.1's parent control. A non-zero recipient and an unregistered node,
+        // so the unregistered guard answers.
+        require(
+            _revertsWith(
+                implAddr,
+                abi.encodeCall(L2Registry.parentTransfer, (PROBE_NODE, address(1))),
+                L2Registry.ParentTransferUnregistered.selector
+            ),
+            "registry implementation does not run v2.1's parentTransfer - it is not the v2.1 bytecode"
+        );
+        // v2.2 (audit 950): no ERC-721 delegation, and no public batch.
+        require(
+            _revertsWith(
+                implAddr,
+                abi.encodeWithSignature("approve(address,uint256)", address(1), uint256(PROBE_NODE)),
+                L2Registry.DelegationNotSupported.selector
+            ),
+            "registry implementation still delegates - it is not the v2.2 bytecode"
+        );
+        require(
+            _revertsEmpty(implAddr, abi.encodeWithSignature("multicall(bytes[])", new bytes[](0))),
+            "registry implementation still answers multicall - it is not the v2.2 bytecode"
         );
     }
 

@@ -44,7 +44,7 @@ contract SubEnsV2CutoverForkTest is Test {
     address constant NABIL = 0x73478eb498679DB88E2C2A72C38f81f8861f8C75;
     address constant TEST = 0xeA1478b3818F3a06B83ceB7Ec6f710a51115D879;
     bytes constant NABIL_SITE = hex"e40101fa011b20d66c6ff7650a468c2fd98439c8f04547b5b8a4b933d349ff16db1d0b00c23adc";
-    bytes constant TEST_SITE = hex"e40101fa011b206a20bc33c1b52baf70c847a0d13f0da83e286c6cb9f9059009332886e1cacf9a";
+    bytes constant TEST_SITE = hex"e40101fa011b20eb869cf3a4481315dfb675c022a26e843aa128ac00a8649754b401c9301ceacc";
 
     function test_fork_cutoverEndToEnd() public {
         string memory arbRpc = vm.envOr("ARB_ONE_RPC_URL", string(""));
@@ -86,14 +86,19 @@ contract SubEnsV2CutoverForkTest is Test {
         assertTrue(wired, "the printed wiring call failed from the Safe");
     }
 
-    /// C4: the sponsor re-mints both names from the table; v2 then answers the
+    /// C4: the sponsor re-mints both names from the table — bare, since the
+    /// registrar never writes a pointer — and each HOLDER points its name back
+    /// at its site, as it would after the cutover. v2 then answers the
     /// gateway's call exactly as v1 does, and its records are the holders' alone.
     function _remintAndCompare(address registry, address registrar) internal {
-        string[] memory none = new string[](0);
         vm.startPrank(SPONSOR);
-        WoCoRegistrar(registrar).register("nabil", NABIL, NABIL_SITE, none, none);
-        WoCoRegistrar(registrar).register("test", TEST, TEST_SITE, none, none);
+        bytes32 nabilNode = WoCoRegistrar(registrar).register("nabil", NABIL);
+        bytes32 testNode = WoCoRegistrar(registrar).register("test", TEST);
         vm.stopPrank();
+        vm.prank(NABIL);
+        L2Registry(registry).setContenthash(nabilNode, NABIL_SITE);
+        vm.prank(TEST);
+        L2Registry(registry).setContenthash(testNode, TEST_SITE);
 
         _assertRecords(registry, "nabil.woco.eth", NABIL, NABIL_SITE, "v2 nabil is not the table");
         _assertRecords(registry, "test.woco.eth", TEST, TEST_SITE, "v2 test is not the table");
@@ -120,7 +125,7 @@ contract SubEnsV2CutoverForkTest is Test {
         string[] memory none = new string[](0);
         vm.expectRevert(abi.encodeWithSelector(WoCoRegistrar.NotAuthorisedSponsor.selector, SPONSOR));
         vm.prank(SPONSOR);
-        WoCoRegistrar(V1_REGISTRAR).register("another", NABIL, NABIL_SITE, none, none);
+        IV1Registrar(V1_REGISTRAR).register("another", NABIL, NABIL_SITE, none, none);
     }
 
     /// The seat's way on, driven by the real Safe contract.
@@ -233,4 +238,16 @@ contract CutoverHarness is DeploySubEnsRegistry {
         _assertRegistryRunsOurImplementation(registry, impl);
         _assertDeployedState(registry, registrar, admin, sponsor);
     }
+}
+
+/// @dev The LIVE v1 registrar's mint, which took records at mint. v2.2's
+///      `register` is two arguments; this is only for driving v1 on the fork.
+interface IV1Registrar {
+    function register(
+        string calldata label,
+        address owner_,
+        bytes calldata contenthash,
+        string[] calldata textKeys,
+        string[] calldata textValues
+    ) external returns (bytes32);
 }

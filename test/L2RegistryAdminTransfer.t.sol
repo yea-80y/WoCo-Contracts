@@ -15,9 +15,13 @@ import {L2Registry} from "../src/durin/L2Registry.sol";
  * EIP-1167 clone that cannot be upgraded, so the shape frozen here is permanent.
  * Each test below pins one clause of the public promise:
  *
- *   "Your name is an NFT we can never re-issue over or burn. The registry admin
- *    — intended to be a DAO multisig — can reassign it, on-chain and visibly,
- *    under a published policy."
+ *   "Your name is an NFT we can never re-issue over, and never burn from
+ *    where it stands. The registry admin — intended to be a DAO multisig — can
+ *    reassign it, on-chain and visibly, under a published policy."
+ *
+ * "From where it stands", because the admin can end a name in two visible
+ * steps: reassign it to an address it controls, then release it there as its
+ * holder (audit 937 F14 / 938 M-1; accepted power, see `adminTransfer`).
  */
 contract L2RegistryAdminTransferTest is Test {
     L2Registry    registry;
@@ -42,18 +46,19 @@ contract L2RegistryAdminTransferTest is Test {
         registry = L2Registry(Clones.clone(address(new L2Registry())));
         registry.initialize("woco.eth", "WoCo Names", "", admin);
 
-        registrar = new WoCoRegistrar(address(registry), admin, sponsor, new string[](0));
+        registrar = new WoCoRegistrar(address(registry), sponsor, new string[](0));
 
         vm.prank(admin);
         registry.addRegistrar(address(registrar));
     }
 
+    /// A bare sponsored mint, then the HOLDER points the name at its site —
+    /// the registrar no longer writes records at mint (sponsor-key consult).
     function _register(string memory label, address owner_) internal returns (bytes32 node) {
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.prank(sponsor);
-        registrar.register(label, owner_, SWARM_HASH, keys, vals);
-        node = registry.makeNode(registry.baseNode(), label);
+        node = registrar.register(label, owner_);
+        vm.prank(owner_);
+        registry.setContenthash(node, SWARM_HASH);
     }
 
     // ── The power works ───────────────────────────────────────────────────────
@@ -185,11 +190,9 @@ contract L2RegistryAdminTransferTest is Test {
     function test_AdminTransfer_DoesNotEnableMintingOverALiveName() public {
         _register("venue", organiser);
 
-        string[] memory keys = new string[](0);
-        string[] memory vals = new string[](0);
         vm.expectRevert();
         vm.prank(sponsor);
-        registrar.register("venue", claimant, SWARM_HASH, keys, vals);
+        registrar.register("venue", claimant);
     }
 
     /// After reassignment the previous holder has no residual control.
@@ -233,14 +236,14 @@ contract L2RegistryAdminTransferTest is Test {
 
     /// The classic forced-transfer hazard: a stale approval surviving the move
     /// would let the previous holder's approvee take the name straight back.
-    /// OZ `_update` clears per-token approval, and operator approvals are keyed
-    /// to the previous owner — pinned here because this file's job is to freeze
-    /// the shape.
+    /// v2.2 refuses approvals outright, so there is none to survive; the
+    /// would-be accomplice is refused like any stranger.
     function test_AdminTransfer_StaleApprovalCannotClawBack() public {
         bytes32 node = _register("venue", organiser);
 
         address accomplice = makeAddr("accomplice");
         vm.prank(organiser);
+        vm.expectRevert(L2Registry.DelegationNotSupported.selector);
         registry.approve(accomplice, uint256(node));
 
         vm.prank(admin);
@@ -256,14 +259,10 @@ contract L2RegistryAdminTransferTest is Test {
     /// Records cleared must mean ALL record types, not just the contenthash —
     /// the address records are the money-relevant ones.
     function test_AdminTransfer_ClearsAddrAndTextNotJustContenthash() public {
-        string[] memory keys = new string[](1);
-        string[] memory vals = new string[](1);
-        keys[0] = "url";
-        vals[0] = "https://squatter.example";
-
         vm.prank(sponsor);
-        registrar.register("venue", organiser, SWARM_HASH, keys, vals);
-        bytes32 node = registry.makeNode(registry.baseNode(), "venue");
+        bytes32 node = registrar.register("venue", organiser);
+        vm.prank(organiser);
+        registry.setText(node, "url", "https://squatter.example");
 
         assertEq(registry.addr(node), organiser, "precondition: addr set at mint");
         assertEq(registry.text(node, "url"), "https://squatter.example");
@@ -335,6 +334,23 @@ contract L2RegistryAdminTransferTest is Test {
 
         assertEq(registry.addr(node), stranger);
         assertEq(registry.owner(node), organiser, "the name itself did not move");
+    }
+
+    /// The two visible steps by which the admin seat can end a name, pinned so
+    /// no policy says "never burned" (audit 937 F14 / 938 M-1).
+    function test_Governance_CanEndANameInTwoVisibleSteps() public {
+        bytes32 node = _register("venue", organiser);
+
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit AdminTransfer(node, organiser, admin);
+        vm.startPrank(admin);
+        registry.adminTransfer(node, admin);
+        registry.release(node);
+        vm.stopPrank();
+
+        assertEq(registry.owner(node), address(0));
+        (address previous,) = registry.lastRelease(node);
+        assertEq(previous, admin, "the release record names the seat, not the organiser");
     }
 
     // ── setText removal ───────────────────────────────────────────────────────
