@@ -34,10 +34,12 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         assertFalse(ledger.authorisedSponsors(vm.addr(SCRIPT_DEPLOYER_PK)), "the deployer holds no role");
     }
 
-    function test_Run_AcceptsUnlimited() public {
-        WoCoTicketLedger ledger = _script(owner, sponsor, type(uint32).max).run();
-        (uint32 perHour, , ) = ledger.sponsorMintAllowance(sponsor);
-        assertEq(perHour, ledger.UNLIMITED_MINTS());
+    function test_Refuses_UnlimitedForTheFirstSponsor() public {
+        TestableDeployTicketLedger s = _script(owner, sponsor, type(uint32).max);
+        vm.expectRevert(
+            bytes("INITIAL_SPONSOR must have a finite cap: UNLIMITED_MINTS is for a sponsor the chain can check, added later")
+        );
+        s.run();
     }
 
     function test_Refuses_ZeroOwner() public {
@@ -66,33 +68,71 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         s.run();
     }
 
+    function _etchSafe(address a) internal {
+        vm.etch(a, address(new MockSafe()).code);
+    }
+
     function test_ArbitrumOne_RefusesAnOwnerWithoutCode() public {
         vm.chainId(42161);
         TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
-        vm.expectRevert(bytes("INITIAL_OWNER must be a Safe deployed on Arbitrum One"));
+        vm.expectRevert(bytes("INITIAL_OWNER must be a Safe deployed on this chain"));
+        s.run();
+    }
+
+    /// Code is not enough: a contract that is not a Safe is refused (audit 960 L-6).
+    function test_ArbitrumOne_RefusesAContractThatIsNotASafe() public {
+        vm.chainId(42161);
+        vm.etch(owner, hex"00");
+        TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
+        vm.expectRevert(bytes("INITIAL_OWNER does not answer getThreshold() like a Safe"));
         s.run();
     }
 
     function test_ArbitrumOne_RefusesTheSponsorAsOwner() public {
         vm.chainId(42161);
-        vm.etch(sponsor, hex"00");
+        _etchSafe(sponsor);
         TestableDeployTicketLedger s = _script(sponsor, sponsor, 1_000);
         vm.expectRevert(bytes("INITIAL_OWNER must not be the sponsor"));
         s.run();
     }
 
-    function test_ArbitrumOne_AcceptsAContractOwner() public {
+    /// An EIP-7702 deployer has code; it must still not be the owner (audit 960 I-4).
+    function test_ArbitrumOne_RefusesTheDeployerAsOwner() public {
         vm.chainId(42161);
-        vm.etch(owner, hex"00");
+        address deployer = vm.addr(SCRIPT_DEPLOYER_PK);
+        _etchSafe(deployer);
+        TestableDeployTicketLedger s = _script(deployer, sponsor, 1_000);
+        vm.expectRevert(bytes("INITIAL_OWNER must not be the deployer"));
+        s.run();
+    }
+
+    function test_ArbitrumOne_AcceptsASafeOwner() public {
+        vm.chainId(42161);
+        _etchSafe(owner);
         WoCoTicketLedger ledger = _script(owner, sponsor, 1_000).run();
         assertEq(ledger.owner(), owner);
     }
 
-    /// The code check is Arbitrum One only: testnet rehearsals may use an EOA.
-    function test_OtherChains_AllowAnEoaOwner() public {
+    /// A chain the script does not know gets the production checks (audit 960 I-5).
+    function test_UnknownChain_GetsTheProductionChecks() public {
+        vm.chainId(999_999);
+        TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
+        vm.expectRevert(bytes("INITIAL_OWNER must be a Safe deployed on this chain"));
+        s.run();
+    }
+
+    /// Testnet rehearsals (here the local chain) may use an EOA owner.
+    function test_Testnets_AllowAnEoaOwner() public {
         WoCoTicketLedger ledger = _script(owner, sponsor, 1_000).run();
         assertEq(owner.code.length, 0);
         assertEq(ledger.owner(), owner);
+    }
+}
+
+/// Answers `getThreshold()` like a Safe; no storage, so its code can be etched.
+contract MockSafe {
+    function getThreshold() external pure returns (uint256) {
+        return 1;
     }
 }
 

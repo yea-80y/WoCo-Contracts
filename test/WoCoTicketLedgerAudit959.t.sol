@@ -423,11 +423,17 @@ contract CapHandler is Test {
         vm.warp(block.timestamp + bound(dt, 0, 2 hours));
     }
 
+    /// 0..50, or 51 meaning UNLIMITED_MINTS, so the fuzzer also crosses the
+    /// unlimited boundary, which closes the window (audit 960 M-2).
     function retune(uint256 c) external {
+        uint32 prev = cap;
+        c = bound(c, 0, 51);
         // forge-lint: disable-next-line(unsafe-typecast)
-        cap = uint32(bound(c, 0, 50));
+        cap = c == 51 ? ledger.UNLIMITED_MINTS() : uint32(c);
         vm.prank(owner);
         ledger.setSponsorMintCap(address(this), cap);
+        uint32 unlimited = ledger.UNLIMITED_MINTS();
+        if ((prev == unlimited) != (cap == unlimited)) windowEnd = 0;
         if (cap > maxCapInWindow) maxCapInWindow = cap;
     }
 }

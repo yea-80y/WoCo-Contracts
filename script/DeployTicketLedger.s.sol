@@ -30,17 +30,19 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  *   INITIAL_OWNER        — the Safe. It becomes owner AND dispute authority
  *                          in the deploy transaction itself, so no handover is
  *                          left to do and the deployer never holds either role.
- *                          On Arbitrum One it must be a contract native to that
- *                          chain (a Safe deployed there): an L1 Safe acting via
- *                          the bridge arrives aliased and could never pass
+ *                          Off testnets it must be a Safe native to that chain
+ *                          (it must answer getThreshold()) and neither the
+ *                          sponsor nor the deployer: an L1 Safe acting via the
+ *                          bridge arrives aliased and could never pass
  *                          onlyOwner (audit 959 I-2).
  *   INITIAL_SPONSOR      — the sponsor wallet that will mint (the server's
  *                          WOCO_SPONSOR_PRIVATE_KEY address). A wrong sponsor is
  *                          a contract the server cannot mint through,
  *                          discovered at first sale.
  *   INITIAL_SPONSOR_MINTS_PER_HOUR — that sponsor's hourly mint cap (audit 959
- *                          M-1). 4294967295 = unlimited. The Safe retunes it
- *                          later with setSponsorMintCap.
+ *                          M-1). Finite and non-zero: the first sponsor is the
+ *                          hot card key. The Safe retunes it later with
+ *                          setSponsorMintCap.
  *
  * POST-DEPLOY, IN THIS ORDER (1 before 2 — reversing them opens a window in
  * which every mint reverts NotAuthorised and ticket fulfilment stops):
@@ -79,9 +81,18 @@ contract DeployWoCoTicketLedger is Script {
         require(c.sponsor != address(0), "INITIAL_SPONSOR must not be the zero address");
         require(c.perHour <= type(uint32).max, "INITIAL_SPONSOR_MINTS_PER_HOUR exceeds uint32");
         require(c.perHour > 0, "INITIAL_SPONSOR_MINTS_PER_HOUR must not be 0: that is the stopped state, set it later with setSponsorMintCap");
-        if (block.chainid == 42161) {
-            require(c.owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on Arbitrum One");
+        // The first sponsor is always the hot card key, the one the cap exists
+        // to bound (audit 960 L-2). A payments contract that may run unlimited
+        // needs this ledger's address, so it is always added later.
+        require(c.perHour != type(uint32).max, "INITIAL_SPONSOR must have a finite cap: UNLIMITED_MINTS is for a sponsor the chain can check, added later");
+        if (!_isTestnet(block.chainid)) {
+            require(c.owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on this chain");
+            // Code alone proves only "a contract" (audit 960 L-6): a wrong
+            // contract here bricks every onlyOwner function for good.
+            require(_safeThreshold(c.owner) > 0, "INITIAL_OWNER does not answer getThreshold() like a Safe");
             require(c.owner != c.sponsor, "INITIAL_OWNER must not be the sponsor");
+            // An EIP-7702 deployer has code, so the checks above do not rule it out (audit 960 I-4).
+            require(c.owner != deployer, "INITIAL_OWNER must not be the deployer");
         }
 
         console.log("Deploying WoCoTicketLedger...");
@@ -110,6 +121,21 @@ contract DeployWoCoTicketLedger is Script {
         if (c.writeDeploymentRecord) {
             _writeDeployment(address(ledger), deployer, c.owner, c.sponsor, c.perHour);
         }
+    }
+
+    /// @dev Chains where the production checks are skipped: local and public
+    ///      testnets, where a rehearsal may use an EOA owner. Every other chain,
+    ///      including one this script has never seen, gets them (audit 960 I-5).
+    function _isTestnet(uint256 id) internal pure returns (bool) {
+        return id == 31337 || id == 421614 || id == 84532 || id == 11155111 || id == 11155420;
+    }
+
+    /// @dev A Safe's threshold, or 0 for anything that does not answer
+    ///      `getThreshold()` with exactly one word.
+    function _safeThreshold(address a) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = a.staticcall(abi.encodeWithSignature("getThreshold()"));
+        if (!ok || ret.length != 32) return 0;
+        return abi.decode(ret, (uint256));
     }
 
     function _writeDeployment(

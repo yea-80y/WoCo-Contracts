@@ -731,7 +731,7 @@ contract WoCoTicketLedgerTest is Test {
         address claimer,
         bytes32 orderRef
     );
-    event EventCancelled(bytes32 indexed eventId, address indexed by);
+    event EventCancelled(bytes32 indexed eventId, address indexed by, bool forced);
 
     function test_Emit_Registered() public {
         bytes32 expectedId = _expectedId(sponsor, 0);
@@ -774,7 +774,7 @@ contract WoCoTicketLedgerTest is Test {
         bytes32 eventId = _register();
 
         vm.expectEmit(true, true, false, true, address(ledger));
-        emit EventCancelled(eventId, organiser);
+        emit EventCancelled(eventId, organiser, false);
         vm.prank(organiser);
         ledger.cancelEvent(eventId);
 
@@ -782,7 +782,7 @@ contract WoCoTicketLedgerTest is Test {
         // that is how the two cancellation routes are told apart on chain.
         bytes32 second = _register();
         vm.expectEmit(true, true, false, true, address(ledger));
-        emit EventCancelled(second, owner);
+        emit EventCancelled(second, owner, true);
         vm.prank(owner);
         ledger.forceCancelEvent(second);
     }
