@@ -5,6 +5,11 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
+/// @dev `WoCoTicketLedger.UNLIMITED_MINTS`, at file level so the deploy script
+///      can import the one definition (a contract's constant cannot be read
+///      from its type).
+uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
+
 /**
  * @title WoCoTicketLedger
  * @notice Allocation ledger for event tickets. Mints slots and lets their
@@ -199,9 +204,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice A sponsor's hourly mint accounting. One slot.
     /// @dev `perHour` is `UNLIMITED_MINTS` (no accounting at all), 0 (the
     ///      sponsor stays authorised but mints nothing), or a cap. The window's
-    ///      END is stored, not its start, and a retune writes only `perHour`,
-    ///      so changing a cap never re-anchors an open window or hands back
-    ///      spent allowance (the registrar's audit 937 F6). Fixed window, opened
+    ///      END is stored, not its start, and a retune between finite caps
+    ///      writes only `perHour`, so it never re-anchors an open window or hands
+    ///      back spent allowance (the registrar's audit 937 F6). Fixed window, opened
     ///      by the first mint after the last one ended: across a boundary a
     ///      sponsor can mint up to twice its cap in a few seconds, accepted for
     ///      a backstop in exchange for one slot and no loops. The window runs on
@@ -221,7 +226,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     mapping(address => MintAllowance) private _mintAllowance;
 
     /// @notice `perHour` meaning "no cap".
-    uint32 public constant UNLIMITED_MINTS = type(uint32).max;
+    uint32 public constant UNLIMITED_MINTS = LEDGER_UNLIMITED_MINTS;
 
     /// @notice Every capped sponsor's window. Fixed, not owner-tunable: the
     ///         cap is the one knob, and a tunable window is what let the
@@ -850,7 +855,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice Authorise `sponsor` to mint, at most `perHour` slots per hour.
     /// @dev The cap is required, never defaulted: choosing it is the decision
     ///      that bounds a leaked key. `UNLIMITED_MINTS` for a sponsor the chain
-    ///      can check. Re-adding a removed sponsor keeps its open window.
+    ///      can check. Re-adding a removed sponsor keeps its open window
+    ///      unless the new cap crosses the unlimited boundary (see
+    ///      `MintAllowance`).
     function addSponsor(address sponsor, uint32 perHour) external onlyOwner {
         _addSponsor(sponsor, perHour);
     }
@@ -895,6 +902,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     function setDisputeAuthority(address authority) external onlyOwner {
         if (authority == address(0)) revert ZeroAddress();
+        // The ledger never calls itself, so this would brick force-cancel (audit 960 I-9).
+        if (authority == address(this)) revert TransferToLedger();
         disputeAuthority = authority;
         emit DisputeAuthorityUpdated(authority);
     }
@@ -903,9 +912,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      address (audit 959 L-1). A handover is often made BECAUSE the old
     ///      owner's signers are suspect, and without this the old owner kept
     ///      `forceCancelEvent` over every event, one-way, until a second call
-    ///      caught it. THE RULE: at a handover the outgoing owner never keeps
-    ///      the dispute authority, unless it was set to a DIFFERENT address;
-    ///      one that differs from the outgoing owner stays where it is. It is
+    ///      caught it. THE RULE: at a handover, if the dispute authority IS the
+    ///      outgoing owner it moves to the new owner; otherwise it stays where
+    ///      it is. It is
     ///      keyed on the address, not on a "set apart" flag, on purpose (audit
     ///      960 L-1): after `setDisputeAuthority(D)` and a handover to D, D holds
     ///      both roles, and a flag would let a later handover away from D leave

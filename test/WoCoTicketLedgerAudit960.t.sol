@@ -156,3 +156,14 @@ contract WoCoTicketLedgerAudit960Test is Test {
         assertEq(forced.data, abi.encode(true));
     }
 }
+
+contract WoCoTicketLedgerAudit960DisputeTest is Test {
+    /// audit 960 I-9 / Fable N6: the ledger never calls itself, so it can never
+    /// be the dispute authority.
+    function test_SetDisputeAuthority_RefusesTheLedgerItself() public {
+        WoCoTicketLedger ledger = new WoCoTicketLedger(address(0x1), address(0x2), 5);
+        vm.expectRevert(WoCoTicketLedger.TransferToLedger.selector);
+        vm.prank(address(0x1));
+        ledger.setDisputeAuthority(address(ledger));
+    }
+}

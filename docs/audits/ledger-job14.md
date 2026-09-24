@@ -43,10 +43,12 @@ Changes after job 960:
    for `forceCancelEvent`.
 4. Deploy script (960 L-2, L-6, I-4, I-5): the first sponsor's cap must be finite and non-zero; off known
    testnets (31337, 421614, 84532, 11155111, 11155420) the owner must have code, must answer `getThreshold()`
-   with one non-zero word, and must be neither the sponsor nor the deployer; owner, dispute authority, sponsor
-   and cap are read back after deploy. Inputs come through a virtual `_config()` so tests never set the
-   process environment.
-5. Natspec only: 960 L-5 (the window runs on the sequencer's `block.timestamp`), L-7 (one sponsor's cap is
+   with one non-zero word, must list `INITIAL_OWNER_SIGNER` as an owner (`isOwner` answers 1), and must be
+   neither the sponsor nor the deployer; owner, dispute authority, sponsor and cap are read back after deploy.
+   Inputs come through a virtual `_config()` so tests never set the process environment. The "unlimited"
+   value is one file-level constant (`LEDGER_UNLIMITED_MINTS`) shared by the contract and the script.
+5. 960 I-9: `setDisputeAuthority` refuses `address(this)` (`TransferToLedger`).
+6. Natspec only: 960 L-5 (the window runs on the sequencer's `block.timestamp`), L-7 (one sponsor's cap is
    shared across the events it mints into), I-6 (`claimer` is the minting sponsor, not the payer), I-8
    (`remaining()` covers neither caps nor batch size).
 
@@ -57,7 +59,7 @@ Kept after job 960, with reasons (please challenge them):
   L-1 fixed.
 - 960 I-3: `removeSponsor` accepts an address that is not a sponsor, so an emergency Safe batch never reverts
   because a key was already removed.
-- 960 L-3, I-1, I-2, I-7, I-9, I-10, I-11: unchanged (cosmetic, off-chain by design, or recoverable in one
+- 960 L-3, I-1, I-2, I-7, I-10, I-11: unchanged (cosmetic, off-chain by design, or recoverable in one
   owner transaction).
 
 ## Guarantees to test

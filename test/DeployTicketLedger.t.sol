@@ -88,6 +88,25 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         s.run();
     }
 
+    function test_ArbitrumOne_RefusesAMissingOwnerSigner() public {
+        vm.chainId(42161);
+        _etchSafe(owner);
+        TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
+        s.setOwnerSigner(address(0));
+        vm.expectRevert(bytes("INITIAL_OWNER_SIGNER must be set to a signer of the owner Safe"));
+        s.run();
+    }
+
+    /// A Safe, but not ours: the named signer is not one of its owners (Fable N5).
+    function test_ArbitrumOne_RefusesASafeThatDoesNotListTheSigner() public {
+        vm.chainId(42161);
+        _etchSafe(owner);
+        TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
+        s.setOwnerSigner(address(0xBAD));
+        vm.expectRevert(bytes("INITIAL_OWNER_SIGNER is not an owner of INITIAL_OWNER"));
+        s.run();
+    }
+
     function test_ArbitrumOne_RefusesTheSponsorAsOwner() public {
         vm.chainId(42161);
         _etchSafe(sponsor);
@@ -129,10 +148,16 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
     }
 }
 
-/// Answers `getThreshold()` like a Safe; no storage, so its code can be etched.
+/// Answers like a Safe whose one signer is `SIGNER`; no storage, so its code can be etched.
 contract MockSafe {
+    address internal constant SIGNER = address(uint160(0x5165));
+
     function getThreshold() external pure returns (uint256) {
         return 1;
+    }
+
+    function isOwner(address a) external pure returns (bool) {
+        return a == SIGNER;
     }
 }
 
@@ -142,9 +167,14 @@ contract TestableDeployTicketLedger is DeployWoCoTicketLedger {
     constructor(uint256 deployerPk_, address owner_, address sponsor_, uint256 perHour_) {
         cfg.deployerPk = deployerPk_;
         cfg.owner = owner_;
+        cfg.ownerSigner = address(uint160(0x5165));
         cfg.sponsor = sponsor_;
         cfg.perHour = perHour_;
         cfg.writeDeploymentRecord = false;
+    }
+
+    function setOwnerSigner(address s) external {
+        cfg.ownerSigner = s;
     }
 
     function _config() internal view override returns (Config memory) {

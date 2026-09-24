@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
-import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
+import {WoCoTicketLedger, LEDGER_UNLIMITED_MINTS} from "../src/WoCoTicketLedger.sol";
 
 /**
  * Deploy WoCoTicketLedger — the allocation ledger, with no payment handling.
@@ -35,6 +35,9 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  *                          sponsor nor the deployer: an L1 Safe acting via the
  *                          bridge arrives aliased and could never pass
  *                          onlyOwner (audit 959 I-2).
+ *   INITIAL_OWNER_SIGNER — off testnets only: one signer of that Safe (for WoCo,
+ *                          the owner's own account). The script refuses a Safe
+ *                          that does not list it, so "a Safe" is "our Safe".
  *   INITIAL_SPONSOR      — the sponsor wallet that will mint (the server's
  *                          WOCO_SPONSOR_PRIVATE_KEY address). A wrong sponsor is
  *                          a contract the server cannot mint through,
@@ -57,6 +60,7 @@ contract DeployWoCoTicketLedger is Script {
     struct Config {
         uint256 deployerPk;
         address owner;
+        address ownerSigner;
         address sponsor;
         uint256 perHour;
         bool writeDeploymentRecord;
@@ -69,6 +73,7 @@ contract DeployWoCoTicketLedger is Script {
     function _config() internal view virtual returns (Config memory c) {
         c.deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         c.owner = vm.envAddress("INITIAL_OWNER");
+        c.ownerSigner = vm.envOr("INITIAL_OWNER_SIGNER", address(0));
         c.sponsor = vm.envAddress("INITIAL_SPONSOR");
         c.perHour = vm.envUint("INITIAL_SPONSOR_MINTS_PER_HOUR");
         c.writeDeploymentRecord = vm.envOr("WRITE_DEPLOYMENT_RECORD", true);
@@ -84,12 +89,16 @@ contract DeployWoCoTicketLedger is Script {
         // The first sponsor is always the hot card key, the one the cap exists
         // to bound (audit 960 L-2). A payments contract that may run unlimited
         // needs this ledger's address, so it is always added later.
-        require(c.perHour != type(uint32).max, "INITIAL_SPONSOR must have a finite cap: UNLIMITED_MINTS is for a sponsor the chain can check, added later");
+        require(c.perHour != LEDGER_UNLIMITED_MINTS, "INITIAL_SPONSOR must have a finite cap: UNLIMITED_MINTS is for a sponsor the chain can check, added later");
         if (!_isTestnet(block.chainid)) {
             require(c.owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on this chain");
             // Code alone proves only "a contract" (audit 960 L-6): a wrong
             // contract here bricks every onlyOwner function for good.
             require(_safeThreshold(c.owner) > 0, "INITIAL_OWNER does not answer getThreshold() like a Safe");
+            // Any Safe, or any contract with a catch-all fallback, passes the
+            // probe above; one we hold a key to is what the owner must be.
+            require(c.ownerSigner != address(0), "INITIAL_OWNER_SIGNER must be set to a signer of the owner Safe");
+            require(_safeIsOwner(c.owner, c.ownerSigner), "INITIAL_OWNER_SIGNER is not an owner of INITIAL_OWNER");
             require(c.owner != c.sponsor, "INITIAL_OWNER must not be the sponsor");
             // An EIP-7702 deployer has code, so the checks above do not rule it out (audit 960 I-4).
             require(c.owner != deployer, "INITIAL_OWNER must not be the deployer");
@@ -136,6 +145,12 @@ contract DeployWoCoTicketLedger is Script {
         (bool ok, bytes memory ret) = a.staticcall(abi.encodeWithSignature("getThreshold()"));
         if (!ok || ret.length != 32) return 0;
         return abi.decode(ret, (uint256));
+    }
+
+    /// @dev True only when `isOwner(signer)` answers one word equal to 1.
+    function _safeIsOwner(address safe, address signer) internal view returns (bool) {
+        (bool ok, bytes memory ret) = safe.staticcall(abi.encodeWithSignature("isOwner(address)", signer));
+        return ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
     }
 
     function _writeDeployment(
