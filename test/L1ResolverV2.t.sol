@@ -183,6 +183,19 @@ contract L1ResolverV2Test is L1ResolverBase {
         resolver.resolve(_dns("x.events.brand.eth"), _addrQuery(_node("x.events.brand.eth")));
     }
 
+    /// Audit 969 L-2: the TLD's own node is never consulted, even if whoever
+    /// owns it wrote settings - a TLD is never a tenant.
+    function test_Walk_NeverConsultsTheTld() public {
+        _configure(_own("eth", alice), alice, _registrySettings(registryA));
+        _own("venue.eth", bob);
+
+        (bool ok, bytes memory ret) = _resolveRaw(_dns("sub.venue.eth"), _addrQuery(_node("sub.venue.eth")));
+        assertFalse(ok);
+        assertEq(bytes4(ret), L1Resolver.NoConfiguredAncestor.selector, "the TLD's settings routed a query");
+        (bytes32 node,,) = resolver.routeFor(_dns("venue.eth"));
+        assertEq(node, bytes32(0), "routeFor reached the TLD");
+    }
+
     /// Refused here, not sent to the gateway with zero values.
     function test_Walk_NothingConfiguredNeverGoesOffchain() public {
         _own("venue.eth", alice);

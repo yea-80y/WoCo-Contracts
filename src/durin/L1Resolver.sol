@@ -349,7 +349,9 @@ contract L1Resolver is IExtendedResolver, Ownable2Step {
         returns (bool found, bytes32 node, address owner, Settings memory s, bool isSelf)
     {
         bytes32[] memory nodes = _suffixNodes(name);
-        for (uint256 k; k < nodes.length; ++k) {
+        // The last node is the TLD, which is never a route target: a
+        // single-label name is refused, and no TLD owner is a tenant (audit 969 L-2).
+        for (uint256 k; k + 1 < nodes.length; ++k) {
             address o = effectiveOwner(nodes[k]);
             // Slot zero can never be written (`configure` refuses it).
             if (o == address(0)) continue;
