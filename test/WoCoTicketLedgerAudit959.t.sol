@@ -407,9 +407,11 @@ contract CapHandler is Test {
         address[] memory to = new address[](n);
         for (uint256 i; i < n; ++i) to[i] = address(0xB0B);
         try ledger.batchClaimFor(eventId, to, 0) {
-            (, , uint64 end) = ledger.sponsorMintAllowance(address(this));
-            if (end != windowEnd) {
-                windowEnd = end;
+            // The handler is its own oracle for the window, never the contract
+            // under test: a re-anchor after a warp would otherwise look like a
+            // legitimate new window.
+            if (block.timestamp >= windowEnd) {
+                windowEnd = uint64(block.timestamp) + 1 hours;
                 mintedInWindow = 0;
                 maxCapInWindow = cap;
             }

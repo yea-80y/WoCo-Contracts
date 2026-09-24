@@ -52,40 +52,64 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  *   3. Confirm owner() and disputeAuthority() both read the Safe.
  */
 contract DeployWoCoTicketLedger is Script {
-    function run() external {
-        uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
-        address deployer    = vm.addr(deployerKey);
-        address owner       = vm.envAddress("INITIAL_OWNER");
-        address sponsor     = vm.envAddress("INITIAL_SPONSOR");
-        uint256 perHour     = vm.envUint("INITIAL_SPONSOR_MINTS_PER_HOUR");
-        require(owner != address(0), "INITIAL_OWNER must not be the zero address");
-        require(sponsor != address(0), "INITIAL_SPONSOR must not be the zero address");
-        require(perHour <= type(uint32).max, "INITIAL_SPONSOR_MINTS_PER_HOUR exceeds uint32");
+    struct Config {
+        uint256 deployerPk;
+        address owner;
+        address sponsor;
+        uint256 perHour;
+        bool writeDeploymentRecord;
+    }
+
+    /// @dev `virtual` ONLY so tests can vary the inputs: `vm.setEnv` writes the
+    ///      whole forge process's environment and tests run in parallel, so
+    ///      per-test environments race (see test/ScriptEnvFixture.sol). The
+    ///      guards stay in `run()` and are never overridden.
+    function _config() internal view virtual returns (Config memory c) {
+        c.deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
+        c.owner = vm.envAddress("INITIAL_OWNER");
+        c.sponsor = vm.envAddress("INITIAL_SPONSOR");
+        c.perHour = vm.envUint("INITIAL_SPONSOR_MINTS_PER_HOUR");
+        c.writeDeploymentRecord = vm.envOr("WRITE_DEPLOYMENT_RECORD", true);
+    }
+
+    function run() external returns (WoCoTicketLedger ledger) {
+        Config memory c = _config();
+        address deployer = vm.addr(c.deployerPk);
+        require(c.owner != address(0), "INITIAL_OWNER must not be the zero address");
+        require(c.sponsor != address(0), "INITIAL_SPONSOR must not be the zero address");
+        require(c.perHour <= type(uint32).max, "INITIAL_SPONSOR_MINTS_PER_HOUR exceeds uint32");
+        require(c.perHour > 0, "INITIAL_SPONSOR_MINTS_PER_HOUR must not be 0: that is the stopped state, set it later with setSponsorMintCap");
         if (block.chainid == 42161) {
-            require(owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on Arbitrum One");
-            require(owner != sponsor, "INITIAL_OWNER must not be the sponsor");
+            require(c.owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on Arbitrum One");
+            require(c.owner != c.sponsor, "INITIAL_OWNER must not be the sponsor");
         }
 
         console.log("Deploying WoCoTicketLedger...");
         console.log("  Chain ID:            ", block.chainid);
         console.log("  Deployer (gas only): ", deployer);
-        console.log("  Owner + dispute auth:", owner);
-        console.log("  Initial sponsor:     ", sponsor);
-        console.log("  Sponsor mints/hour:  ", perHour);
+        console.log("  Owner + dispute auth:", c.owner);
+        console.log("  Initial sponsor:     ", c.sponsor);
+        console.log("  Sponsor mints/hour:  ", c.perHour);
 
-        vm.startBroadcast(deployerKey);
         // safe: bounded to uint32 by the require above
         // forge-lint: disable-next-line(unsafe-typecast)
-        WoCoTicketLedger ledger = new WoCoTicketLedger(owner, sponsor, uint32(perHour));
+        uint32 perHour = uint32(c.perHour);
+
+        vm.startBroadcast(c.deployerPk);
+        ledger = new WoCoTicketLedger(c.owner, c.sponsor, perHour);
         vm.stopBroadcast();
 
-        require(ledger.owner() == owner, "owner read-back failed");
-        require(ledger.disputeAuthority() == owner, "dispute authority read-back failed");
-        require(ledger.authorisedSponsors(sponsor), "sponsor read-back failed");
+        require(ledger.owner() == c.owner, "owner read-back failed");
+        require(ledger.disputeAuthority() == c.owner, "dispute authority read-back failed");
+        require(ledger.authorisedSponsors(c.sponsor), "sponsor read-back failed");
+        (uint32 capBack,,) = ledger.sponsorMintAllowance(c.sponsor);
+        require(capBack == perHour, "cap read-back failed");
 
         console.log("WoCoTicketLedger deployed to:", address(ledger));
 
-        _writeDeployment(address(ledger), deployer, owner, sponsor, perHour);
+        if (c.writeDeploymentRecord) {
+            _writeDeployment(address(ledger), deployer, c.owner, c.sponsor, c.perHour);
+        }
     }
 
     function _writeDeployment(

@@ -19,7 +19,8 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  *
  *   On an event it did not itself register, sponsor authority grants exactly
  *   ONE power: appending new slots — within the supply stamped at
- *   registration, before `eventEndTs`, and only while not cancelled.
+ *   registration, before `eventEndTs`, only while not cancelled, and within
+ *   that sponsor's hourly mint cap.
  *
  * Sponsors cannot cancel such an event, cannot alter its stamped terms, and
  * cannot touch slots that already exist. That statement is what a payments
@@ -39,7 +40,9 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  * A card sponsor is a hot key that must be online around the clock, and the
  * chain cannot check the Stripe payment it acts on. So every sponsor is also
  * bounded by an hourly mint cap the owner sets per sponsor: a leaked key takes
- * at most one hour's cap per hour until the owner calls `removeSponsor`.
+ * at most its cap per window, and at most twice it across a window boundary
+ * (see `MintAllowance`), until the owner calls `removeSponsor` or
+ * `setSponsorMintCap(sponsor, 0)`.
  *
  * `UNLIMITED_MINTS` is for a sponsor whose mints the chain CAN check — a
  * payments contract that mints only in the transaction that takes the money.
@@ -83,7 +86,8 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  * unusual; now a holder can move it, and a payments contract that read
  * `getSlotData(...).owner` to pick a payee would let a ledger transition
  * redirect money — the one thing the rule above forbids. WoCoEventV2 already
- * got this right by paying `batchClaimer` (WoCoEventV2.sol:537); keep that shape.
+ * got this right by paying the batch's `claimer` (`getSlotData`)
+ * (WoCoEventV2.sol:537); keep that shape.
  *
  * ── Why there is no drop gate ────────────────────────────────────────────────
  *
@@ -162,8 +166,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
-    /// Address allowed to `forceCancelEvent`. Initially the owner; designed to
-    /// be rotated to a multisig / DAO. Deliberately NOT the payments contract:
+    /// Address allowed to `forceCancelEvent`. Initially the owner, and moves
+    /// with an ownership handover while it still equals the owner
+    /// (`_transferOwnership`); `setDisputeAuthority` sets it apart, after which
+    /// a handover leaves it where it is. Deliberately NOT the payments contract:
     /// keeping this a human-controlled address is what keeps the dependency
     /// one-directional.
     address public disputeAuthority;
@@ -287,6 +293,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error EmptyManifestRef();
     error RenounceDisabled();
     error NotSponsor();
+    /// @dev `windowResetsAt` is when the sponsor's window ends. If its cap is 0
+    ///      the reset lifts nothing: read `sponsorMintAllowance(sponsor).perHour`
+    ///      before retrying.
     error MintCapExceeded(address sponsor, uint64 windowResetsAt);
     error TransferToLedger();
 
@@ -839,14 +848,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice A sponsor's cap, what it may still mint now, and when its window
     ///         ends. For `/api/health` to report "mint cap reached until <time>"
     ///         before a sale fails, rather than after.
-    /// @dev No open window: `remaining` is the whole cap and `windowResetsAt`
-    ///      is when a window opened now would end. Unlimited: `remaining` is
+    /// @dev No open window: `mintable` is the whole cap and `windowResetsAt`
+    ///      is when a window opened now would end. Unlimited: `mintable` is
     ///      `UNLIMITED_MINTS` and `windowResetsAt` 0. Says nothing about
     ///      authorisation; that is `authorisedSponsors`.
     function sponsorMintAllowance(address sponsor)
         external
         view
-        returns (uint32 perHour, uint32 remaining, uint64 windowResetsAt)
+        returns (uint32 perHour, uint32 mintable, uint64 windowResetsAt)
     {
         MintAllowance memory a = _mintAllowance[sponsor];
         perHour = a.perHour;
@@ -854,7 +863,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         uint64 nowTs = uint64(block.timestamp);
         if (nowTs >= a.windowEnd) return (perHour, perHour, nowTs + MINT_WINDOW);
         // A lowered cap can sit below what the window already spent.
-        remaining = a.used >= perHour ? 0 : perHour - a.used;
+        mintable = a.used >= perHour ? 0 : perHour - a.used;
         windowResetsAt = a.windowEnd;
     }
 
@@ -913,7 +922,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice Disabled: always reverts `RenounceDisabled`.
     /// @dev Renouncing would set `owner` to address(0) for good, and every
     ///      `onlyOwner` power would go with it — `addSponsor`, `removeSponsor`,
-    ///      `setDisputeAuthority`. A leaked sponsor key could then never be
+    ///      `setSponsorMintCap`, `setDisputeAuthority`. A leaked sponsor key could then never be
     ///      removed, nor a lost dispute authority replaced, on a contract that
     ///      is deployed once. `Ownable2Step` makes transfers two-step but leaves
     ///      renounce a single call, and renounce is the only road to a zero
