@@ -53,7 +53,7 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
 
     function setUp() public {
         vm.warp(NOW);
-        ledger = new WoCoTicketLedger(owner, sponsor);
+        ledger = new WoCoTicketLedger(owner, sponsor, type(uint32).max);
     }
 
     function _registerAndClaim(WoCoTicketLedger l, address to)
@@ -335,7 +335,7 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
     /// verifying contract in the domain differs. The positive control at the end
     /// proves the refusal came from that difference and nothing else.
     function test_RejectsASignatureMadeForAnotherDeployment() public {
-        WoCoTicketLedger ledger2 = new WoCoTicketLedger(owner, sponsor);
+        WoCoTicketLedger ledger2 = new WoCoTicketLedger(owner, sponsor, type(uint32).max);
         (bytes32 eventId, uint256 slot) = _registerAndClaim(ledger2, holder);
 
         bytes memory wrongDomain = _sign(
