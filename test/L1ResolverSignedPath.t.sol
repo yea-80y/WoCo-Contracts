@@ -134,6 +134,38 @@ contract L1ResolverSignedPathTest is L1ResolverBase {
         resolver.resolveWithProof(response, extraData);
     }
 
+    /// A vector the REAL gateway handler produced (woco_app
+    /// `apps/server/src/lib/ens-gateway/ccip.ts`, pinned in its own
+    /// `ens-gateway.test.ts`): resolver 0x1111…1111 on chain 1, signer
+    /// 0x7099…79C8, now 1_800_000_000, `nabil.woco.eth` addr on the v2.2
+    /// registry. If either side changes the format, one of the two suites fails.
+    address constant GOLDEN_TARGET = 0x1111111111111111111111111111111111111111;
+    address constant GOLDEN_SIGNER = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
+    bytes constant GOLDEN_REQUEST =
+        hex"21759430000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000c0000000000000000000000000000000000000000000000000000000000000a4b10000000000000000000000004c2265470e0134c0a2df6902ebcb5397a40102a80000000000000000000000000000000000000000000000000000000000000010056e6162696c04776f636f03657468000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000243b3b57dec8062a52e62f372f92d47336f9230c01106d562e2ff375c8ff5ae0a19e4b9eb900000000000000000000000000000000000000000000000000000000";
+    bytes constant GOLDEN_RESULT = hex"000000000000000000000000ea1478b3818f3a06b83ceb7ec6f710a51115d879";
+    bytes constant GOLDEN_RESPONSE =
+        hex"0000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000006b49d45800000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000ea1478b3818f3a06b83ceb7ec6f710a51115d87900000000000000000000000000000000000000000000000000000000000000414c8548db5c48a5063537b3a02b86075ec75986bc945c64d236305bdcbdb4fab62bdbec2c48eaedebf07003b0265061a8ab2ce0141b748ac0727c4f8daaaa44981b00000000000000000000000000000000000000000000000000000000000000";
+
+    function test_Signed_TheGatewaysOwnVectorVerifies() public {
+        deployCodeTo(
+            "L1Resolver.sol:L1Resolver",
+            abi.encode(GATEWAY_URL, GOLDEN_SIGNER, resolverOwner, address(wrapper)),
+            GOLDEN_TARGET
+        );
+        L1Resolver golden = L1Resolver(GOLDEN_TARGET);
+        Lookup memory q; // the signature path never reads the query
+        bytes memory extra = abi.encode(address(0), q, GOLDEN_REQUEST);
+
+        vm.chainId(1);
+        vm.warp(1_800_000_000);
+        assertEq(golden.resolveWithProof(GOLDEN_RESPONSE, extra), GOLDEN_RESULT);
+
+        vm.chainId(421614);
+        vm.expectRevert(L1Resolver.InvalidSignature.selector);
+        golden.resolveWithProof(GOLDEN_RESPONSE, extra);
+    }
+
     /// The built-in path's extraData is (module 0, the query, the request).
     function test_Signed_ExtraDataCarriesModuleZeroAndTheRequest() public view {
         (address module,, bytes memory request) =
