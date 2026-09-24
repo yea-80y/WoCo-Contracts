@@ -11,7 +11,7 @@ pragma solidity ^0.8.20;
 import {ENS} from "@ensdomains/ens-contracts/registry/ENS.sol";
 import {IExtendedResolver} from "@ensdomains/ens-contracts/resolvers/profiles/IExtendedResolver.sol";
 import {NameEncoder} from "@ensdomains/ens-contracts/utils/NameEncoder.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {strings} from "@arachnid/string-utils/strings.sol";
 
 import {ENSDNSUtils} from "./lib/ENSDNSUtils.sol";
@@ -53,11 +53,16 @@ interface INameWrapper {
 /// │ pinned by test/L1ResolverFallback.t.sol, which compares the OffchainLookup│
 /// │ revert data byte for byte against an independently built expectation.     │
 /// │                                                                          │
+/// │ v2 (audit 926 / WoCo-Contracts #23): Ownable2Step with a renounce that    │
+/// │ always reverts, and a one-label name reverts `UnsupportedName`. Nothing   │
+/// │ else changes: the signed-answer format and checks are upstream's, so the  │
+/// │ gateway is unchanged.                                                     │
+/// │                                                                          │
 /// │ Unlike the registry this contract is REPLACEABLE: pointing a name         │
 /// │ elsewhere is one `setResolver` by the name owner and touches no name on   │
 /// │ L2. That is what makes the Unruggable-proofs upgrade a post-launch item.  │
 /// └──────────────────────────────────────────────────────────────────────────┘
-contract L1Resolver is IExtendedResolver, Ownable {
+contract L1Resolver is IExtendedResolver, Ownable2Step {
     /*//////////////////////////////////////////////////////////////
                                 STRUCTS
     //////////////////////////////////////////////////////////////*/
@@ -109,6 +114,7 @@ contract L1Resolver is IExtendedResolver, Ownable {
     error Unauthorized();
     error InvalidSignature();
     error UnsupportedName();
+    error RenounceDisabled();
     error FallbackResolverHasNoCode(address resolver);
     error OffchainLookup(
         address sender,
@@ -210,6 +216,9 @@ contract L1Resolver is IExtendedResolver, Ownable {
         strings.slice memory s = strings.toSlice(decodedName);
         strings.slice memory delim = strings.toSlice(".");
         string[] memory parts = new string[](strings.count(s, delim) + 1);
+        // A one-label or root name has no 2LD + TLD to read; refuse it plainly
+        // rather than underflow `parts.length - 2` (audit 926 finding 8).
+        if (parts.length < 2) revert UnsupportedName();
 
         // Populate the parts array into ['sub', 'name', 'eth']
         for (uint i = 0; i < parts.length; i++) {
@@ -284,6 +293,19 @@ contract L1Resolver is IExtendedResolver, Ownable {
     function setSigner(address _signer) external onlyOwner {
         signer = _signer;
         emit SignerChanged(_signer);
+    }
+
+    /// @notice Disabled: always reverts `RenounceDisabled` (audit 926 findings
+    ///         2 and 4, WoCo-Contracts #23).
+    /// @dev Renouncing would freeze `setURL` and `setSigner` for good: the
+    ///      gateway could never move and a leaked signer could never be
+    ///      rotated. A Safe transaction builder has been seen to pre-fill
+    ///      `renounceOwnership` (0x715018a6), so the refusal lives in code, not
+    ///      in a signing checklist. Hand ownership on with `transferOwnership`
+    ///      + `acceptOwnership` instead. `pure` and unguarded: there is nothing
+    ///      left to authorise. The selector is unchanged.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     /*//////////////////////////////////////////////////////////////
