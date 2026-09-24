@@ -24,6 +24,9 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 ///        L2_CHAIN_ID             — uint64 chain id of the L2 sub-ENS registry.
 ///        L2_REGISTRY_ADDRESS     — the L2Registry this resolver should point queries at.
 ///        FALLBACK_RESOLVER       — ordinary L1 resolver the apex itself answers from.
+///        NAME_WRAPPER            — the ENS NameWrapper, a constructor argument (immutable).
+///                                  Defaults to the mainnet wrapper on chain 1, and MUST
+///                                  equal it there (G13); required everywhere else.
 ///        EXPECT_NAME_OWNER       — the address the operator BELIEVES controls PARENT_NAME.
 ///                                  REQUIRED, no default — see the #420 custody guard below.
 ///      Optional env:
@@ -37,8 +40,9 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 ///
 /// WHY THIS SCRIPT PRINTS INSTEAD OF SENDING (#419, #420)
 ///
-/// `setL2Registry`, `setFallbackResolver` and the `setResolver` swap that actually
-/// points the name at this contract are all authorised by the ENS NAME OWNER, not
+/// `configure` (the name's settings, written into the name owner's own slot) and
+/// the `setResolver` swap that actually points the name at this contract are
+/// both sent by the ENS NAME OWNER, not
 /// by this contract's `owner()` and not by the deployer. On mainnet the name owner
 /// is the custody Safe (#420) — the deployer key that runs this script never holds
 /// that role, on purpose, so the script has no private key to send these with even
@@ -67,25 +71,31 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 /// WHY PLAN-ONLY MODE EXISTS (`EXISTING_RESOLVER`)
 ///
 /// One `L1Resolver` can serve many names — `url` and `signer` are shared, while
-/// `l2Registry` and `fallbackResolver` are keyed per node. If a resolver was
+/// settings are keyed per (node, owner). If a resolver was
 /// already deployed for a throwaway name during rehearsal, the mainnet cutover for
 /// `woco.eth` reuses that SAME contract rather than deploying a second one with a
 /// second gateway signer to keep in sync. Plan-only mode skips the broadcast
 /// entirely and instead verifies the reused resolver actually matches what the
 /// operator described (G15/G16) before computing the same plan.
 ///
-/// ⚠️ `RESOLVER_OWNER` IS SINGLE-STEP AND IRREVERSIBLE — `L1Resolver` is plain
-/// `Ownable`, not `Ownable2Step`. An address you do not control freezes
-/// `setURL`/`setSigner` for good. Unlike the sub-ENS registry, though, this
-/// contract is REPLACEABLE: the name owner can always `setResolver` away from it
-/// with one transaction touching no name on L2 — a frozen owner degrades the
-/// gateway URL/signer, it does not strand the name. Verify `RESOLVER_OWNER` on a
-/// block explorer before broadcasting regardless.
+/// ⚠️ `RESOLVER_OWNER` IS SET IN ONE STEP, BY THE CONSTRUCTOR. `L1Resolver` is
+/// `Ownable2Step`, but the two-step accept only guards LATER transfers; the
+/// constructor argument takes effect immediately, and renounce is disabled. An
+/// address you do not control therefore holds `setURL`/`setSigner`/
+/// `setDefaultModule` for good. The name owner can still `setResolver` away with
+/// one transaction touching no name on L2 — a wrong owner degrades the gateway
+/// settings, it does not strand the name. Verify `RESOLVER_OWNER` on a block
+/// explorer before broadcasting regardless.
 contract DeployL1Resolver is Script {
     /// @notice The canonical ENS registry address `L1Resolver`'s constructor
     ///         hardcodes. Declared again here, rather than read off the resolver,
     ///         so G8 can run before anything is deployed or reused.
     address constant ENS_ADDRESS = 0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e;
+
+    /// @notice The mainnet NameWrapper. Its admin is the zero address and no
+    ///         upgrade contract is set, so no wrapped name can ever leave it -
+    ///         which is why the resolver may hold it immutably (audit 964 I-3).
+    address constant MAINNET_NAME_WRAPPER = 0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401;
 
     /// @notice Everything this script reads from its environment, in one place.
     struct Config {
@@ -96,6 +106,7 @@ contract DeployL1Resolver is Script {
         uint64 l2ChainId;
         address l2RegistryAddress;
         address fallbackResolver;
+        address nameWrapper;
         address expectNameOwner;
         string parentName;
         string gatewayUrl;
@@ -115,8 +126,7 @@ contract DeployL1Resolver is Script {
         bool wrapped;
         address nameOwner;
         address currentResolver;
-        bytes setL2RegistryCall;
-        bytes setFallbackResolverCall;
+        bytes configureCall;
         address swapTarget;
         bytes swapCall;
         bytes rollbackCall;
@@ -135,6 +145,7 @@ contract DeployL1Resolver is Script {
         c.l2ChainId = uint64(vm.envUint("L2_CHAIN_ID"));
         c.l2RegistryAddress = vm.envAddress("L2_REGISTRY_ADDRESS");
         c.fallbackResolver = vm.envAddress("FALLBACK_RESOLVER");
+        c.nameWrapper = vm.envOr("NAME_WRAPPER", block.chainid == 1 ? MAINNET_NAME_WRAPPER : address(0));
         // Required, not defaulted to the deployer or to anything else — see G14.
         c.expectNameOwner = vm.envAddress("EXPECT_NAME_OWNER");
         c.parentName = vm.envOr("PARENT_NAME", string("woco.eth"));
@@ -225,6 +236,14 @@ contract DeployL1Resolver is Script {
             "the canonical ENS registry has no code on this chain - are you pointed at an L2 by mistake?"
         );
 
+        // G13. The wrapper is immutable in the resolver, so a wrong one could
+        // never be fixed. On mainnet only the canonical wrapper is accepted.
+        require(c.nameWrapper.code.length > 0, "NAME_WRAPPER has no code");
+        require(
+            block.chainid != 1 || c.nameWrapper == MAINNET_NAME_WRAPPER,
+            "NAME_WRAPPER is not the mainnet NameWrapper 0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401"
+        );
+
         ens = ENS(ENS_ADDRESS);
         (dnsName, node) = NameEncoder.dnsEncodeName(c.parentName);
 
@@ -282,7 +301,7 @@ contract DeployL1Resolver is Script {
 
         if (!planOnly) {
             vm.startBroadcast(c.deployerPk);
-            resolver = new L1Resolver(c.gatewayUrl, c.gatewaySigner, c.resolverOwner);
+            resolver = new L1Resolver(c.gatewayUrl, c.gatewaySigner, c.resolverOwner, INameWrapper(c.nameWrapper));
             vm.stopBroadcast();
         } else {
             // G15
@@ -325,10 +344,10 @@ contract DeployL1Resolver is Script {
         address currentResolver,
         bool planOnly
     ) internal returns (Plan memory plan) {
-        // G13
+        // G13 (post-deploy half): the resolver holds the wrapper the operator named.
         require(
-            address(resolver.nameWrapper()) != address(0),
-            "the deployed/reused resolver's nameWrapper is the zero address"
+            address(resolver.nameWrapper()) == c.nameWrapper,
+            "the deployed/reused resolver's nameWrapper does not match NAME_WRAPPER"
         );
 
         // G14. #420 custody: the printed transactions are for this signer,
@@ -379,14 +398,33 @@ contract DeployL1Resolver is Script {
             wrapped: wrapped,
             nameOwner: nameOwner,
             currentResolver: currentResolver,
-            setL2RegistryCall: abi.encodeCall(L1Resolver.setL2Registry, (node, c.l2ChainId, c.l2RegistryAddress)),
-            setFallbackResolverCall: abi.encodeCall(L1Resolver.setFallbackResolver, (node, c.fallbackResolver)),
+            configureCall: _configureCall(c, node, nameOwner),
             swapTarget: swapTarget,
             swapCall: abi.encodeWithSignature("setResolver(bytes32,address)", node, address(resolver)),
             rollbackCall: abi.encodeWithSignature("setResolver(bytes32,address)", node, currentResolver)
         });
 
         _printPlan(plan, dnsName);
+    }
+
+    /// @dev The one settings call the name owner sends: into its OWN slot,
+    ///      with no module (the built-in signer path). Split out only for the
+    ///      stack.
+    function _configureCall(Config memory c, bytes32 node, address nameOwner) internal pure returns (bytes memory) {
+        return abi.encodeCall(
+            L1Resolver.configure,
+            (
+                node,
+                nameOwner,
+                L1Resolver.Settings({
+                    chainId: c.l2ChainId,
+                    registry: c.l2RegistryAddress,
+                    fallbackResolver: c.fallbackResolver,
+                    module: address(0),
+                    moduleData: ""
+                })
+            )
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -399,30 +437,33 @@ contract DeployL1Resolver is Script {
         console.log(plan.wrapped ? "(wrapped: yes)" : "(wrapped: no)");
         console.log("================================================================");
 
-        console.log("1. setL2Registry");
+        console.log("1. configure - the settings, into the name owner's own slot");
         console.log("   to:  ", plan.resolver);
         console.log("   data:");
-        console.logBytes(plan.setL2RegistryCall);
+        console.logBytes(plan.configureCall);
 
-        console.log("2. setFallbackResolver");
-        console.log("   to:  ", plan.resolver);
-        console.log("   data:");
-        console.logBytes(plan.setFallbackResolverCall);
-
-        console.log("3. SWAP setResolver");
+        console.log("2. SWAP setResolver");
         console.log("   to:  ", plan.swapTarget);
         console.log("   data:");
         console.logBytes(plan.swapCall);
 
         console.log("----------------------------------------------------------------");
-        console.log("ROLLBACK (prepare before sending step 3)");
+        console.log("ROLLBACK (prepare before sending step 2)");
         console.log("   to:  ", plan.swapTarget);
         console.log("   data:");
         console.logBytes(plan.rollbackCall);
         console.log("----------------------------------------------------------------");
 
         bytes memory contenthashCall = abi.encodeWithSignature("contenthash(bytes32)", plan.node);
-        console.log("Verify BEFORE sending the swap:");
+        console.log("Verify BEFORE sending the swap - routeFor must name the owner and the settings above:");
+        console.log(
+            string.concat(
+                "  cast call ",
+                vm.toString(plan.resolver),
+                " \"routeFor(bytes)(bytes32,address,(uint64,address,address,address,bytes))\" ",
+                vm.toString(dnsName)
+            )
+        );
         console.log(
             string.concat(
                 "  cast call ",
@@ -465,8 +506,7 @@ contract DeployL1Resolver is Script {
         vm.serializeAddress(obj, "l2Registry", c.l2RegistryAddress);
         vm.serializeAddress(obj, "fallbackResolver", c.fallbackResolver);
         vm.serializeBool(obj, "planOnly", planOnly);
-        vm.serializeString(obj, "setL2RegistryCall", vm.toString(plan.setL2RegistryCall));
-        vm.serializeString(obj, "setFallbackResolverCall", vm.toString(plan.setFallbackResolverCall));
+        vm.serializeString(obj, "configureCall", vm.toString(plan.configureCall));
         vm.serializeString(obj, "swapCall", vm.toString(plan.swapCall));
         string memory json = vm.serializeString(obj, "rollbackCall", vm.toString(plan.rollbackCall));
 
