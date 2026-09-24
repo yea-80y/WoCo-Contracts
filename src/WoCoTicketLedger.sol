@@ -210,13 +210,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      by the first mint after the last one ended: across a boundary a
     ///      sponsor can mint up to twice its cap in a few seconds, accepted for
     ///      a backstop in exchange for one slot and no loops. The window runs on
-    ///      Arbitrum's `block.timestamp` (audit 960 L-5), which its sequencer
-    ///      sets. Arbitrum One's SequencerInbox accepts a batch only if its
-    ///      timestamps lie between 24h before and 768 s after the L1 block that
-    ///      posts it (`maxTimeVariation`, read on L1 2026-09-24; governance can
-    ///      change it). In practice it tracks real time to seconds and drifts
-    ///      only when the sequencer stops posting. So the bound is "cap per
-    ///      window of chain time", not per wall-clock hour.
+    ///      Arbitrum's `block.timestamp` (audit 960 L-5), under the chain-time
+    ///      rule stated on `registerEvent`'s `eventEndTs`. So the bound is "cap
+    ///      per window of chain time", not per wall-clock hour.
     ///
     ///      Moving into or out of `UNLIMITED_MINTS` closes the open window
     ///      (audit 960 M-2): unlimited mints are never counted, so a count from
@@ -368,19 +364,26 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      * @param eventEndTs   UNIX seconds; the on-chain sales cutoff. `claimFor`
      *                     reverts `SalesClosed` at or after this. Immutable
      *                     once stamped — see the monotonicity note above.
-     *                     It is CHAIN time (audit 961 M-2). Arbitrum One's
-     *                     SequencerInbox bounds `block.timestamp` to between
-     *                     24h behind and 768 s (12.8 min) ahead of the L1 block
-     *                     that posts the batch (`maxTimeVariation`, read on L1
-     *                     2026-09-24; governance can change it); in practice it
-     *                     tracks real time to seconds and drifts only when the
-     *                     sequencer stops posting. So this cutoff can arrive up
-     *                     to ~24h late or minutes early. The platform enforces
-     *                     the real cutoff off chain, before any charge; this is
-     *                     the backstop. Anything that releases money on this
-     *                     value must tolerate it arriving early - allow an hour,
-     *                     well above the 768 s bound - while a late clock only
-     *                     delays a release, which is safe.
+     *                     It is CHAIN time (audit 961 M-2). The sequencer stamps
+     *                     blocks from its own clock, which in practice tracks
+     *                     real time to seconds. The hard rule on the final
+     *                     chain: each block's timestamp is CLAMPED into
+     *                     [P - 24h, P + 768 s], P being the timestamp of the L1
+     *                     block that posts its batch, and is never below the
+     *                     previous block's (Arbitrum One
+     *                     `SequencerInbox.maxTimeVariation`, read on L1
+     *                     2026-09-24, governance can change it; nitro
+     *                     `arbstate/inbox.go` getNextMsg,
+     *                     `arbos/block_processor.go` createNewHeader). P is the
+     *                     POSTING time, so a sequencer that holds batches back
+     *                     can stamp blocks ahead of when a transaction was
+     *                     ordered by that delay plus 768 s. So this cutoff can
+     *                     arrive up to ~24h late, or early. The platform
+     *                     enforces the real cutoff off chain, before any charge;
+     *                     this is the backstop. Nothing that moves money may
+     *                     rely on this value finer than hours (Arbitrum's own
+     *                     guidance): release delays belong in days. A late clock
+     *                     only delays a release, which is safe.
      */
     function registerEvent(
         address organiser,
@@ -651,11 +654,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      one simply lapses. Do not build a flow in which someone holds a
      *      signature to submit later.
      *
-     *      `deadline` is CHAIN time (audit 961 L-2). Arbitrum One bounds
-     *      `block.timestamp` to between 24h behind and 768 s ahead of the L1
-     *      block that posts the batch (in practice it drifts only when the
-     *      sequencer stops posting), so a signature can stay valid up to ~24h
-     *      past the wall-clock deadline, or lapse minutes early. To void one for certain, move the slot,
+     *      `deadline` is CHAIN time (audit 961 L-2), under the rule stated on
+     *      `registerEvent`'s `eventEndTs`: a signature can stay valid up to
+     *      ~24h past the wall-clock deadline, or lapse early. To void one for certain, move the slot,
      *      which consumes the nonce.
      *
      *      The digest names `from` and the nonce as read at SUBMISSION (audit
