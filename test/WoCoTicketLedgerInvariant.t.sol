@@ -361,11 +361,11 @@ contract WoCoTicketLedgerInvariantTest is Test {
 
     function setUp() public {
         // Deploy with the handler as the initial authorised sponsor.
-        ledger  = new WoCoTicketLedger(owner, address(0xDEAD));
+        ledger  = new WoCoTicketLedger(owner, address(0xDEAD), type(uint32).max);
         handler = new LedgerHandler(ledger);
 
         vm.prank(owner);
-        ledger.addSponsor(address(handler));
+        ledger.addSponsor(address(handler), type(uint32).max);
 
         targetContract(address(handler));
     }

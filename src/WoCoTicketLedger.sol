@@ -5,6 +5,11 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
+/// @dev `WoCoTicketLedger.UNLIMITED_MINTS`, at file level so the deploy script
+///      can import the one definition (a contract's constant cannot be read
+///      from its type).
+uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
+
 /**
  * @title WoCoTicketLedger
  * @notice Allocation ledger for event tickets. Mints slots and lets their
@@ -19,7 +24,8 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  *
  *   On an event it did not itself register, sponsor authority grants exactly
  *   ONE power: appending new slots — within the supply stamped at
- *   registration, before `eventEndTs`, and only while not cancelled.
+ *   registration, before `eventEndTs`, only while not cancelled, and within
+ *   that sponsor's hourly mint cap.
  *
  * Sponsors cannot cancel such an event, cannot alter its stamped terms, and
  * cannot touch slots that already exist. That statement is what a payments
@@ -31,6 +37,27 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  * having stamped itself as their organiser, cancel those. That is not sponsor
  * authority — it is what any address can do, and it reaches only events that
  * caller created. The guarantee above is about the events it did not.
+ *
+ * ── What bounds a sponsor (audit 959 M-1) ────────────────────────────────────
+ *
+ * "Can only append" is not "harmless": appending is the valuable act. A slot
+ * is a ticket the door accepts, and supply once allocated never comes back.
+ * A card sponsor is a hot key that must be online around the clock, and the
+ * chain cannot check the Stripe payment it acts on. So every sponsor is also
+ * bounded by an hourly mint cap the owner sets per sponsor: a leaked key takes
+ * at most its cap per window, and at most twice it across a window boundary
+ * (see `MintAllowance`), until the owner calls `removeSponsor` or
+ * `setSponsorMintCap(sponsor, 0)`.
+ *
+ * `UNLIMITED_MINTS` is for a sponsor whose mints the chain CAN check — a
+ * payments contract that mints only in the transaction that takes the money.
+ * Caps are per sponsor, not shared, so one rail's leak or on-sale can never
+ * exhaust another's allowance. Scoping sponsors to events was rejected: one
+ * platform key registers AND mints every event, so it would bound nothing.
+ * The flip side (audit 960 L-7): one sponsor's cap is shared by every event it
+ * mints into, so a busy on-sale can use an hour that another event's buyers
+ * then wait out. That is watched off chain (`sponsorMintAllowance`) and met by
+ * raising the cap, not by partitioning it here.
  *
  * ── The trust boundary with WoCoPayments ─────────────────────────────────────
  *
@@ -67,8 +94,12 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  * CURRENT owner. `owner` used to be immutable, so keying on it was merely
  * unusual; now a holder can move it, and a payments contract that read
  * `getSlotData(...).owner` to pick a payee would let a ledger transition
- * redirect money — the one thing the rule above forbids. WoCoEventV2 already
- * got this right by paying `batchClaimer` (WoCoEventV2.sol:537); keep that shape.
+ * redirect money — the one thing the rule above forbids. Nor is the batch's
+ * `claimer` (`getSlotData`) a payee: here it is the MINTING SPONSOR, which for
+ * every card sale is the same platform wallet whoever paid (audit 960 I-6).
+ * WoCoEventV2 paid its claimer (WoCoEventV2.sol:537) because there the claimer
+ * was the payer; on this ledger that is true only of a payments contract
+ * minting its own sales, and even then its own record of who paid is the key.
  *
  * ── Why there is no drop gate ────────────────────────────────────────────────
  *
@@ -147,16 +178,21 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
-    /// Address allowed to `forceCancelEvent`. Initially the owner; designed to
-    /// be rotated to a multisig / DAO. Deliberately NOT the payments contract:
+    /// Address allowed to `forceCancelEvent`. Initially the owner, and moves
+    /// with an ownership handover whenever it equals the outgoing owner
+    /// (`_transferOwnership`); while it is a different address, a handover
+    /// leaves it where it is. Deliberately NOT the payments contract:
     /// keeping this a human-controlled address is what keeps the dependency
     /// one-directional.
     address public disputeAuthority;
 
     mapping(bytes32 => Event) private _events;
-    mapping(bytes32 => mapping(uint256 => Slot)) public slots;
-    mapping(bytes32 => mapping(uint64 => bytes32)) public batchOrderRef;
-    mapping(bytes32 => mapping(uint64 => address)) public batchClaimer;
+    // Private (audit 959 L-2): public getters here returned another batch's
+    // claimer and orderRef for an unclaimed slot. `getSlotData` and `slotOwner`
+    // are the reads, and the only ones that get unclaimed slots right.
+    mapping(bytes32 => mapping(uint256 => Slot)) private _slots;
+    mapping(bytes32 => mapping(uint64 => bytes32)) private _batchOrderRef;
+    mapping(bytes32 => mapping(uint64 => address)) private _batchClaimer;
 
     /// eventId derivation counter, keyed by REGISTRANT. See the note above.
     mapping(address => uint256) public registrantNonce;
@@ -164,6 +200,38 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// Addresses permitted to mint. The Stripe webhook's sponsor wallet today;
     /// WoCoPayments once it ships; any future sponsor contract after that.
     mapping(address => bool) public authorisedSponsors;
+
+    /// @notice A sponsor's hourly mint accounting. One slot.
+    /// @dev `perHour` is `UNLIMITED_MINTS` (no accounting at all), 0 (the
+    ///      sponsor stays authorised but mints nothing), or a cap. The window's
+    ///      END is stored, not its start, and a retune between finite caps
+    ///      writes only `perHour`, so it never re-anchors an open window or hands
+    ///      back spent allowance (the registrar's audit 937 F6). Fixed window, opened
+    ///      by the first mint after the last one ended: across a boundary a
+    ///      sponsor can mint up to twice its cap in a few seconds, accepted for
+    ///      a backstop in exchange for one slot and no loops. The window runs on
+    ///      Arbitrum's `block.timestamp` (audit 960 L-5), under the chain-time
+    ///      rule stated on `registerEvent`'s `eventEndTs`. So the bound is "cap
+    ///      per window of chain time", not per wall-clock hour.
+    ///
+    ///      Moving into or out of `UNLIMITED_MINTS` closes the open window
+    ///      (audit 960 M-2): unlimited mints are never counted, so a count from
+    ///      before an unlimited spell is stale, not spent allowance.
+    struct MintAllowance {
+        uint32 perHour;
+        uint32 used;
+        uint64 windowEnd;
+    }
+
+    mapping(address => MintAllowance) private _mintAllowance;
+
+    /// @notice `perHour` meaning "no cap".
+    uint32 public constant UNLIMITED_MINTS = LEDGER_UNLIMITED_MINTS;
+
+    /// @notice Every capped sponsor's window. Fixed, not owner-tunable: the
+    ///         cap is the one knob, and a tunable window is what let the
+    ///         registrar's owner brick minting by overflow (audit 925 F3).
+    uint64 public constant MINT_WINDOW = 1 hours;
 
     /// Per-slot counter consumed by EVERY ownership change, on either transfer
     /// path. A signed transfer commits to its current value, so a signature is
@@ -205,17 +273,26 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      It is also the invalidation signal for anything holding a SNAPSHOT
     ///      of slot owners — the offline check-in pack above all, which is
     ///      sound only as of the block it was built at.
+    ///
+    ///      `to` is indexed rather than `slot` (audit 959 I-4, #562): "what did
+    ///      wallet X receive" is what a wallet, passport or door asks, and only
+    ///      an indexed field can be filtered by the node. `slot` decodes from
+    ///      data.
     event SlotTransferred(
         bytes32 indexed eventId,
-        uint256 indexed slot,
+        uint256 slot,
         address indexed from,
-        address to
+        address indexed to
     );
 
-    event EventCancelled(bytes32 indexed eventId, address indexed by);
+    /// @dev `forced` is true for `forceCancelEvent`, false for the organiser's
+    ///      own `cancelEvent` (audit 960 L-4): `by` alone cannot tell them apart
+    ///      when the dispute authority is also an event's organiser.
+    event EventCancelled(bytes32 indexed eventId, address indexed by, bool forced);
 
     event SponsorAdded(address indexed sponsor);
     event SponsorRemoved(address indexed sponsor);
+    event SponsorMintCapSet(address indexed sponsor, uint32 perHour);
     event DisputeAuthorityUpdated(address indexed authority);
 
     // ── Errors ────────────────────────────────────────────────────────────────
@@ -237,6 +314,15 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error SignatureExpired();
     error EmptyManifestRef();
     error RenounceDisabled();
+    error NotSponsor();
+    /// @dev `windowResetsAt` is when the sponsor's window ends. If its cap is 0
+    ///      the reset lifts nothing: read `sponsorMintAllowance(sponsor).perHour`
+    ///      before retrying. If the last window had already ended, the call
+    ///      opened a new one only in memory and reverted with it (audit 961
+    ///      I-4): the value is when a window opened by that call would end, and
+    ///      nothing was stored, so the next mint opens its own window.
+    error MintCapExceeded(address sponsor, uint64 windowResetsAt);
+    error TransferToLedger();
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -252,16 +338,13 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
-    constructor(address initialOwner, address initialSponsor)
+    constructor(address initialOwner, address initialSponsor, uint32 initialSponsorPerHour)
         Ownable(initialOwner)
         EIP712("WoCoTicketLedger", "1")
     {
-        if (initialSponsor == address(0)) revert ZeroAddress();
-
         disputeAuthority = initialOwner;
 
-        authorisedSponsors[initialSponsor] = true;
-        emit SponsorAdded(initialSponsor);
+        _addSponsor(initialSponsor, initialSponsorPerHour);
         emit DisputeAuthorityUpdated(initialOwner);
     }
 
@@ -281,6 +364,26 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      * @param eventEndTs   UNIX seconds; the on-chain sales cutoff. `claimFor`
      *                     reverts `SalesClosed` at or after this. Immutable
      *                     once stamped — see the monotonicity note above.
+     *                     It is CHAIN time (audit 961 M-2). The sequencer stamps
+     *                     blocks from its own clock, which in practice tracks
+     *                     real time to seconds. The hard rule on the final
+     *                     chain: each block's timestamp is CLAMPED into
+     *                     [P - 24h, P + 768 s], P being the timestamp of the L1
+     *                     block that posts its batch, and is never below the
+     *                     previous block's (Arbitrum One
+     *                     `SequencerInbox.maxTimeVariation`, read on L1
+     *                     2026-09-24, governance can change it; nitro
+     *                     `arbstate/inbox.go` getNextMsg,
+     *                     `arbos/block_processor.go` createNewHeader). P is the
+     *                     POSTING time, so a sequencer that holds batches back
+     *                     can stamp blocks ahead of when a transaction was
+     *                     ordered by that delay plus 768 s. So this cutoff can
+     *                     arrive up to ~24h late, or early. The platform
+     *                     enforces the real cutoff off chain, before any charge;
+     *                     this is the backstop. Nothing that moves money may
+     *                     rely on this value finer than hours (Arbitrum's own
+     *                     guidance): release delays belong in days. A late clock
+     *                     only delays a release, which is safe.
      */
     function registerEvent(
         address organiser,
@@ -355,20 +458,23 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         returns (uint256 slot)
     {
         if (to == address(0)) revert ZeroAddress();
+        // Same sink as `_transfer` refuses, by the mint road (audit 960 M-1).
+        if (to == address(this)) revert TransferToLedger();
         Event storage ev = _events[eventId];
         if (!ev.exists)                       revert EventNotFound();
         if (ev.cancelled)                     revert AlreadyCancelled();
         if (block.timestamp >= ev.eventEndTs) revert SalesClosed();
         if (ev.nextSlot >= ev.totalSupply)    revert InsufficientSupply();
+        _consumeMintAllowance(1);
 
         uint64 first = ev.nextSlot;
         slot = uint256(first);
         // safe: first < totalSupply ≤ uint64.max
         unchecked { ev.nextSlot = first + 1; }
 
-        slots[eventId][slot] = Slot({owner: to, batchFirstSlot: first});
-        batchOrderRef[eventId][first] = orderRef;
-        batchClaimer[eventId][first]  = msg.sender;
+        _slots[eventId][slot] = Slot({owner: to, batchFirstSlot: first});
+        _batchOrderRef[eventId][first] = orderRef;
+        _batchClaimer[eventId][first]  = msg.sender;
 
         emit SlotClaimed(eventId, slot, to, msg.sender, orderRef);
     }
@@ -402,23 +508,29 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
         uint64 first = ev.nextSlot;
         firstSlot = uint256(first);
+        // safe: first < 2^64 and n <= 100, so the uint256 sum cannot overflow
         unchecked {
             if (uint256(first) + n > ev.totalSupply) revert InsufficientSupply();
         }
+        _consumeMintAllowance(n);
 
-        batchOrderRef[eventId][first] = orderRef;
-        batchClaimer[eventId][first]  = msg.sender;
+        _batchOrderRef[eventId][first] = orderRef;
+        _batchClaimer[eventId][first]  = msg.sender;
 
         for (uint256 i; i < n;) {
             address to = owners[i];
             if (to == address(0)) revert ZeroAddress();
+            if (to == address(this)) revert TransferToLedger();
             uint256 s;
+            // safe: firstSlot + i < first + n <= totalSupply < 2^64
             unchecked { s = firstSlot + i; }
-            slots[eventId][s] = Slot({owner: to, batchFirstSlot: first});
+            _slots[eventId][s] = Slot({owner: to, batchFirstSlot: first});
             emit SlotClaimed(eventId, s, to, msg.sender, orderRef);
+            // safe: i < n <= 100
             unchecked { ++i; }
         }
 
+        // safe: first + n <= totalSupply <= uint64.max, checked above
         unchecked { ev.nextSlot = first + n64; }
     }
 
@@ -542,6 +654,18 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      one simply lapses. Do not build a flow in which someone holds a
      *      signature to submit later.
      *
+     *      `deadline` is CHAIN time (audit 961 L-2), under the rule stated on
+     *      `registerEvent`'s `eventEndTs`: a signature can stay valid up to
+     *      ~24h past the wall-clock deadline, or lapse early. To void one for certain, move the slot,
+     *      which consumes the nonce.
+     *
+     *      The digest names `from` and the nonce as read at SUBMISSION (audit
+     *      961 L-4). A message naming the signer as `from` for a slot it does
+     *      not yet hold becomes valid once the slot is minted, or later moved,
+     *      to it while the nonce still equals the one it signed.
+     *      Wallets and the platform must never ask a holder to sign a transfer
+     *      for a slot it does not hold now.
+     *
      *      Everything `transferSlot` documents — the check-in pack window,
      *      provenance, cancellation and `eventEndTs`, contract recipients —
      *      applies unchanged: both paths share `_transfer`.
@@ -584,7 +708,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
                     TRANSFER_SLOT_TYPEHASH,
                     eventId,
                     slot,
-                    slots[eventId][slot].owner,
+                    _slots[eventId][slot].owner,
                     newOwner,
                     transferNonces[eventId][slot],
                     deadline
@@ -598,8 +722,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      for `transferSlotWithSignature`. Neither can be address(0).
     function _transfer(bytes32 eventId, uint256 slot, address authority, address newOwner) internal {
         if (newOwner == address(0)) revert ZeroAddress();
+        // The ledger holds no key and never calls itself, so a slot sent here
+        // could never move again: the burn this contract forbids, by another
+        // road (audit 959 I-8). Its own error, so the guard is killable alone.
+        if (newOwner == address(this)) revert TransferToLedger();
 
-        Slot storage sd = slots[eventId][slot];
+        Slot storage sd = _slots[eventId][slot];
         address previousOwner = sd.owner;
 
         // Distinct selector from NotSlotOwner on purpose. Holder-only auth
@@ -645,20 +773,20 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         if (ev.cancelled)               revert AlreadyCancelled();
 
         ev.cancelled = true;
-        emit EventCancelled(eventId, msg.sender);
+        emit EventCancelled(eventId, msg.sender, false);
     }
 
     /**
      * @notice Cancel an event when the organiser will not — or cannot. Dispute
      *         authority only. Same one-way flag as `cancelEvent`; separate
      *         entrypoint so the power is distinguishable on chain from an
-     *         organiser's own cancellation.
+     *         organiser's own cancellation (`EventCancelled.forced`).
      *
      *         "or cannot" is load-bearing today: no code in the platform calls
      *         `cancelEvent` yet, so until an organiser-facing cancel is wired
      *         (the stamped organiser is a Kernel smart account or EOA and can
      *         call it directly — the sponsored-userop rail already exists for
-     *         EAS attestations), every real cancellation arrives here. If the
+     *         Kernel accounts), every real cancellation arrives here. If the
      *         server should instead relay an organiser's cancellation, this
      *         contract needs a signature-authorised `cancelEventBySig` and it
      *         must be added BEFORE deploy — the contract is immutable.
@@ -674,7 +802,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         if (ev.cancelled) revert AlreadyCancelled();
 
         ev.cancelled = true;
-        emit EventCancelled(eventId, msg.sender);
+        emit EventCancelled(eventId, msg.sender, true);
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -721,19 +849,19 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     function getSlotData(bytes32 eventId, uint256 slot)
         external
         view
-        returns (address owner, address claimer, bytes32 orderRef)
+        returns (address holder, address claimer, bytes32 orderRef)
     {
-        Slot memory sd = slots[eventId][slot];
+        Slot memory sd = _slots[eventId][slot];
         if (sd.owner == address(0)) return (address(0), address(0), bytes32(0));
         return (
             sd.owner,
-            batchClaimer[eventId][sd.batchFirstSlot],
-            batchOrderRef[eventId][sd.batchFirstSlot]
+            _batchClaimer[eventId][sd.batchFirstSlot],
+            _batchOrderRef[eventId][sd.batchFirstSlot]
         );
     }
 
     function slotOwner(bytes32 eventId, uint256 slot) external view returns (address) {
-        return slots[eventId][slot].owner;
+        return _slots[eventId][slot].owner;
     }
 
     /// @notice Slots remaining to be sold now: zero once the event is cancelled
@@ -745,6 +873,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      must change with them. Reporting stamped supply instead would show
     ///      a cancelled or closed event as on sale; that figure, regardless of
     ///      state, is `getEvent`'s `totalSupply - nextSlot`.
+    ///
+    ///      It says nothing about any sponsor's hourly cap, nor whether a batch
+    ///      of a given size fits (audit 960 I-8): those are
+    ///      `sponsorMintAllowance` and this figure read together.
     ///
     ///      Reverts `EventNotFound` for an unknown id, like `getEvent` and
     ///      `getEventStatus`: returning 0 made a mistyped id indistinguishable
@@ -759,27 +891,134 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     // ── Admin ─────────────────────────────────────────────────────────────────
 
-    function addSponsor(address sponsor) external onlyOwner {
-        if (sponsor == address(0)) revert ZeroAddress();
-        authorisedSponsors[sponsor] = true;
-        emit SponsorAdded(sponsor);
+    /// @notice Authorise `sponsor` to mint, at most `perHour` slots per hour.
+    /// @dev The cap is required, never defaulted: choosing it is the decision
+    ///      that bounds a leaked key. `UNLIMITED_MINTS` for a sponsor the chain
+    ///      can check. Re-adding a removed sponsor keeps its open window
+    ///      unless the new cap crosses the unlimited boundary (see
+    ///      `MintAllowance`).
+    function addSponsor(address sponsor, uint32 perHour) external onlyOwner {
+        _addSponsor(sponsor, perHour);
     }
 
+    /// @dev Succeeds, and emits, for an address that is not a sponsor, on
+    ///      purpose (audit 960 I-3, 961 L-1): the emergency lever must stay
+    ///      idempotent, so a Safe batch never reverts because a key was
+    ///      already removed. `authorisedSponsors` is the state; the event is
+    ///      not proof a sponsor existed.
     function removeSponsor(address sponsor) external onlyOwner {
         authorisedSponsors[sponsor] = false;
         emit SponsorRemoved(sponsor);
     }
 
+    /// @notice Retune an authorised sponsor's hourly cap. Takes effect on its
+    ///         next mint; raising it lifts a refusal at once, and 0 stops the
+    ///         sponsor minting without de-authorising it.
+    /// @dev Between finite caps it writes `perHour` only: the open window keeps
+    ///      its end and its count. Into or out of `UNLIMITED_MINTS` it closes the
+    ///      window (audit 960 M-2).
+    function setSponsorMintCap(address sponsor, uint32 perHour) external onlyOwner {
+        if (!authorisedSponsors[sponsor]) revert NotSponsor();
+        _setMintCap(sponsor, perHour);
+    }
+
+    /// @notice A sponsor's cap, what it may still mint now, and when its window
+    ///         ends. For `/api/health` to report "mint cap reached until <time>"
+    ///         before a sale fails, rather than after.
+    /// @dev No open window: `mintable` is the whole cap and `windowResetsAt`
+    ///      is when a window opened now would end. Unlimited: `mintable` is
+    ///      `UNLIMITED_MINTS` and `windowResetsAt` 0. Says nothing about
+    ///      authorisation; that is `authorisedSponsors`.
+    function sponsorMintAllowance(address sponsor)
+        external
+        view
+        returns (uint32 perHour, uint32 mintable, uint64 windowResetsAt)
+    {
+        MintAllowance memory a = _mintAllowance[sponsor];
+        perHour = a.perHour;
+        if (perHour == UNLIMITED_MINTS) return (perHour, UNLIMITED_MINTS, 0);
+        uint64 nowTs = uint64(block.timestamp);
+        if (nowTs >= a.windowEnd) return (perHour, perHour, nowTs + MINT_WINDOW);
+        // A lowered cap can sit below what the window already spent.
+        mintable = a.used >= perHour ? 0 : perHour - a.used;
+        windowResetsAt = a.windowEnd;
+    }
+
     function setDisputeAuthority(address authority) external onlyOwner {
         if (authority == address(0)) revert ZeroAddress();
+        // The ledger never calls itself, so this would brick force-cancel (audit 960 I-9).
+        if (authority == address(this)) revert TransferToLedger();
         disputeAuthority = authority;
         emit DisputeAuthorityUpdated(authority);
+    }
+
+    /// @dev Moves `disputeAuthority` with ownership while the two are the same
+    ///      address (audit 959 L-1). A handover is often made BECAUSE the old
+    ///      owner's signers are suspect, and without this the old owner kept
+    ///      `forceCancelEvent` over every event, one-way, until a second call
+    ///      caught it. THE RULE: at a handover, if the dispute authority IS the
+    ///      outgoing owner it moves to the new owner; otherwise it stays where
+    ///      it is. It is keyed on the address, not on a "set apart" flag, on
+    ///      purpose (audit
+    ///      960 L-1): after `setDisputeAuthority(D)` and a handover to D, D holds
+    ///      both roles, and a flag would let a later handover away from D leave
+    ///      the retiring D with force-cancel, which is exactly the defect above.
+    ///      `previous == address(0)` is the constructor's call, whose body sets
+    ///      the authority itself.
+    ///
+    ///      A convenience for an honest owner, not a control against a
+    ///      malicious one (audit 961 I-2): the owner can set the authority
+    ///      anywhere but zero and this contract, with `setDisputeAuthority`, at
+    ///      any time.
+    function _transferOwnership(address newOwner) internal override {
+        address previous = owner();
+        super._transferOwnership(newOwner);
+        if (previous != address(0) && disputeAuthority == previous) {
+            disputeAuthority = newOwner;
+            emit DisputeAuthorityUpdated(newOwner);
+        }
+    }
+
+    function _addSponsor(address sponsor, uint32 perHour) private {
+        if (sponsor == address(0)) revert ZeroAddress();
+        authorisedSponsors[sponsor] = true;
+        emit SponsorAdded(sponsor);
+        _setMintCap(sponsor, perHour);
+    }
+
+    function _setMintCap(address sponsor, uint32 perHour) private {
+        MintAllowance storage a = _mintAllowance[sponsor];
+        // Crossing the unlimited boundary closes the window; see `MintAllowance`.
+        if ((a.perHour == UNLIMITED_MINTS) != (perHour == UNLIMITED_MINTS)) {
+            a.used = 0;
+            a.windowEnd = 0;
+        }
+        a.perHour = perHour;
+        emit SponsorMintCapSet(sponsor, perHour);
+    }
+
+    /// @dev Charges `n` slots to the calling sponsor's window, opening a fresh
+    ///      window if the last one has ended. Reverts with the reset time so the
+    ///      server can report it. Unlimited sponsors skip it without a write.
+    function _consumeMintAllowance(uint256 n) internal {
+        MintAllowance memory a = _mintAllowance[msg.sender];
+        if (a.perHour == UNLIMITED_MINTS) return;
+        uint64 nowTs = uint64(block.timestamp);
+        if (nowTs >= a.windowEnd) {
+            a.windowEnd = nowTs + MINT_WINDOW;
+            a.used = 0;
+        }
+        if (uint256(a.used) + n > a.perHour) revert MintCapExceeded(msg.sender, a.windowEnd);
+        // safe: used + n <= perHour < 2^32 by the check above
+        // forge-lint: disable-next-line(unsafe-typecast)
+        a.used += uint32(n);
+        _mintAllowance[msg.sender] = a;
     }
 
     /// @notice Disabled: always reverts `RenounceDisabled`.
     /// @dev Renouncing would set `owner` to address(0) for good, and every
     ///      `onlyOwner` power would go with it — `addSponsor`, `removeSponsor`,
-    ///      `setDisputeAuthority`. A leaked sponsor key could then never be
+    ///      `setSponsorMintCap`, `setDisputeAuthority`. A leaked sponsor key could then never be
     ///      removed, nor a lost dispute authority replaced, on a contract that
     ///      is deployed once. `Ownable2Step` makes transfers two-step but leaves
     ///      renounce a single call, and renounce is the only road to a zero
