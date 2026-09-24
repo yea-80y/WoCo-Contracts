@@ -92,22 +92,33 @@ contract DeployWoCoTicketLedger is Script {
         require(c.perHour != LEDGER_UNLIMITED_MINTS, "INITIAL_SPONSOR must have a finite cap: UNLIMITED_MINTS is for a sponsor the chain can check, added later");
         if (!_isTestnet(block.chainid)) {
             require(c.owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on this chain");
-            // Code alone proves only "a contract" (audit 960 L-6): a wrong
-            // contract here bricks every onlyOwner function for good.
+            // Code, or answering Safe getters, proves only "a contract" (audits
+            // 960 L-6, 961 M-1): a hand-rolled contract can answer both. A proxy
+            // whose singleton (slot 0) is an official Safe release runs the real
+            // Safe logic, so its getters and signature checks are genuine.
+            require(_isCanonicalSafeProxy(c.owner), "INITIAL_OWNER is not a proxy of an official Safe singleton");
             require(_safeThreshold(c.owner) > 0, "INITIAL_OWNER does not answer getThreshold() like a Safe");
-            // Any Safe, or any contract with a catch-all fallback, passes the
-            // probe above; one we hold a key to is what the owner must be.
+            // A genuine Safe is not yet OUR Safe: it must list a signer we hold.
             require(c.ownerSigner != address(0), "INITIAL_OWNER_SIGNER must be set to a signer of the owner Safe");
             require(_safeIsOwner(c.owner, c.ownerSigner), "INITIAL_OWNER_SIGNER is not an owner of INITIAL_OWNER");
             require(c.owner != c.sponsor, "INITIAL_OWNER must not be the sponsor");
             // An EIP-7702 deployer has code, so the checks above do not rule it out (audit 960 I-4).
             require(c.owner != deployer, "INITIAL_OWNER must not be the deployer");
+            // The gas-only deployer key must never double as the hot sponsor (audit 961 L-3).
+            require(c.sponsor != deployer, "INITIAL_SPONSOR must not be the deployer");
         }
 
         console.log("Deploying WoCoTicketLedger...");
         console.log("  Chain ID:            ", block.chainid);
         console.log("  Deployer (gas only): ", deployer);
         console.log("  Owner + dispute auth:", c.owner);
+        if (!_isTestnet(block.chainid)) {
+            uint256 threshold = _safeThreshold(c.owner);
+            console.log("  Owner Safe threshold:", threshold);
+            // Not refused: signer policy is the owner's call, and the Safe can be
+            // raised to m-of-n at any time without touching this contract.
+            if (threshold < 2) console.log("  WARNING: the owner Safe is 1-of-n - every owner power rests on one key");
+        }
         console.log("  Initial sponsor:     ", c.sponsor);
         console.log("  Sponsor mints/hour:  ", c.perHour);
 
@@ -145,6 +156,19 @@ contract DeployWoCoTicketLedger is Script {
         (bool ok, bytes memory ret) = a.staticcall(abi.encodeWithSignature("getThreshold()"));
         if (!ok || ret.length != 32) return 0;
         return abi.decode(ret, (uint256));
+    }
+
+    /// @dev Official Safe singletons (same address on every chain, deterministic
+    ///      deployment), each checked on Arbitrum One on 2026-09-24 to hold code
+    ///      and report its VERSION. A Safe proxy keeps its singleton in slot 0.
+    function _isCanonicalSafeProxy(address a) internal view returns (bool) {
+        address singleton = address(uint160(uint256(vm.load(a, bytes32(0)))));
+        return singleton == 0x29fcB43b46531BcA003ddC8FCB67FFE91900C762  // SafeL2 1.4.1
+            || singleton == 0x41675C099F32341bf84BFc5382aF534df5C7461a  // Safe 1.4.1
+            || singleton == 0x3E5c63644E683549055b9Be8653de26E0B4CD36E  // SafeL2 1.3.0
+            || singleton == 0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552  // Safe 1.3.0
+            || singleton == 0xfb1bffC9d739B8D520DaF37dF666da4C687191EA  // SafeL2 1.3.0 (eip155)
+            || singleton == 0x69f4D1788e39c87893C980c06EdF4b7f686e2938; // Safe 1.3.0 (eip155)
     }
 
     /// @dev True only when `isOwner(signer)` answers one word equal to 1.

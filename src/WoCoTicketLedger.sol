@@ -210,9 +210,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      by the first mint after the last one ended: across a boundary a
     ///      sponsor can mint up to twice its cap in a few seconds, accepted for
     ///      a backstop in exchange for one slot and no loops. The window runs on
-    ///      Arbitrum's `block.timestamp`, which the sequencer may set up to about
-    ///      an hour ahead of or a day behind L1 (audit 960 L-5): the bound is
-    ///      "cap per window of chain time", not per wall-clock hour.
+    ///      Arbitrum's `block.timestamp` (audit 960 L-5): normally real time to
+    ///      seconds, but up to 24h behind or 1h ahead while the sequencer is not
+    ///      posting batches to L1, so the bound is "cap per window of chain
+    ///      time", not per wall-clock hour.
     ///
     ///      Moving into or out of `UNLIMITED_MINTS` closes the open window
     ///      (audit 960 M-2): unlimited mints are never counted, so a count from
@@ -317,7 +318,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error NotSponsor();
     /// @dev `windowResetsAt` is when the sponsor's window ends. If its cap is 0
     ///      the reset lifts nothing: read `sponsorMintAllowance(sponsor).perHour`
-    ///      before retrying.
+    ///      before retrying. If the last window had already ended, the call
+    ///      opened a new one only in memory and reverted with it (audit 961
+    ///      I-4): the value is when a window opened by that call would end, and
+    ///      nothing was stored, so the next mint opens its own window.
     error MintCapExceeded(address sponsor, uint64 windowResetsAt);
     error TransferToLedger();
 
@@ -361,6 +365,16 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      * @param eventEndTs   UNIX seconds; the on-chain sales cutoff. `claimFor`
      *                     reverts `SalesClosed` at or after this. Immutable
      *                     once stamped — see the monotonicity note above.
+     *                     It is CHAIN time (audit 961 M-2). Arbitrum's clock
+     *                     normally tracks real time to seconds, but its rules
+     *                     let the sequencer set `block.timestamp` up to 24h
+     *                     behind or 1h ahead, for when it has stopped posting
+     *                     batches to L1. So in that case this cutoff can arrive
+     *                     up to ~24h late or ~1h early. The platform enforces
+     *                     the real cutoff off chain, before any charge; this is
+     *                     the backstop. Anything that releases money on this
+     *                     value must tolerate it arriving up to an hour early -
+     *                     a late clock only delays a release, which is safe.
      */
     function registerEvent(
         address organiser,
@@ -485,6 +499,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
         uint64 first = ev.nextSlot;
         firstSlot = uint256(first);
+        // safe: first < 2^64 and n <= 100, so the uint256 sum cannot overflow
         unchecked {
             if (uint256(first) + n > ev.totalSupply) revert InsufficientSupply();
         }
@@ -498,12 +513,15 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
             if (to == address(0)) revert ZeroAddress();
             if (to == address(this)) revert TransferToLedger();
             uint256 s;
+            // safe: firstSlot + i < first + n <= totalSupply < 2^64
             unchecked { s = firstSlot + i; }
             _slots[eventId][s] = Slot({owner: to, batchFirstSlot: first});
             emit SlotClaimed(eventId, s, to, msg.sender, orderRef);
+            // safe: i < n <= 100
             unchecked { ++i; }
         }
 
+        // safe: first + n <= totalSupply <= uint64.max, checked above
         unchecked { ev.nextSlot = first + n64; }
     }
 
@@ -626,6 +644,18 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      use, submitted straight away, and given short deadlines, so an unused
      *      one simply lapses. Do not build a flow in which someone holds a
      *      signature to submit later.
+     *
+     *      `deadline` is CHAIN time (audit 961 L-2): normally real time to
+     *      seconds, but while the sequencer is not posting batches to L1 its
+     *      clock may lag up to 24h, keeping a signature valid that long past
+     *      the wall-clock deadline. To void one for certain, move the slot,
+     *      which consumes the nonce.
+     *
+     *      The digest names `from` and the nonce as read at SUBMISSION (audit
+     *      961 L-4). A message naming the signer as `from` for a slot it does
+     *      not yet hold becomes valid the moment that slot is minted to it.
+     *      Wallets and the platform must never ask a holder to sign a transfer
+     *      for a slot it does not hold now.
      *
      *      Everything `transferSlot` documents — the check-in pack window,
      *      provenance, cancellation and `eventEndTs`, contract recipients —
@@ -862,6 +892,11 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         _addSponsor(sponsor, perHour);
     }
 
+    /// @dev Succeeds, and emits, for an address that is not a sponsor, on
+    ///      purpose (audit 960 I-3, 961 L-1): the emergency lever must stay
+    ///      idempotent, so a Safe batch never reverts because a key was
+    ///      already removed. `authorisedSponsors` is the state; the event is
+    ///      not proof a sponsor existed.
     function removeSponsor(address sponsor) external onlyOwner {
         authorisedSponsors[sponsor] = false;
         emit SponsorRemoved(sponsor);
@@ -914,13 +949,17 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      `forceCancelEvent` over every event, one-way, until a second call
     ///      caught it. THE RULE: at a handover, if the dispute authority IS the
     ///      outgoing owner it moves to the new owner; otherwise it stays where
-    ///      it is. It is
-    ///      keyed on the address, not on a "set apart" flag, on purpose (audit
+    ///      it is. It is keyed on the address, not on a "set apart" flag, on
+    ///      purpose (audit
     ///      960 L-1): after `setDisputeAuthority(D)` and a handover to D, D holds
     ///      both roles, and a flag would let a later handover away from D leave
     ///      the retiring D with force-cancel, which is exactly the defect above.
     ///      `previous == address(0)` is the constructor's call, whose body sets
     ///      the authority itself.
+    ///
+    ///      A convenience for an honest owner, not a control against a
+    ///      malicious one (audit 961 I-2): the owner can set the authority
+    ///      anywhere with `setDisputeAuthority` at any time.
     function _transferOwnership(address newOwner) internal override {
         address previous = owner();
         super._transferOwnership(newOwner);

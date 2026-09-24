@@ -68,8 +68,13 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         s.run();
     }
 
+    /// The live owner Safe's singleton (SafeL2 1.4.1).
+    address constant SAFE_L2_141 = 0x29fcB43b46531BcA003ddC8FCB67FFE91900C762;
+
+    /// A Safe-shaped proxy: MockSafe's getters, with an official singleton in slot 0.
     function _etchSafe(address a) internal {
         vm.etch(a, address(new MockSafe()).code);
+        vm.store(a, bytes32(0), bytes32(uint256(uint160(SAFE_L2_141))));
     }
 
     function test_ArbitrumOne_RefusesAnOwnerWithoutCode() public {
@@ -79,12 +84,32 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         s.run();
     }
 
-    /// Code is not enough: a contract that is not a Safe is refused (audit 960 L-6).
+    /// Answering the Safe getters is not enough: the audit's FakeSafe, with no
+    /// official singleton behind it, is refused (audit 961 M-1).
+    function test_ArbitrumOne_RefusesAFakeSafe() public {
+        vm.chainId(42161);
+        vm.etch(owner, address(new MockSafe()).code);
+        TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
+        vm.expectRevert(bytes("INITIAL_OWNER is not a proxy of an official Safe singleton"));
+        s.run();
+    }
+
+    /// Slot 0 alone is not enough either: the proxy must answer getThreshold() (audit 960 L-6).
     function test_ArbitrumOne_RefusesAContractThatIsNotASafe() public {
         vm.chainId(42161);
         vm.etch(owner, hex"00");
+        vm.store(owner, bytes32(0), bytes32(uint256(uint160(SAFE_L2_141))));
         TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
         vm.expectRevert(bytes("INITIAL_OWNER does not answer getThreshold() like a Safe"));
+        s.run();
+    }
+
+    /// The gas-only deployer must never double as the hot sponsor (audit 961 L-3).
+    function test_ArbitrumOne_RefusesTheDeployerAsSponsor() public {
+        vm.chainId(42161);
+        _etchSafe(owner);
+        TestableDeployTicketLedger s = _script(owner, vm.addr(SCRIPT_DEPLOYER_PK), 1_000);
+        vm.expectRevert(bytes("INITIAL_SPONSOR must not be the deployer"));
         s.run();
     }
 
