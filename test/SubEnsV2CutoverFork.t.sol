@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {NameEncoder} from "@ensdomains/ens-contracts/utils/NameEncoder.sol";
 import {DeploySubEnsRegistry} from "../script/DeploySubEnsRegistry.s.sol";
 import {L1Resolver} from "../src/durin/L1Resolver.sol";
+import {IL1ResolverV1} from "./mocks/IL1ResolverV1.sol";
 import {L2Registry} from "../src/durin/L2Registry.sol";
 import {L2Resolver} from "../src/durin/L2Resolver.sol";
 import {WoCoRegistrar} from "../src/WoCoRegistrar.sol";
@@ -141,7 +142,7 @@ contract SubEnsV2CutoverForkTest is Test {
     /// C6 from the Safe that holds woco.eth, then the rollback. The apex keeps
     /// answering from L1 throughout.
     function _flipL1AndRollBack(address registry) internal {
-        L1Resolver l1 = L1Resolver(L1_RESOLVER);
+        IL1ResolverV1 l1 = IL1ResolverV1(L1_RESOLVER);
         (uint64 chainBefore, address registryBefore) = l1.l2Registry(WOCO_ETH);
         assertEq(chainBefore, 42161, "L1 does not point at Arbitrum One");
         assertEq(registryBefore, V1_REGISTRY, "L1 does not point at v1");
@@ -204,7 +205,7 @@ contract SubEnsV2CutoverForkTest is Test {
 
     /// The registry an L1 lookup sends the gateway to: the last argument of the
     /// `stuffedResolveCall` inside the `OffchainLookup` revert.
-    function _offchainRegistry(L1Resolver l1, string memory name) internal view returns (address) {
+    function _offchainRegistry(IL1ResolverV1 l1, string memory name) internal view returns (address) {
         bytes memory inner = abi.encodeWithSignature("addr(bytes32)", vm.ensNamehash(name));
         try l1.resolve(_dns(name), inner) returns (bytes memory) {
             revert("expected an OffchainLookup");

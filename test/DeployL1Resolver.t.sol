@@ -5,7 +5,7 @@ import {NameEncoder} from "@ensdomains/ens-contracts/utils/NameEncoder.sol";
 import {ScriptEnvFixture} from "./ScriptEnvFixture.sol";
 import {DeployL1Resolver} from "../script/DeployL1Resolver.s.sol";
 import {L1Resolver} from "../src/durin/L1Resolver.sol";
-import {MockENS, MockAddrResolver, MockNameWrapper, MockPublicResolver} from "./mocks/L1Mocks.sol";
+import {MockENS, MockNameWrapper, MockPublicResolver} from "./mocks/L1Mocks.sol";
 
 /**
  * Tests for the L1Resolver deploy script (#419).
@@ -25,10 +25,9 @@ import {MockENS, MockAddrResolver, MockNameWrapper, MockPublicResolver} from "./
  * so per-test variation can never race another test file.
  */
 contract DeployL1ResolverTest is ScriptEnvFixture {
-    /// The canonical ENS registry address `L1Resolver`'s constructor hardcodes.
+    /// The canonical ENS registry address `L1Resolver` hardcodes.
     address constant ENS_ADDRESS = 0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e;
-    /// namehash("namewrapper.eth"), read by the constructor.
-    bytes32 constant WRAPPER_NODE = 0xdee478ba2734e34d81c6adc77a32d75b29007895efa2fe60921f1c315e1ec7d9;
+    address constant MAINNET_NAME_WRAPPER = 0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401;
 
     string constant GATEWAY_URL = "https://events-api.woco-net.com/api/ens-gateway/v1/{sender}/{data}";
 
@@ -61,14 +60,12 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         // TestableDeployL1Resolver's Config, never through vm.setEnv.
         _setSharedScriptEnv();
 
-        // The constructor reads the ENS registry at a fixed address, then
-        // resolves namewrapper.eth through it. Etch a mock there, populate its
-        // storage through its own setters, and only then deploy anything.
+        // The resolver reads the ENS registry at a fixed address. Etch a mock
+        // there and populate it through its own setters.
         vm.etch(ENS_ADDRESS, address(new MockENS()).code);
         ens = MockENS(ENS_ADDRESS);
 
         wrapper = new MockNameWrapper();
-        ens.setResolver(WRAPPER_NODE, address(new MockAddrResolver(address(wrapper))));
 
         (dnsName, node) = NameEncoder.dnsEncodeName("woco.eth");
 
@@ -88,7 +85,14 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
     ///      a reader can see at a glance which fields a given test overrides.
     function _newScript() internal returns (TestableDeployL1Resolver) {
         return new TestableDeployL1Resolver(
-            SCRIPT_DEPLOYER_PK, SCRIPT_SPONSOR, gatewaySigner, address(safe), L2_REGISTRY_ADDRESS, address(publicResolver), nameOwner
+            SCRIPT_DEPLOYER_PK,
+            SCRIPT_SPONSOR,
+            gatewaySigner,
+            address(safe),
+            L2_REGISTRY_ADDRESS,
+            address(publicResolver),
+            address(wrapper),
+            nameOwner
         );
     }
 
@@ -110,18 +114,20 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         assertEq(plan.swapTarget, address(wrapper), "swap target should be the wrapper when wrapped");
         assertEq(plan.nameOwner, nameOwner, "nameOwner");
 
-        // Execute the two name-owner calls exactly as the Safe would.
-        vm.startPrank(nameOwner);
-        (bool ok1,) = plan.resolver.call(plan.setL2RegistryCall);
-        assertTrue(ok1, "setL2Registry call failed");
-        (bool ok2,) = plan.resolver.call(plan.setFallbackResolverCall);
-        assertTrue(ok2, "setFallbackResolver call failed");
-        vm.stopPrank();
+        assertEq(address(resolver.nameWrapper()), address(wrapper), "nameWrapper");
 
-        (uint64 chainId, address registryAddr) = resolver.l2Registry(node);
-        assertEq(chainId, L2_CHAIN_ID, "l2Registry chainId");
-        assertEq(registryAddr, L2_REGISTRY_ADDRESS, "l2Registry address");
-        assertEq(resolver.fallbackResolver(node), address(publicResolver), "fallbackResolver");
+        // Execute the name-owner call exactly as the Safe would.
+        vm.prank(nameOwner);
+        (bool ok1,) = plan.resolver.call(plan.configureCall);
+        assertTrue(ok1, "configure call failed");
+
+        (bytes32 routedNode, address routedOwner, L1Resolver.Settings memory s) = resolver.routeFor(dnsName);
+        assertEq(routedNode, node, "routeFor node");
+        assertEq(routedOwner, nameOwner, "routeFor owner");
+        assertEq(s.chainId, L2_CHAIN_ID, "chainId");
+        assertEq(s.registry, L2_REGISTRY_ADDRESS, "registry");
+        assertEq(s.fallbackResolver, address(publicResolver), "fallbackResolver");
+        assertEq(s.module, address(0), "module");
 
         bytes memory data = abi.encodeWithSignature("contenthash(bytes32)", node);
         bytes memory result = resolver.resolve(dnsName, data);
@@ -197,16 +203,13 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
 
         assertEq(secondPlan.resolver, firstPlan.resolver, "plan-only mode deployed a new resolver");
 
-        vm.startPrank(nameOwner);
-        (bool ok1,) = secondPlan.resolver.call(secondPlan.setL2RegistryCall);
-        assertTrue(ok1, "setL2Registry call failed");
-        (bool ok2,) = secondPlan.resolver.call(secondPlan.setFallbackResolverCall);
-        assertTrue(ok2, "setFallbackResolver call failed");
-        vm.stopPrank();
+        vm.prank(nameOwner);
+        (bool ok1,) = secondPlan.resolver.call(secondPlan.configureCall);
+        assertTrue(ok1, "configure call failed");
 
-        (uint64 chainId, address registryAddr) = L1Resolver(secondPlan.resolver).l2Registry(node);
-        assertEq(chainId, L2_CHAIN_ID);
-        assertEq(registryAddr, L2_REGISTRY_ADDRESS);
+        L1Resolver.Settings memory s = L1Resolver(secondPlan.resolver).settings(node, nameOwner);
+        assertEq(s.chainId, L2_CHAIN_ID);
+        assertEq(s.registry, L2_REGISTRY_ADDRESS);
     }
 
     function test_Refuses_ExistingResolverHasNoCode() public {
@@ -459,7 +462,7 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         TestableDeployL1Resolver script = _newScript();
         script.setFallbackResolver(address(otherResolver));
         vm.expectRevert(
-            bytes("FALLBACK_RESOLVER does not match the name's CURRENT resolver - set ALLOW_FALLBACK_MISMATCH=true to override")
+            bytes("FALLBACK_RESOLVER does not match where the apex CURRENTLY answers from - set ALLOW_FALLBACK_MISMATCH=true to override")
         );
         script.run();
     }
@@ -471,27 +474,134 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         script.setAllowFallbackMismatch(true);
         DeployL1Resolver.Plan memory plan = script.run();
 
-        assertEq(
-            plan.setFallbackResolverCall,
-            abi.encodeCall(L1Resolver.setFallbackResolver, (node, address(otherResolver))),
-            "plan did not target the mismatched fallback"
+        (,, L1Resolver.Settings memory s) =
+            abi.decode(_afterSelector(plan.configureCall), (bytes32, address, L1Resolver.Settings));
+        assertEq(s.fallbackResolver, address(otherResolver), "plan did not target the mismatched fallback");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                 G0 - NO ESCAPE HATCHES ON MAINNET (969 L-3)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Refuses_AllowEoaAdminOnMainnet() public {
+        vm.chainId(1);
+        TestableDeployL1Resolver script = _newScript();
+        script.setAllowEoaAdmin(true);
+        vm.expectRevert(bytes("ALLOW_EOA_ADMIN is refused on mainnet - the resolver owner must be the Safe"));
+        script.run();
+    }
+
+    function test_Refuses_AllowFallbackMismatchOnMainnet() public {
+        vm.chainId(1);
+        TestableDeployL1Resolver script = _newScript();
+        script.setAllowFallbackMismatch(true);
+        vm.expectRevert(
+            bytes("ALLOW_FALLBACK_MISMATCH is refused on mainnet - the apex must keep answering from where it answers now")
         );
+        script.run();
+    }
+
+    function test_Refuses_AllowSignerChangeOnMainnet() public {
+        vm.chainId(1);
+        TestableDeployL1Resolver script = _newScript();
+        script.setAllowSignerChange(true);
+        vm.expectRevert(
+            bytes("ALLOW_SIGNER_CHANGE is refused on mainnet - rotate the gateway signer as its own reviewed step")
+        );
+        script.run();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+          G12 / G12b / G18 - REPLACING AN L1RESOLVER (THE v1 SWAP)
+    //////////////////////////////////////////////////////////////*/
+
+    /// The live swap: woco.eth points at a v1 L1Resolver, which stores no
+    /// records and forwards the apex to its fallback. The apex source is that
+    /// fallback, so the correct plan passes with no escape hatch.
+    function test_Deploy_FromAnL1ResolverTheApexSourceIsItsFallback() public {
+        MockL1ResolverV1 v1 = new MockL1ResolverV1(address(publicResolver), gatewaySigner);
+        ens.setResolver(node, address(v1));
+
+        DeployL1Resolver.Plan memory plan = _newScript().run();
+        assertEq(plan.currentResolver, address(v1), "rollback must target the v1 resolver");
+        (,, L1Resolver.Settings memory s) =
+            abi.decode(_afterSelector(plan.configureCall), (bytes32, address, L1Resolver.Settings));
+        assertEq(s.fallbackResolver, address(publicResolver), "the apex must keep answering from the Public Resolver");
+    }
+
+    /// Pointing the fallback at the v1 resolver itself would take the app
+    /// offline at the swap: it has no contenthash.
+    function test_Refuses_TheCurrentL1ResolverAsTheFallback() public {
+        MockL1ResolverV1 v1 = new MockL1ResolverV1(address(publicResolver), gatewaySigner);
+        ens.setResolver(node, address(v1));
+
+        TestableDeployL1Resolver script = _newScript();
+        script.setFallbackResolver(address(v1));
+        vm.expectRevert(
+            bytes(
+                "FALLBACK_RESOLVER does not match where the apex CURRENTLY answers from - set ALLOW_FALLBACK_MISMATCH=true to override"
+            )
+        );
+        script.run();
+
+        // G12b holds even with the override.
+        script.setAllowFallbackMismatch(true);
+        vm.expectRevert(
+            bytes(
+                "FALLBACK_RESOLVER does not answer contenthash(node) - it is not a record store, and the apex would go dark"
+            )
+        );
+        script.run();
+    }
+
+    /// One gateway key signs for both resolvers during the swap.
+    function test_Refuses_ASignerChangeAcrossTheSwap() public {
+        MockL1ResolverV1 v1 = new MockL1ResolverV1(address(publicResolver), makeAddr("current-gateway-key"));
+        ens.setResolver(node, address(v1));
+
+        TestableDeployL1Resolver script = _newScript();
+        vm.expectRevert(
+            bytes(
+                "GATEWAY_SIGNER_ADDRESS differs from the current resolver's signer() - one gateway key signs for both during the swap; set ALLOW_SIGNER_CHANGE=true only with a rotation plan"
+            )
+        );
+        script.run();
+
+        script.setAllowSignerChange(true);
+        script.run();
     }
 
     /*//////////////////////////////////////////////////////////////
                     G13-G14 - NAME WRAPPER / #420 CUSTODY
     //////////////////////////////////////////////////////////////*/
 
-    function test_Refuses_ResolverWithNoNameWrapper() public {
-        // Break namewrapper.eth's resolver so the constructor reads a zero
-        // wrapper address - a STATICCALL to a zero-address `addr()` would not
-        // revert, it would just return the wrong thing, exactly like the
-        // real-world misconfiguration this guard exists to catch.
-        ens.setResolver(WRAPPER_NODE, address(new MockAddrResolver(address(0))));
-
+    /// G13, pre-deploy: the wrapper is immutable in the resolver.
+    function test_Refuses_CodelessNameWrapper() public {
         TestableDeployL1Resolver script = _newScript();
-        vm.expectRevert(bytes("the deployed/reused resolver's nameWrapper is the zero address"));
+        script.setNameWrapper(makeAddr("not-a-wrapper"));
+        vm.expectRevert(bytes("NAME_WRAPPER has no code"));
         script.run();
+    }
+
+    /// G13 on chain 1: only the canonical wrapper, which no name can ever leave.
+    function test_Refuses_AnyOtherNameWrapperOnMainnet() public {
+        vm.chainId(1);
+        TestableDeployL1Resolver script = _newScript();
+        vm.expectRevert(bytes("NAME_WRAPPER is not the mainnet NameWrapper 0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401"));
+        script.run();
+    }
+
+    /// G13, post-deploy: a reused resolver holding another wrapper is not the
+    /// one the operator described.
+    function test_Refuses_ExistingResolverWithAnotherNameWrapper() public {
+        TestableDeployL1Resolver first = _newScript();
+        DeployL1Resolver.Plan memory firstPlan = first.run();
+
+        TestableDeployL1Resolver second = _newScript();
+        second.setExistingResolver(firstPlan.resolver);
+        second.setNameWrapper(address(new MockNameWrapper()));
+        vm.expectRevert(bytes("the deployed/reused resolver's nameWrapper does not match NAME_WRAPPER"));
+        second.run();
     }
 
     /// G17. Plan-only mode, rerun after the swap has already happened, with
@@ -525,6 +635,13 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         );
         script.run();
     }
+
+    function _afterSelector(bytes memory b) internal pure returns (bytes memory out) {
+        out = new bytes(b.length - 4);
+        for (uint256 i; i < out.length; ++i) {
+            out[i] = b[i + 4];
+        }
+    }
 }
 
 /*//////////////////////////////////////////////////////////////
@@ -546,6 +663,7 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
         address resolverOwner_,
         address l2RegistryAddress_,
         address fallbackResolver_,
+        address nameWrapper_,
         address expectNameOwner_
     ) {
         cfg.deployerPk = deployerPk_;
@@ -555,12 +673,14 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
         cfg.l2ChainId = 421614;
         cfg.l2RegistryAddress = l2RegistryAddress_;
         cfg.fallbackResolver = fallbackResolver_;
+        cfg.nameWrapper = nameWrapper_;
         cfg.expectNameOwner = expectNameOwner_;
         cfg.parentName = "woco.eth";
         cfg.gatewayUrl = "https://events-api.woco-net.com/api/ens-gateway/v1/{sender}/{data}";
         cfg.l2DeploymentRecord = "deployments/421614-subens.json";
         cfg.allowEoaAdmin = false;
         cfg.allowFallbackMismatch = false;
+        cfg.allowSignerChange = false;
         cfg.writeDeploymentRecord = false;
         cfg.existingResolver = address(0);
     }
@@ -597,6 +717,10 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
         cfg.fallbackResolver = v;
     }
 
+    function setNameWrapper(address v) external {
+        cfg.nameWrapper = v;
+    }
+
     function setExpectNameOwner(address v) external {
         cfg.expectNameOwner = v;
     }
@@ -621,6 +745,10 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
         cfg.allowFallbackMismatch = v;
     }
 
+    function setAllowSignerChange(bool v) external {
+        cfg.allowSignerChange = v;
+    }
+
     function setWriteDeploymentRecord(bool v) external {
         cfg.writeDeploymentRecord = v;
     }
@@ -632,3 +760,20 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
 
 /// @dev A contract, because `RESOLVER_OWNER` must not be a bare key (G2).
 contract MockSafe {}
+
+/// @dev The shape of the live v1 L1Resolver as the script sees it: a gateway
+///      `signer()`, a per-node `fallbackResolver`, and NO record storage - it
+///      has no `contenthash`, so anything asking it for one reverts.
+contract MockL1ResolverV1 {
+    address internal immutable apexFallback;
+    address public immutable signer;
+
+    constructor(address apexFallback_, address signer_) {
+        apexFallback = apexFallback_;
+        signer = signer_;
+    }
+
+    function fallbackResolver(bytes32) external view returns (address) {
+        return apexFallback;
+    }
+}

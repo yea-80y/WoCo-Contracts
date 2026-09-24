@@ -18,12 +18,18 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 ///      Required env:
 ///        DEPLOYER_PRIVATE_KEY    — deployer EOA. Broadcasts the `new L1Resolver`
 ///                                  transaction only; holds no role afterwards.
-///        GATEWAY_SIGNER_ADDRESS  — CCIP-Read gateway's signing key (a NEW hot key).
+///        GATEWAY_SIGNER_ADDRESS  — CCIP-Read gateway's signing key. When replacing a resolver
+///                                  that has a `signer()`, it must be THAT key (G18): one
+///                                  gateway key signs for both during the swap. A new key
+///                                  only for a first deploy, or with a rotation plan.
 ///        SPONSOR_ADDRESS         — platform gas-sponsor wallet (checked against, not used).
 ///        RESOLVER_OWNER          — ends up owning `setURL`/`setSigner`. REQUIRED, no default.
 ///        L2_CHAIN_ID             — uint64 chain id of the L2 sub-ENS registry.
 ///        L2_REGISTRY_ADDRESS     — the L2Registry this resolver should point queries at.
 ///        FALLBACK_RESOLVER       — ordinary L1 resolver the apex itself answers from.
+///        NAME_WRAPPER            — the ENS NameWrapper, a constructor argument (immutable).
+///                                  Defaults to the mainnet wrapper on chain 1, and MUST
+///                                  equal it there (G13); required everywhere else.
 ///        EXPECT_NAME_OWNER       — the address the operator BELIEVES controls PARENT_NAME.
 ///                                  REQUIRED, no default — see the #420 custody guard below.
 ///      Optional env:
@@ -32,13 +38,16 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 ///        L2_DEPLOYMENT_RECORD     — defaults to deployments/<L2_CHAIN_ID>-subens.json.
 ///        ALLOW_EOA_ADMIN          — testnet escape hatch for RESOLVER_OWNER; see below.
 ///        ALLOW_FALLBACK_MISMATCH  — testnet escape hatch for the fallback-vs-current-resolver check.
+///        ALLOW_SIGNER_CHANGE      — testnet escape hatch for G18 (signer continuity).
+///        All three ALLOW_* flags are REFUSED on chain 1 (G0): a mainnet override is a code change.
 ///        WRITE_DEPLOYMENT_RECORD  — defaults to true; tests set it false.
 ///        EXISTING_RESOLVER        — set to reuse an already-deployed resolver (PLAN-ONLY MODE).
 ///
 /// WHY THIS SCRIPT PRINTS INSTEAD OF SENDING (#419, #420)
 ///
-/// `setL2Registry`, `setFallbackResolver` and the `setResolver` swap that actually
-/// points the name at this contract are all authorised by the ENS NAME OWNER, not
+/// `configure` (the name's settings, written into the name owner's own slot) and
+/// the `setResolver` swap that actually points the name at this contract are
+/// both sent by the ENS NAME OWNER, not
 /// by this contract's `owner()` and not by the deployer. On mainnet the name owner
 /// is the custody Safe (#420) — the deployer key that runs this script never holds
 /// that role, on purpose, so the script has no private key to send these with even
@@ -56,36 +65,45 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 /// baseNode check in particular catches "an L2 registry built for a different
 /// parent," which is invisible from either input alone.
 ///
-/// WHY THE FALLBACK MUST MATCH THE NAME'S CURRENT RESOLVER (see G12)
+/// WHY THE FALLBACK MUST MATCH WHERE THE APEX ANSWERS NOW (see G12, G12b)
 ///
 /// The apex's own records (`woco.eth`'s contenthash, the app itself) live wherever
-/// the name's CURRENT resolver already stores them — pointing `fallbackResolver`
-/// anywhere else silently serves someone else's records, or none. A typed address
-/// left over from a previous chain, or a run repeated after the swap already
-/// happened, both land here rather than in a live footgun.
+/// the name answers from TODAY — pointing `fallbackResolver` anywhere else
+/// silently serves someone else's records, or none. When the current resolver is
+/// itself an L1Resolver (v1 before this swap), it stores no records: it forwards
+/// the apex to ITS fallback, so that fallback is the source, not the resolver. A
+/// typed address left over from a previous chain, a run repeated after the swap,
+/// or a fallback that cannot answer `contenthash` all fail here rather than
+/// taking the app offline.
 ///
 /// WHY PLAN-ONLY MODE EXISTS (`EXISTING_RESOLVER`)
 ///
 /// One `L1Resolver` can serve many names — `url` and `signer` are shared, while
-/// `l2Registry` and `fallbackResolver` are keyed per node. If a resolver was
+/// settings are keyed per (node, owner). If a resolver was
 /// already deployed for a throwaway name during rehearsal, the mainnet cutover for
 /// `woco.eth` reuses that SAME contract rather than deploying a second one with a
 /// second gateway signer to keep in sync. Plan-only mode skips the broadcast
 /// entirely and instead verifies the reused resolver actually matches what the
 /// operator described (G15/G16) before computing the same plan.
 ///
-/// ⚠️ `RESOLVER_OWNER` IS SINGLE-STEP AND IRREVERSIBLE — `L1Resolver` is plain
-/// `Ownable`, not `Ownable2Step`. An address you do not control freezes
-/// `setURL`/`setSigner` for good. Unlike the sub-ENS registry, though, this
-/// contract is REPLACEABLE: the name owner can always `setResolver` away from it
-/// with one transaction touching no name on L2 — a frozen owner degrades the
-/// gateway URL/signer, it does not strand the name. Verify `RESOLVER_OWNER` on a
-/// block explorer before broadcasting regardless.
+/// ⚠️ `RESOLVER_OWNER` IS SET IN ONE STEP, BY THE CONSTRUCTOR. `L1Resolver` is
+/// `Ownable2Step`, but the two-step accept only guards LATER transfers; the
+/// constructor argument takes effect immediately, and renounce is disabled. An
+/// address you do not control therefore holds `setURL`/`setSigner`/
+/// `setDefaultModule` for good. The name owner can still `setResolver` away with
+/// one transaction touching no name on L2 — a wrong owner degrades the gateway
+/// settings, it does not strand the name. Verify `RESOLVER_OWNER` on a block
+/// explorer before broadcasting regardless.
 contract DeployL1Resolver is Script {
     /// @notice The canonical ENS registry address `L1Resolver`'s constructor
     ///         hardcodes. Declared again here, rather than read off the resolver,
     ///         so G8 can run before anything is deployed or reused.
     address constant ENS_ADDRESS = 0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e;
+
+    /// @notice The mainnet NameWrapper. Its admin is the zero address and no
+    ///         upgrade contract is set, so no wrapped name can ever leave it -
+    ///         which is why the resolver may hold it immutably (audit 964 I-3).
+    address constant MAINNET_NAME_WRAPPER = 0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401;
 
     /// @notice Everything this script reads from its environment, in one place.
     struct Config {
@@ -96,12 +114,14 @@ contract DeployL1Resolver is Script {
         uint64 l2ChainId;
         address l2RegistryAddress;
         address fallbackResolver;
+        address nameWrapper;
         address expectNameOwner;
         string parentName;
         string gatewayUrl;
         string l2DeploymentRecord;
         bool allowEoaAdmin;
         bool allowFallbackMismatch;
+        bool allowSignerChange;
         bool writeDeploymentRecord;
         address existingResolver;
     }
@@ -115,8 +135,7 @@ contract DeployL1Resolver is Script {
         bool wrapped;
         address nameOwner;
         address currentResolver;
-        bytes setL2RegistryCall;
-        bytes setFallbackResolverCall;
+        bytes configureCall;
         address swapTarget;
         bytes swapCall;
         bytes rollbackCall;
@@ -135,6 +154,7 @@ contract DeployL1Resolver is Script {
         c.l2ChainId = uint64(vm.envUint("L2_CHAIN_ID"));
         c.l2RegistryAddress = vm.envAddress("L2_REGISTRY_ADDRESS");
         c.fallbackResolver = vm.envAddress("FALLBACK_RESOLVER");
+        c.nameWrapper = vm.envOr("NAME_WRAPPER", block.chainid == 1 ? MAINNET_NAME_WRAPPER : address(0));
         // Required, not defaulted to the deployer or to anything else — see G14.
         c.expectNameOwner = vm.envAddress("EXPECT_NAME_OWNER");
         c.parentName = vm.envOr("PARENT_NAME", string("woco.eth"));
@@ -145,6 +165,7 @@ contract DeployL1Resolver is Script {
         );
         c.allowEoaAdmin = vm.envOr("ALLOW_EOA_ADMIN", false);
         c.allowFallbackMismatch = vm.envOr("ALLOW_FALLBACK_MISMATCH", false);
+        c.allowSignerChange = vm.envOr("ALLOW_SIGNER_CHANGE", false);
         c.writeDeploymentRecord = vm.envOr("WRITE_DEPLOYMENT_RECORD", true);
         c.existingResolver = vm.envOr("EXISTING_RESOLVER", address(0));
     }
@@ -168,7 +189,7 @@ contract DeployL1Resolver is Script {
     }
 
     /*//////////////////////////////////////////////////////////////
-              PRE-BROADCAST GUARDS — pure env shape (G1-G12)
+              PRE-BROADCAST GUARDS — env shape and chain reads (G0-G13, G18)
     //////////////////////////////////////////////////////////////*/
 
     function _checkPreDeployGuards(Config memory c)
@@ -177,6 +198,20 @@ contract DeployL1Resolver is Script {
         returns (ENS ens, bytes memory dnsName, bytes32 node, address currentResolver)
     {
         address deployer = vm.addr(c.deployerPk);
+
+        // G0 (audit 969 L-3). Each escape hatch is one env var, routinely set on
+        // testnets; a .env carried over into a mainnet run would silently switch
+        // off the guard it names. On mainnet an override must be a reviewed code
+        // change, never an env var. One require per flag so each is testable.
+        if (block.chainid == 1) {
+            require(!c.allowEoaAdmin, "ALLOW_EOA_ADMIN is refused on mainnet - the resolver owner must be the Safe");
+            require(!c.allowFallbackMismatch, "ALLOW_FALLBACK_MISMATCH is refused on mainnet - the apex must keep answering from where it answers now");
+            require(!c.allowSignerChange, "ALLOW_SIGNER_CHANGE is refused on mainnet - rotate the gateway signer as its own reviewed step");
+        } else {
+            if (c.allowEoaAdmin) console.log("WARNING: ALLOW_EOA_ADMIN is set - G2 (multisig owner) is OFF");
+            if (c.allowFallbackMismatch) console.log("WARNING: ALLOW_FALLBACK_MISMATCH is set - G12 (apex source) is OFF");
+            if (c.allowSignerChange) console.log("WARNING: ALLOW_SIGNER_CHANGE is set - G18 (signer continuity) is OFF");
+        }
 
         // G1
         require(c.resolverOwner != address(0), "RESOLVER_OWNER must not be the zero address");
@@ -225,6 +260,14 @@ contract DeployL1Resolver is Script {
             "the canonical ENS registry has no code on this chain - are you pointed at an L2 by mistake?"
         );
 
+        // G13. The wrapper is immutable in the resolver, so a wrong one could
+        // never be fixed. On mainnet only the canonical wrapper is accepted.
+        require(c.nameWrapper.code.length > 0, "NAME_WRAPPER has no code");
+        require(
+            block.chainid != 1 || c.nameWrapper == MAINNET_NAME_WRAPPER,
+            "NAME_WRAPPER is not the mainnet NameWrapper 0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401"
+        );
+
         ens = ENS(ENS_ADDRESS);
         (dnsName, node) = NameEncoder.dnsEncodeName(c.parentName);
 
@@ -264,13 +307,49 @@ contract DeployL1Resolver is Script {
         require(c.fallbackResolver != address(0), "FALLBACK_RESOLVER must not be the zero address");
         require(c.fallbackResolver.code.length > 0, "FALLBACK_RESOLVER has no code");
 
-        // G12. Apex records live wherever the name's CURRENT resolver is - a
-        // typed address for another chain, or a run after the swap, both land
-        // here.
+        // G12. The apex must keep answering from where it answers NOW - through
+        // an L1Resolver, that is its fallback (see the header).
         require(
-            c.allowFallbackMismatch || c.fallbackResolver == currentResolver,
-            "FALLBACK_RESOLVER does not match the name's CURRENT resolver - set ALLOW_FALLBACK_MISMATCH=true to override"
+            c.allowFallbackMismatch || c.fallbackResolver == _apexSource(currentResolver, node),
+            "FALLBACK_RESOLVER does not match where the apex CURRENTLY answers from - set ALLOW_FALLBACK_MISMATCH=true to override"
         );
+
+        // G12b. Even with the override, the fallback must be a record store: an
+        // L1Resolver has no `contenthash`, so the app would go dark at the swap.
+        (bool answers,) = c.fallbackResolver.staticcall(abi.encodeWithSignature("contenthash(bytes32)", node));
+        require(
+            answers,
+            "FALLBACK_RESOLVER does not answer contenthash(node) - it is not a record store, and the apex would go dark"
+        );
+
+        // G18. One gateway key signs for BOTH resolvers during the swap (the old
+        // format for the current one, the chain-bound format for this one), and a
+        // rollback needs the current one to still accept it. A different key is a
+        // rotation, which needs its own plan.
+        address currentSigner = _signerOf(currentResolver);
+        require(
+            c.allowSignerChange || currentSigner == address(0) || currentSigner == c.gatewaySigner,
+            "GATEWAY_SIGNER_ADDRESS differs from the current resolver's signer() - one gateway key signs for both during the swap; set ALLOW_SIGNER_CHANGE=true only with a rotation plan"
+        );
+    }
+
+    /// @dev Where the apex answers from today: the current resolver itself, or,
+    ///      when it is an L1Resolver (it has `fallbackResolver(bytes32)`), the
+    ///      fallback it forwards the apex to.
+    function _apexSource(address current, bytes32 node) internal view returns (address) {
+        if (current.code.length == 0) return current;
+        (bool ok, bytes memory ret) = current.staticcall(abi.encodeWithSignature("fallbackResolver(bytes32)", node));
+        if (ok && ret.length == 32) return abi.decode(ret, (address));
+        return current;
+    }
+
+    /// @dev The current resolver's gateway signer, or zero when it has none
+    ///      (an ordinary resolver such as the ENS PublicResolver).
+    function _signerOf(address current) internal view returns (address) {
+        if (current.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = current.staticcall(abi.encodeWithSignature("signer()"));
+        if (ok && ret.length == 32) return abi.decode(ret, (address));
+        return address(0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -282,7 +361,7 @@ contract DeployL1Resolver is Script {
 
         if (!planOnly) {
             vm.startBroadcast(c.deployerPk);
-            resolver = new L1Resolver(c.gatewayUrl, c.gatewaySigner, c.resolverOwner);
+            resolver = new L1Resolver(c.gatewayUrl, c.gatewaySigner, c.resolverOwner, INameWrapper(c.nameWrapper));
             vm.stopBroadcast();
         } else {
             // G15
@@ -325,10 +404,10 @@ contract DeployL1Resolver is Script {
         address currentResolver,
         bool planOnly
     ) internal returns (Plan memory plan) {
-        // G13
+        // G13 (post-deploy half): the resolver holds the wrapper the operator named.
         require(
-            address(resolver.nameWrapper()) != address(0),
-            "the deployed/reused resolver's nameWrapper is the zero address"
+            address(resolver.nameWrapper()) == c.nameWrapper,
+            "the deployed/reused resolver's nameWrapper does not match NAME_WRAPPER"
         );
 
         // G14. #420 custody: the printed transactions are for this signer,
@@ -379,14 +458,33 @@ contract DeployL1Resolver is Script {
             wrapped: wrapped,
             nameOwner: nameOwner,
             currentResolver: currentResolver,
-            setL2RegistryCall: abi.encodeCall(L1Resolver.setL2Registry, (node, c.l2ChainId, c.l2RegistryAddress)),
-            setFallbackResolverCall: abi.encodeCall(L1Resolver.setFallbackResolver, (node, c.fallbackResolver)),
+            configureCall: _configureCall(c, node, nameOwner),
             swapTarget: swapTarget,
             swapCall: abi.encodeWithSignature("setResolver(bytes32,address)", node, address(resolver)),
             rollbackCall: abi.encodeWithSignature("setResolver(bytes32,address)", node, currentResolver)
         });
 
         _printPlan(plan, dnsName);
+    }
+
+    /// @dev The one settings call the name owner sends: into its OWN slot,
+    ///      with no module (the built-in signer path). Split out only for the
+    ///      stack.
+    function _configureCall(Config memory c, bytes32 node, address nameOwner) internal pure returns (bytes memory) {
+        return abi.encodeCall(
+            L1Resolver.configure,
+            (
+                node,
+                nameOwner,
+                L1Resolver.Settings({
+                    chainId: c.l2ChainId,
+                    registry: c.l2RegistryAddress,
+                    fallbackResolver: c.fallbackResolver,
+                    module: address(0),
+                    moduleData: ""
+                })
+            )
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -399,30 +497,33 @@ contract DeployL1Resolver is Script {
         console.log(plan.wrapped ? "(wrapped: yes)" : "(wrapped: no)");
         console.log("================================================================");
 
-        console.log("1. setL2Registry");
+        console.log("1. configure - the settings, into the name owner's own slot");
         console.log("   to:  ", plan.resolver);
         console.log("   data:");
-        console.logBytes(plan.setL2RegistryCall);
+        console.logBytes(plan.configureCall);
 
-        console.log("2. setFallbackResolver");
-        console.log("   to:  ", plan.resolver);
-        console.log("   data:");
-        console.logBytes(plan.setFallbackResolverCall);
-
-        console.log("3. SWAP setResolver");
+        console.log("2. SWAP setResolver");
         console.log("   to:  ", plan.swapTarget);
         console.log("   data:");
         console.logBytes(plan.swapCall);
 
         console.log("----------------------------------------------------------------");
-        console.log("ROLLBACK (prepare before sending step 3)");
+        console.log("ROLLBACK (prepare before sending step 2)");
         console.log("   to:  ", plan.swapTarget);
         console.log("   data:");
         console.logBytes(plan.rollbackCall);
         console.log("----------------------------------------------------------------");
 
         bytes memory contenthashCall = abi.encodeWithSignature("contenthash(bytes32)", plan.node);
-        console.log("Verify BEFORE sending the swap:");
+        console.log("Verify BEFORE sending the swap - routeFor must name the owner and the settings above:");
+        console.log(
+            string.concat(
+                "  cast call ",
+                vm.toString(plan.resolver),
+                " \"routeFor(bytes)(bytes32,address,(uint64,address,address,address,bytes))\" ",
+                vm.toString(dnsName)
+            )
+        );
         console.log(
             string.concat(
                 "  cast call ",
@@ -434,12 +535,14 @@ contract DeployL1Resolver is Script {
             )
         );
 
-        (bool ok, bytes memory result) = plan.currentResolver.staticcall(contenthashCall);
+        // Ask where the apex answers from NOW: through an L1Resolver that is its
+        // fallback, since an L1Resolver stores no records of its own.
+        (bool ok, bytes memory result) = _apexSource(plan.currentResolver, plan.node).staticcall(contenthashCall);
         if (ok) {
-            console.log("Current resolver's contenthash(node):");
+            console.log("The apex's contenthash(node) today (must match the verify call above):");
             console.logBytes(result);
         } else {
-            console.log("Current resolver's contenthash(node): reverted");
+            console.log("The apex's contenthash(node) today: reverted");
         }
     }
 
@@ -465,8 +568,7 @@ contract DeployL1Resolver is Script {
         vm.serializeAddress(obj, "l2Registry", c.l2RegistryAddress);
         vm.serializeAddress(obj, "fallbackResolver", c.fallbackResolver);
         vm.serializeBool(obj, "planOnly", planOnly);
-        vm.serializeString(obj, "setL2RegistryCall", vm.toString(plan.setL2RegistryCall));
-        vm.serializeString(obj, "setFallbackResolverCall", vm.toString(plan.setFallbackResolverCall));
+        vm.serializeString(obj, "configureCall", vm.toString(plan.configureCall));
         vm.serializeString(obj, "swapCall", vm.toString(plan.swapCall));
         string memory json = vm.serializeString(obj, "rollbackCall", vm.toString(plan.rollbackCall));
 
