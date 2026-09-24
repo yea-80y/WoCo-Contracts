@@ -181,7 +181,9 @@ contract L1Resolver is IExtendedResolver, Ownable2Step {
     ///      control of `forOwner`'s names of this kind: a NameWrapper operator
     ///      (`isApprovedForAll` on the wrapper) for a wrapped node, a registry
     ///      operator otherwise. Such an operator can already repoint or take
-    ///      the name, so writing its principal's settings gives it nothing new.
+    ///      the name (fuses and the .eth grace period permitting), so writing
+    ///      its principal's settings gives it nothing it could not otherwise
+    ///      get; the principal can always overwrite its own slot.
     ///      Accepting either kind for any node would let a holder's registry
     ///      operator steer that holder's wrapped names, which ENS does not
     ///      allow. The ENS PublicResolver's own, narrower delegate approvals
@@ -370,8 +372,8 @@ contract L1Resolver is IExtendedResolver, Ownable2Step {
     ///
     ///      Strict where the UniversalResolver is lenient (missing terminator,
     ///      bytes after it): two encodings of one name should not both be
-    ///      lookups. Root and single-label names are refused - no TLD can call
-    ///      `configure`, so none can be configured here.
+    ///      lookups. Root and single-label names are refused, and `_route`
+    ///      never consults the TLD's own node (audit 969 L-2).
     function _suffixNodes(bytes calldata name) internal pure returns (bytes32[] memory nodes) {
         uint256 count;
         uint256 i;
