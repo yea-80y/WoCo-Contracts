@@ -18,7 +18,10 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 ///      Required env:
 ///        DEPLOYER_PRIVATE_KEY    — deployer EOA. Broadcasts the `new L1Resolver`
 ///                                  transaction only; holds no role afterwards.
-///        GATEWAY_SIGNER_ADDRESS  — CCIP-Read gateway's signing key (a NEW hot key).
+///        GATEWAY_SIGNER_ADDRESS  — CCIP-Read gateway's signing key. When replacing a resolver
+///                                  that has a `signer()`, it must be THAT key (G18): one
+///                                  gateway key signs for both during the swap. A new key
+///                                  only for a first deploy, or with a rotation plan.
 ///        SPONSOR_ADDRESS         — platform gas-sponsor wallet (checked against, not used).
 ///        RESOLVER_OWNER          — ends up owning `setURL`/`setSigner`. REQUIRED, no default.
 ///        L2_CHAIN_ID             — uint64 chain id of the L2 sub-ENS registry.
@@ -35,6 +38,7 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 ///        L2_DEPLOYMENT_RECORD     — defaults to deployments/<L2_CHAIN_ID>-subens.json.
 ///        ALLOW_EOA_ADMIN          — testnet escape hatch for RESOLVER_OWNER; see below.
 ///        ALLOW_FALLBACK_MISMATCH  — testnet escape hatch for the fallback-vs-current-resolver check.
+///        ALLOW_SIGNER_CHANGE      — escape hatch for G18, only with a signer-rotation plan.
 ///        WRITE_DEPLOYMENT_RECORD  — defaults to true; tests set it false.
 ///        EXISTING_RESOLVER        — set to reuse an already-deployed resolver (PLAN-ONLY MODE).
 ///
@@ -60,13 +64,16 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 /// baseNode check in particular catches "an L2 registry built for a different
 /// parent," which is invisible from either input alone.
 ///
-/// WHY THE FALLBACK MUST MATCH THE NAME'S CURRENT RESOLVER (see G12)
+/// WHY THE FALLBACK MUST MATCH WHERE THE APEX ANSWERS NOW (see G12, G12b)
 ///
 /// The apex's own records (`woco.eth`'s contenthash, the app itself) live wherever
-/// the name's CURRENT resolver already stores them — pointing `fallbackResolver`
-/// anywhere else silently serves someone else's records, or none. A typed address
-/// left over from a previous chain, or a run repeated after the swap already
-/// happened, both land here rather than in a live footgun.
+/// the name answers from TODAY — pointing `fallbackResolver` anywhere else
+/// silently serves someone else's records, or none. When the current resolver is
+/// itself an L1Resolver (v1 before this swap), it stores no records: it forwards
+/// the apex to ITS fallback, so that fallback is the source, not the resolver. A
+/// typed address left over from a previous chain, a run repeated after the swap,
+/// or a fallback that cannot answer `contenthash` all fail here rather than
+/// taking the app offline.
 ///
 /// WHY PLAN-ONLY MODE EXISTS (`EXISTING_RESOLVER`)
 ///
@@ -113,6 +120,7 @@ contract DeployL1Resolver is Script {
         string l2DeploymentRecord;
         bool allowEoaAdmin;
         bool allowFallbackMismatch;
+        bool allowSignerChange;
         bool writeDeploymentRecord;
         address existingResolver;
     }
@@ -156,6 +164,7 @@ contract DeployL1Resolver is Script {
         );
         c.allowEoaAdmin = vm.envOr("ALLOW_EOA_ADMIN", false);
         c.allowFallbackMismatch = vm.envOr("ALLOW_FALLBACK_MISMATCH", false);
+        c.allowSignerChange = vm.envOr("ALLOW_SIGNER_CHANGE", false);
         c.writeDeploymentRecord = vm.envOr("WRITE_DEPLOYMENT_RECORD", true);
         c.existingResolver = vm.envOr("EXISTING_RESOLVER", address(0));
     }
@@ -179,7 +188,7 @@ contract DeployL1Resolver is Script {
     }
 
     /*//////////////////////////////////////////////////////////////
-              PRE-BROADCAST GUARDS — pure env shape (G1-G12)
+              PRE-BROADCAST GUARDS — env shape and chain reads (G1-G13, G18)
     //////////////////////////////////////////////////////////////*/
 
     function _checkPreDeployGuards(Config memory c)
@@ -283,13 +292,49 @@ contract DeployL1Resolver is Script {
         require(c.fallbackResolver != address(0), "FALLBACK_RESOLVER must not be the zero address");
         require(c.fallbackResolver.code.length > 0, "FALLBACK_RESOLVER has no code");
 
-        // G12. Apex records live wherever the name's CURRENT resolver is - a
-        // typed address for another chain, or a run after the swap, both land
-        // here.
+        // G12. The apex must keep answering from where it answers NOW - through
+        // an L1Resolver, that is its fallback (see the header).
         require(
-            c.allowFallbackMismatch || c.fallbackResolver == currentResolver,
-            "FALLBACK_RESOLVER does not match the name's CURRENT resolver - set ALLOW_FALLBACK_MISMATCH=true to override"
+            c.allowFallbackMismatch || c.fallbackResolver == _apexSource(currentResolver, node),
+            "FALLBACK_RESOLVER does not match where the apex CURRENTLY answers from - set ALLOW_FALLBACK_MISMATCH=true to override"
         );
+
+        // G12b. Even with the override, the fallback must be a record store: an
+        // L1Resolver has no `contenthash`, so the app would go dark at the swap.
+        (bool answers,) = c.fallbackResolver.staticcall(abi.encodeWithSignature("contenthash(bytes32)", node));
+        require(
+            answers,
+            "FALLBACK_RESOLVER does not answer contenthash(node) - it is not a record store, and the apex would go dark"
+        );
+
+        // G18. One gateway key signs for BOTH resolvers during the swap (the old
+        // format for the current one, the chain-bound format for this one), and a
+        // rollback needs the current one to still accept it. A different key is a
+        // rotation, which needs its own plan.
+        address currentSigner = _signerOf(currentResolver);
+        require(
+            c.allowSignerChange || currentSigner == address(0) || currentSigner == c.gatewaySigner,
+            "GATEWAY_SIGNER_ADDRESS differs from the current resolver's signer() - one gateway key signs for both during the swap; set ALLOW_SIGNER_CHANGE=true only with a rotation plan"
+        );
+    }
+
+    /// @dev Where the apex answers from today: the current resolver itself, or,
+    ///      when it is an L1Resolver (it has `fallbackResolver(bytes32)`), the
+    ///      fallback it forwards the apex to.
+    function _apexSource(address current, bytes32 node) internal view returns (address) {
+        if (current.code.length == 0) return current;
+        (bool ok, bytes memory ret) = current.staticcall(abi.encodeWithSignature("fallbackResolver(bytes32)", node));
+        if (ok && ret.length == 32) return abi.decode(ret, (address));
+        return current;
+    }
+
+    /// @dev The current resolver's gateway signer, or zero when it has none
+    ///      (an ordinary resolver such as the ENS PublicResolver).
+    function _signerOf(address current) internal view returns (address) {
+        if (current.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = current.staticcall(abi.encodeWithSignature("signer()"));
+        if (ok && ret.length == 32) return abi.decode(ret, (address));
+        return address(0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -475,12 +520,14 @@ contract DeployL1Resolver is Script {
             )
         );
 
-        (bool ok, bytes memory result) = plan.currentResolver.staticcall(contenthashCall);
+        // Ask where the apex answers from NOW: through an L1Resolver that is its
+        // fallback, since an L1Resolver stores no records of its own.
+        (bool ok, bytes memory result) = _apexSource(plan.currentResolver, plan.node).staticcall(contenthashCall);
         if (ok) {
-            console.log("Current resolver's contenthash(node):");
+            console.log("The apex's contenthash(node) today (must match the verify call above):");
             console.logBytes(result);
         } else {
-            console.log("Current resolver's contenthash(node): reverted");
+            console.log("The apex's contenthash(node) today: reverted");
         }
     }
 

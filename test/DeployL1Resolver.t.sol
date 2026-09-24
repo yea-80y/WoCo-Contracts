@@ -462,7 +462,7 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         TestableDeployL1Resolver script = _newScript();
         script.setFallbackResolver(address(otherResolver));
         vm.expectRevert(
-            bytes("FALLBACK_RESOLVER does not match the name's CURRENT resolver - set ALLOW_FALLBACK_MISMATCH=true to override")
+            bytes("FALLBACK_RESOLVER does not match where the apex CURRENTLY answers from - set ALLOW_FALLBACK_MISMATCH=true to override")
         );
         script.run();
     }
@@ -477,6 +477,66 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
         (,, L1Resolver.Settings memory s) =
             abi.decode(_afterSelector(plan.configureCall), (bytes32, address, L1Resolver.Settings));
         assertEq(s.fallbackResolver, address(otherResolver), "plan did not target the mismatched fallback");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+          G12 / G12b / G18 - REPLACING AN L1RESOLVER (THE v1 SWAP)
+    //////////////////////////////////////////////////////////////*/
+
+    /// The live swap: woco.eth points at a v1 L1Resolver, which stores no
+    /// records and forwards the apex to its fallback. The apex source is that
+    /// fallback, so the correct plan passes with no escape hatch.
+    function test_Deploy_FromAnL1ResolverTheApexSourceIsItsFallback() public {
+        MockL1ResolverV1 v1 = new MockL1ResolverV1(address(publicResolver), gatewaySigner);
+        ens.setResolver(node, address(v1));
+
+        DeployL1Resolver.Plan memory plan = _newScript().run();
+        assertEq(plan.currentResolver, address(v1), "rollback must target the v1 resolver");
+        (,, L1Resolver.Settings memory s) =
+            abi.decode(_afterSelector(plan.configureCall), (bytes32, address, L1Resolver.Settings));
+        assertEq(s.fallbackResolver, address(publicResolver), "the apex must keep answering from the Public Resolver");
+    }
+
+    /// Pointing the fallback at the v1 resolver itself would take the app
+    /// offline at the swap: it has no contenthash.
+    function test_Refuses_TheCurrentL1ResolverAsTheFallback() public {
+        MockL1ResolverV1 v1 = new MockL1ResolverV1(address(publicResolver), gatewaySigner);
+        ens.setResolver(node, address(v1));
+
+        TestableDeployL1Resolver script = _newScript();
+        script.setFallbackResolver(address(v1));
+        vm.expectRevert(
+            bytes(
+                "FALLBACK_RESOLVER does not match where the apex CURRENTLY answers from - set ALLOW_FALLBACK_MISMATCH=true to override"
+            )
+        );
+        script.run();
+
+        // G12b holds even with the override.
+        script.setAllowFallbackMismatch(true);
+        vm.expectRevert(
+            bytes(
+                "FALLBACK_RESOLVER does not answer contenthash(node) - it is not a record store, and the apex would go dark"
+            )
+        );
+        script.run();
+    }
+
+    /// One gateway key signs for both resolvers during the swap.
+    function test_Refuses_ASignerChangeAcrossTheSwap() public {
+        MockL1ResolverV1 v1 = new MockL1ResolverV1(address(publicResolver), makeAddr("current-gateway-key"));
+        ens.setResolver(node, address(v1));
+
+        TestableDeployL1Resolver script = _newScript();
+        vm.expectRevert(
+            bytes(
+                "GATEWAY_SIGNER_ADDRESS differs from the current resolver's signer() - one gateway key signs for both during the swap; set ALLOW_SIGNER_CHANGE=true only with a rotation plan"
+            )
+        );
+        script.run();
+
+        script.setAllowSignerChange(true);
+        script.run();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -588,6 +648,7 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
         cfg.l2DeploymentRecord = "deployments/421614-subens.json";
         cfg.allowEoaAdmin = false;
         cfg.allowFallbackMismatch = false;
+        cfg.allowSignerChange = false;
         cfg.writeDeploymentRecord = false;
         cfg.existingResolver = address(0);
     }
@@ -652,6 +713,10 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
         cfg.allowFallbackMismatch = v;
     }
 
+    function setAllowSignerChange(bool v) external {
+        cfg.allowSignerChange = v;
+    }
+
     function setWriteDeploymentRecord(bool v) external {
         cfg.writeDeploymentRecord = v;
     }
@@ -663,3 +728,20 @@ contract TestableDeployL1Resolver is DeployL1Resolver {
 
 /// @dev A contract, because `RESOLVER_OWNER` must not be a bare key (G2).
 contract MockSafe {}
+
+/// @dev The shape of the live v1 L1Resolver as the script sees it: a gateway
+///      `signer()`, a per-node `fallbackResolver`, and NO record storage - it
+///      has no `contenthash`, so anything asking it for one reverts.
+contract MockL1ResolverV1 {
+    address internal immutable apexFallback;
+    address public immutable signer;
+
+    constructor(address apexFallback_, address signer_) {
+        apexFallback = apexFallback_;
+        signer = signer_;
+    }
+
+    function fallbackResolver(bytes32) external view returns (address) {
+        return apexFallback;
+    }
+}

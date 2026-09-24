@@ -44,7 +44,9 @@ contract MockENS {
 
 /// @dev `ownerOf` returning zero stands in for a wrapped .eth name past its
 ///      wrapper expiry (`_clearOwnerAndFuses`), which is what the real
-///      NameWrapper does once PARENT_CANNOT_CONTROL is burned.
+///      NameWrapper does once PARENT_CANNOT_CONTROL is burned. There is no
+///      clock here, so the 90-day grace period (owner still returned) is not
+///      pinned by a test; it rests on the real wrapper's code.
 contract MockNameWrapper {
     mapping(uint256 => address) internal _owner;
     mapping(address => mapping(address => bool)) internal _operators;

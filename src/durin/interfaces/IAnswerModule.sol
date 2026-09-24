@@ -20,15 +20,22 @@ struct Lookup {
 ///         a name owner's own signer, or an onchain source.
 /// @dev Both calls are views made by `L1Resolver`, which stays the EIP-3668
 ///      `sender`; a module never reverts `OffchainLookup` itself.
+///
+///      `supportsInterface` must answer within 30k gas and refuse 0xffffffff
+///      (OpenZeppelin `ERC165Checker`), or `configure` / `setDefaultModule`
+///      revert `ModuleNotSupported`.
 interface IAnswerModule is IERC165 {
     /// @return urls     Gateway URLs for the `OffchainLookup`. EMPTY means
     ///                  `callData` is already the final answer.
-    /// @return callData The request the gateway receives, and exactly what
-    ///                  `verify` is later handed.
+    /// @return callData The request the gateway receives. An honest client
+    ///                  hands this back to `verify`, but anyone can call
+    ///                  `resolveWithProof` with any `extraData`.
     function prepare(Lookup calldata q) external view returns (string[] memory urls, bytes memory callData);
 
-    /// @dev Reverts on anything it cannot vouch for; never returns empty bytes
-    ///      to mean "could not verify".
+    /// @dev Must check `callData` and `response` against `q` itself - never
+    ///      assume `callData` came from its own `prepare(q)`. Reverts on anything
+    ///      it cannot vouch for; never returns empty bytes to mean "could not
+    ///      verify".
     function verify(Lookup calldata q, bytes calldata callData, bytes calldata response)
         external
         view

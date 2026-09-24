@@ -11,6 +11,8 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 ///      differ in length, so one gateway key can sign both during a swap without
 ///      either verifying as the other.
 library SignatureVerifier {
+    error SignatureExpired(uint64 expires);
+
     /**
      * @dev Generates a hash for signing/verifying.
      * @param target: The address the signature is for.
@@ -54,13 +56,10 @@ library SignatureVerifier {
             response,
             (bytes, uint64, bytes)
         );
+        if (expires < block.timestamp) revert SignatureExpired(expires);
         address signer = ECDSA.recover(
             makeSignatureHash(address(this), block.chainid, expires, request, result),
             sig
-        );
-        require(
-            expires >= block.timestamp,
-            "SignatureVerifier: Signature expired"
         );
         return (signer, result);
     }

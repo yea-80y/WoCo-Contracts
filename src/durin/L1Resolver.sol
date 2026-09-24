@@ -126,8 +126,8 @@ contract L1Resolver is IExtendedResolver, Ownable2Step {
 
     error Unauthorized();
     error InvalidSignature();
-    /// Root, a single label, a malformed encoding, or a `[hex]` label that is
-    /// not 64 hex characters.
+    /// Root, a single label, a malformed encoding, or a 66-byte `[...]` label
+    /// whose 64 inner characters are not all hex.
     error UnsupportedName();
     error NoConfiguredAncestor();
     /// The deepest configured node offers nothing for this query: no registry
@@ -177,11 +177,15 @@ contract L1Resolver is IExtendedResolver, Ownable2Step {
     ///      a transfer (zero downtime), and it is why a seller can never leave
     ///      settings for a buyer - the buyer's slot is the buyer's alone.
     ///
-    ///      An operator may write for `forOwner` exactly where ENS would let it
-    ///      `setResolver`: a NameWrapper operator for a wrapped node, a registry
-    ///      operator otherwise. Accepting either kind for any node would let a
-    ///      holder's registry operator steer that holder's wrapped names, which
-    ///      ENS itself does not allow.
+    ///      An operator may write for `forOwner` under the same principal-or-
+    ///      operator rule the ENS PublicResolver applies to a record write: a
+    ///      NameWrapper operator for a wrapped node, a registry operator
+    ///      otherwise. Accepting either kind for any node would let a holder's
+    ///      registry operator steer that holder's wrapped names, which ENS does
+    ///      not allow. The .eth grace period and fuses are not consulted, because
+    ///      this never repoints the name. The wrap state checked is the node's
+    ///      CURRENT one, so an operator cannot pre-position across a wrap or
+    ///      unwrap; the principal can.
     ///
     ///      A write for a node `forOwner` does not own succeeds and changes
     ///      nothing until it does; check a setup with `routeFor`, not with the
@@ -446,7 +450,9 @@ contract L1Resolver is IExtendedResolver, Ownable2Step {
         );
     }
 
-    /// @dev Where ENS would let `operator` call `setResolver` for `forOwner`.
+    /// @dev Whether `operator` may write records for `forOwner` on `node`, by the
+    ///      ENS PublicResolver's rule: the operator of whichever contract holds
+    ///      the node now.
     function _isOperatorFor(bytes32 node, address forOwner, address operator) internal view returns (bool) {
         if (ens.owner(node) == address(nameWrapper)) {
             return nameWrapper.isApprovedForAll(forOwner, operator);

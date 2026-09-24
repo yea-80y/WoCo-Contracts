@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {L1Resolver} from "../src/durin/L1Resolver.sol";
 import {Lookup} from "../src/durin/interfaces/IAnswerModule.sol";
 import {L1ResolverBase} from "./L1ResolverBase.sol";
+import {SignatureVerifier} from "../src/durin/lib/SignatureVerifier.sol";
 
 /**
  * The built-in path: the WoCo gateway signs, this contract checks.
@@ -104,7 +105,7 @@ contract L1ResolverSignedPathTest is L1ResolverBase {
         uint64 expires = uint64(block.timestamp - 1);
         bytes memory response =
             _response(gatewaySignerPk, _hash(address(resolver), block.chainid, expires, callData, RESULT), expires);
-        vm.expectRevert("SignatureVerifier: Signature expired");
+        vm.expectRevert(abi.encodeWithSelector(SignatureVerifier.SignatureExpired.selector, expires));
         resolver.resolveWithProof(response, extraData);
 
         // The last valid second still verifies.
@@ -135,10 +136,12 @@ contract L1ResolverSignedPathTest is L1ResolverBase {
     }
 
     /// A vector the REAL gateway handler produced (woco_app
-    /// `apps/server/src/lib/ens-gateway/ccip.ts`, pinned in its own
-    /// `ens-gateway.test.ts`): resolver 0x1111…1111 on chain 1, signer
-    /// 0x7099…79C8, now 1_800_000_000, `nabil.woco.eth` addr on the v2.2
-    /// registry. If either side changes the format, one of the two suites fails.
+    /// `apps/server/src/lib/ens-gateway/ccip.ts` at 37fdcfd8, branch
+    /// feat/ens-gateway-chain-bound; pinned in its own `ens-gateway.test.ts`):
+    /// resolver 0x1111…1111 on chain 1, signer 0x7099…79C8, now 1_800_000_000,
+    /// `nabil.woco.eth` addr on the v2.2 registry. Both repos carry these bytes
+    /// by hand: a gateway change fails only the gateway test, so regenerate
+    /// and re-pin BOTH whenever it does.
     address constant GOLDEN_TARGET = 0x1111111111111111111111111111111111111111;
     address constant GOLDEN_SIGNER = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
     bytes constant GOLDEN_REQUEST =
