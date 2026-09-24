@@ -480,6 +480,38 @@ contract DeployL1ResolverTest is ScriptEnvFixture {
     }
 
     /*//////////////////////////////////////////////////////////////
+                 G0 - NO ESCAPE HATCHES ON MAINNET (969 L-3)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Refuses_AllowEoaAdminOnMainnet() public {
+        vm.chainId(1);
+        TestableDeployL1Resolver script = _newScript();
+        script.setAllowEoaAdmin(true);
+        vm.expectRevert(bytes("ALLOW_EOA_ADMIN is refused on mainnet - the resolver owner must be the Safe"));
+        script.run();
+    }
+
+    function test_Refuses_AllowFallbackMismatchOnMainnet() public {
+        vm.chainId(1);
+        TestableDeployL1Resolver script = _newScript();
+        script.setAllowFallbackMismatch(true);
+        vm.expectRevert(
+            bytes("ALLOW_FALLBACK_MISMATCH is refused on mainnet - the apex must keep answering from where it answers now")
+        );
+        script.run();
+    }
+
+    function test_Refuses_AllowSignerChangeOnMainnet() public {
+        vm.chainId(1);
+        TestableDeployL1Resolver script = _newScript();
+        script.setAllowSignerChange(true);
+        vm.expectRevert(
+            bytes("ALLOW_SIGNER_CHANGE is refused on mainnet - rotate the gateway signer as its own reviewed step")
+        );
+        script.run();
+    }
+
+    /*//////////////////////////////////////////////////////////////
           G12 / G12b / G18 - REPLACING AN L1RESOLVER (THE v1 SWAP)
     //////////////////////////////////////////////////////////////*/
 

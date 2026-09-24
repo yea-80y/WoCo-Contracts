@@ -38,7 +38,8 @@ import {L1Resolver, INameWrapper} from "../src/durin/L1Resolver.sol";
 ///        L2_DEPLOYMENT_RECORD     — defaults to deployments/<L2_CHAIN_ID>-subens.json.
 ///        ALLOW_EOA_ADMIN          — testnet escape hatch for RESOLVER_OWNER; see below.
 ///        ALLOW_FALLBACK_MISMATCH  — testnet escape hatch for the fallback-vs-current-resolver check.
-///        ALLOW_SIGNER_CHANGE      — escape hatch for G18, only with a signer-rotation plan.
+///        ALLOW_SIGNER_CHANGE      — testnet escape hatch for G18 (signer continuity).
+///        All three ALLOW_* flags are REFUSED on chain 1 (G0): a mainnet override is a code change.
 ///        WRITE_DEPLOYMENT_RECORD  — defaults to true; tests set it false.
 ///        EXISTING_RESOLVER        — set to reuse an already-deployed resolver (PLAN-ONLY MODE).
 ///
@@ -188,7 +189,7 @@ contract DeployL1Resolver is Script {
     }
 
     /*//////////////////////////////////////////////////////////////
-              PRE-BROADCAST GUARDS — env shape and chain reads (G1-G13, G18)
+              PRE-BROADCAST GUARDS — env shape and chain reads (G0-G13, G18)
     //////////////////////////////////////////////////////////////*/
 
     function _checkPreDeployGuards(Config memory c)
@@ -197,6 +198,20 @@ contract DeployL1Resolver is Script {
         returns (ENS ens, bytes memory dnsName, bytes32 node, address currentResolver)
     {
         address deployer = vm.addr(c.deployerPk);
+
+        // G0 (audit 969 L-3). Each escape hatch is one env var, routinely set on
+        // testnets; a .env carried over into a mainnet run would silently switch
+        // off the guard it names. On mainnet an override must be a reviewed code
+        // change, never an env var. One require per flag so each is testable.
+        if (block.chainid == 1) {
+            require(!c.allowEoaAdmin, "ALLOW_EOA_ADMIN is refused on mainnet - the resolver owner must be the Safe");
+            require(!c.allowFallbackMismatch, "ALLOW_FALLBACK_MISMATCH is refused on mainnet - the apex must keep answering from where it answers now");
+            require(!c.allowSignerChange, "ALLOW_SIGNER_CHANGE is refused on mainnet - rotate the gateway signer as its own reviewed step");
+        } else {
+            if (c.allowEoaAdmin) console.log("WARNING: ALLOW_EOA_ADMIN is set - G2 (multisig owner) is OFF");
+            if (c.allowFallbackMismatch) console.log("WARNING: ALLOW_FALLBACK_MISMATCH is set - G12 (apex source) is OFF");
+            if (c.allowSignerChange) console.log("WARNING: ALLOW_SIGNER_CHANGE is set - G18 (signer continuity) is OFF");
+        }
 
         // G1
         require(c.resolverOwner != address(0), "RESOLVER_OWNER must not be the zero address");
