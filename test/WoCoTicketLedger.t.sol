@@ -34,7 +34,7 @@ contract WoCoTicketLedgerTest is Test {
     uint64  END_TS; // set in setUp (block.timestamp + 7d)
 
     function setUp() public {
-        ledger = new WoCoTicketLedger(owner, sponsor);
+        ledger = new WoCoTicketLedger(owner, sponsor, type(uint32).max);
         // safe: block.timestamp + 7 days well within uint64
         // forge-lint: disable-next-line(unsafe-typecast)
         END_TS = uint64(block.timestamp + 7 days);
@@ -70,7 +70,7 @@ contract WoCoTicketLedgerTest is Test {
 
     function test_Constructor_RevertZeroSponsor() public {
         vm.expectRevert(WoCoTicketLedger.ZeroAddress.selector);
-        new WoCoTicketLedger(owner, address(0));
+        new WoCoTicketLedger(owner, address(0), type(uint32).max);
     }
 
     // ── registerEvent ─────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ contract WoCoTicketLedgerTest is Test {
     /// successor contract structurally safe rather than dependent on remembering
     /// to use a fresh sponsor wallet.
     function test_RegisterEvent_IdDiffersAcrossContractInstances() public {
-        WoCoTicketLedger other = new WoCoTicketLedger(owner, sponsor);
+        WoCoTicketLedger other = new WoCoTicketLedger(owner, sponsor, type(uint32).max);
 
         vm.prank(sponsor);
         bytes32 idA = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
@@ -430,7 +430,7 @@ contract WoCoTicketLedgerTest is Test {
 
         address paymentsContract = address(0xAA1);
         vm.prank(owner);
-        ledger.addSponsor(paymentsContract);
+        ledger.addSponsor(paymentsContract, type(uint32).max);
 
         vm.expectRevert(WoCoTicketLedger.NotOrganiser.selector);
         vm.prank(paymentsContract);
@@ -649,7 +649,7 @@ contract WoCoTicketLedgerTest is Test {
     function test_AddRemoveSponsor() public {
         address newSponsor = address(0x99);
         vm.prank(owner);
-        ledger.addSponsor(newSponsor);
+        ledger.addSponsor(newSponsor, type(uint32).max);
         assertTrue(ledger.authorisedSponsors(newSponsor));
 
         vm.prank(owner);
@@ -660,7 +660,7 @@ contract WoCoTicketLedgerTest is Test {
     function test_AddSponsor_RevertZero() public {
         vm.expectRevert(WoCoTicketLedger.ZeroAddress.selector);
         vm.prank(owner);
-        ledger.addSponsor(address(0));
+        ledger.addSponsor(address(0), type(uint32).max);
     }
 
     /// Renouncing would leave `owner` at address(0) for good, and every
@@ -694,7 +694,7 @@ contract WoCoTicketLedgerTest is Test {
         address newPayments = address(0xBB1);
         vm.startPrank(owner);
         ledger.removeSponsor(sponsor);
-        ledger.addSponsor(newPayments);
+        ledger.addSponsor(newPayments, type(uint32).max);
         vm.stopPrank();
 
         // Old sponsor can no longer mint.
@@ -800,7 +800,7 @@ contract WoCoTicketLedgerTest is Test {
         vm.expectEmit(true, false, false, true);
         emit DisputeAuthorityUpdated(owner);
 
-        new WoCoTicketLedger(owner, sponsor);
+        new WoCoTicketLedger(owner, sponsor, type(uint32).max);
     }
 
     function test_Emit_SponsorAddedAndRemoved() public {
@@ -809,7 +809,7 @@ contract WoCoTicketLedgerTest is Test {
         vm.expectEmit(true, false, false, true, address(ledger));
         emit SponsorAdded(newSponsor);
         vm.prank(owner);
-        ledger.addSponsor(newSponsor);
+        ledger.addSponsor(newSponsor, type(uint32).max);
 
         vm.expectEmit(true, false, false, true, address(ledger));
         emit SponsorRemoved(newSponsor);
@@ -917,7 +917,7 @@ contract WoCoTicketLedgerTest is Test {
     function test_Admin_RevertNonOwner() public {
         vm.expectRevert();
         vm.prank(buyer);
-        ledger.addSponsor(address(0x99));
+        ledger.addSponsor(address(0x99), type(uint32).max);
 
         vm.expectRevert();
         vm.prank(buyer);
