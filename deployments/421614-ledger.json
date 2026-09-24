@@ -1,0 +1,11 @@
+{
+  "address": "0x6B9b93eFe44Ee729BC68158F5F59B4F7aA082972",
+  "chainId": 421614,
+  "contract": "WoCoTicketLedger",
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "disputeAuthority": "0x98716b6d96D1D24167615A1cCF2786785723dB9E",
+  "initialSponsor": "0x68a739867b763081aEf95610402801c9EB1B87bc",
+  "initialSponsorPerHour": 1000,
+  "note_payments": "Holds no funds. Money lives in WoCoPayments (not yet built)",
+  "owner": "0x98716b6d96D1D24167615A1cCF2786785723dB9E"
+}
