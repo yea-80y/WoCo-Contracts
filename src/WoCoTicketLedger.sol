@@ -210,10 +210,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      by the first mint after the last one ended: across a boundary a
     ///      sponsor can mint up to twice its cap in a few seconds, accepted for
     ///      a backstop in exchange for one slot and no loops. The window runs on
-    ///      Arbitrum's `block.timestamp` (audit 960 L-5): normally real time to
-    ///      seconds, but up to 24h behind or 1h ahead while the sequencer is not
-    ///      posting batches to L1, so the bound is "cap per window of chain
-    ///      time", not per wall-clock hour.
+    ///      Arbitrum's `block.timestamp` (audit 960 L-5). Its rules only bound
+    ///      that to 24h behind or 1h ahead of L1; in practice it drifts only
+    ///      when the sequencer stops posting batches. So the bound is "cap per
+    ///      window of chain time", not per wall-clock hour.
     ///
     ///      Moving into or out of `UNLIMITED_MINTS` closes the open window
     ///      (audit 960 M-2): unlimited mints are never counted, so a count from
@@ -365,12 +365,11 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      * @param eventEndTs   UNIX seconds; the on-chain sales cutoff. `claimFor`
      *                     reverts `SalesClosed` at or after this. Immutable
      *                     once stamped — see the monotonicity note above.
-     *                     It is CHAIN time (audit 961 M-2). Arbitrum's clock
-     *                     normally tracks real time to seconds, but its rules
-     *                     let the sequencer set `block.timestamp` up to 24h
-     *                     behind or 1h ahead, for when it has stopped posting
-     *                     batches to L1. So in that case this cutoff can arrive
-     *                     up to ~24h late or ~1h early. The platform enforces
+     *                     It is CHAIN time (audit 961 M-2). Arbitrum's rules
+     *                     only bound `block.timestamp` to 24h behind or 1h
+     *                     ahead of L1; in practice it drifts only when the
+     *                     sequencer stops posting batches. So this cutoff can
+     *                     arrive up to ~24h late or ~1h early. The platform enforces
      *                     the real cutoff off chain, before any charge; this is
      *                     the backstop. Anything that releases money on this
      *                     value must tolerate it arriving up to an hour early -
@@ -645,15 +644,16 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      one simply lapses. Do not build a flow in which someone holds a
      *      signature to submit later.
      *
-     *      `deadline` is CHAIN time (audit 961 L-2): normally real time to
-     *      seconds, but while the sequencer is not posting batches to L1 its
-     *      clock may lag up to 24h, keeping a signature valid that long past
-     *      the wall-clock deadline. To void one for certain, move the slot,
+     *      `deadline` is CHAIN time (audit 961 L-2). Arbitrum's rules only
+     *      bound `block.timestamp` to 24h behind or 1h ahead of L1 (in practice
+     *      it drifts only when the sequencer stops posting batches), so a
+     *      signature can stay valid up to ~24h past the wall-clock deadline. To void one for certain, move the slot,
      *      which consumes the nonce.
      *
      *      The digest names `from` and the nonce as read at SUBMISSION (audit
      *      961 L-4). A message naming the signer as `from` for a slot it does
-     *      not yet hold becomes valid the moment that slot is minted to it.
+     *      not yet hold becomes valid once the slot is minted, or later moved,
+     *      to it while the nonce still equals the one it signed.
      *      Wallets and the platform must never ask a holder to sign a transfer
      *      for a slot it does not hold now.
      *
@@ -959,7 +959,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///
     ///      A convenience for an honest owner, not a control against a
     ///      malicious one (audit 961 I-2): the owner can set the authority
-    ///      anywhere with `setDisputeAuthority` at any time.
+    ///      anywhere but zero and this contract, with `setDisputeAuthority`, at
+    ///      any time.
     function _transferOwnership(address newOwner) internal override {
         address previous = owner();
         super._transferOwnership(newOwner);

@@ -30,11 +30,13 @@ import {WoCoTicketLedger, LEDGER_UNLIMITED_MINTS} from "../src/WoCoTicketLedger.
  *   INITIAL_OWNER        — the Safe. It becomes owner AND dispute authority
  *                          in the deploy transaction itself, so no handover is
  *                          left to do and the deployer never holds either role.
- *                          Off testnets it must be a Safe native to that chain
- *                          (it must answer getThreshold()) and neither the
- *                          sponsor nor the deployer: an L1 Safe acting via the
- *                          bridge arrives aliased and could never pass
- *                          onlyOwner (audit 959 I-2).
+ *                          Off testnets it must be an official Safe proxy (its
+ *                          code) of an official Safe singleton (its slot 0) that
+ *                          answers getThreshold(), native to that chain, and
+ *                          neither the sponsor nor the deployer: an L1 Safe
+ *                          acting via the bridge arrives aliased and could never
+ *                          pass onlyOwner (audit 959 I-2). On Arbitrum One it
+ *                          must be exactly WoCo's owner Safe.
  *   INITIAL_OWNER_SIGNER — off testnets only: one signer of that Safe (for WoCo,
  *                          the owner's own account). The script refuses a Safe
  *                          that does not list it, so "a Safe" is "our Safe".
@@ -91,11 +93,19 @@ contract DeployWoCoTicketLedger is Script {
         // needs this ledger's address, so it is always added later.
         require(c.perHour != LEDGER_UNLIMITED_MINTS, "INITIAL_SPONSOR must have a finite cap: UNLIMITED_MINTS is for a sponsor the chain can check, added later");
         if (!_isTestnet(block.chainid)) {
+            // No check below can tell OUR Safe from a genuine Safe that happens to
+            // list our signer (a second Safe of ours, or a substituted one), so on
+            // the production chain the address itself is pinned.
+            if (block.chainid == 42161) {
+                require(c.owner == WOCO_OWNER_SAFE_ARBITRUM_ONE, "INITIAL_OWNER is not the WoCo owner Safe");
+            }
             require(c.owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on this chain");
             // Code, or answering Safe getters, proves only "a contract" (audits
-            // 960 L-6, 961 M-1): a hand-rolled contract can answer both. A proxy
-            // whose singleton (slot 0) is an official Safe release runs the real
-            // Safe logic, so its getters and signature checks are genuine.
+            // 960 L-6, 961 M-1): a hand-rolled contract can answer both. The
+            // official proxy's code (codehash) delegates every call to the
+            // singleton in slot 0, and that singleton being an official release
+            // is what makes the getters and signature checks genuine Safe logic.
+            require(_isOfficialSafeProxyCode(c.owner), "INITIAL_OWNER is not an official Safe proxy");
             require(_isCanonicalSafeProxy(c.owner), "INITIAL_OWNER is not a proxy of an official Safe singleton");
             require(_safeThreshold(c.owner) > 0, "INITIAL_OWNER does not answer getThreshold() like a Safe");
             // A genuine Safe is not yet OUR Safe: it must list a signer we hold.
@@ -158,6 +168,21 @@ contract DeployWoCoTicketLedger is Script {
         return abi.decode(ret, (uint256));
     }
 
+    /// @dev WoCo's owner Safe on Arbitrum One: the registry admin and registrar
+    ///      owner of the live sub-ENS contracts. A redeploy to another Safe edits
+    ///      this line, in review, which is the point.
+    address internal constant WOCO_OWNER_SAFE_ARBITRUM_ONE = 0xD26abFb5fBd37eFBD876e87cB169286eF0f14BA2;
+
+    /// @dev Runtime codehash of the proxy the official SafeProxyFactory deploys,
+    ///      one per release, independent of singleton and factory deployment.
+    ///      The live owner Safe's is 1.4.1 (read on Arbitrum One 2026-09-24).
+    function _isOfficialSafeProxyCode(address a) internal view returns (bool) {
+        bytes32 h = a.codehash;
+        return h == 0xd7d408ebcd99b2b70be43e20253d6d92a8ea8fab29bd3be7f55b10032331fb4c   // SafeProxy 1.4.1
+            || h == 0xb89c1b3bdf2cf8827818646bce9a8f6e372885f8c55e5c07acbd307cb133b000   // GnosisSafeProxy 1.3.0
+            || h == 0x4e381985ca68b3e5d27b4425fa581c19cf33146d3f887a3cfca96f55528ea46f;  // SafeProxy 1.5.0
+    }
+
     /// @dev Official Safe singletons (same address on every chain, deterministic
     ///      deployment), each checked on Arbitrum One on 2026-09-24 to hold code
     ///      and report its VERSION. A Safe proxy keeps its singleton in slot 0.
@@ -165,6 +190,8 @@ contract DeployWoCoTicketLedger is Script {
         address singleton = address(uint160(uint256(vm.load(a, bytes32(0)))));
         return singleton == 0x29fcB43b46531BcA003ddC8FCB67FFE91900C762  // SafeL2 1.4.1
             || singleton == 0x41675C099F32341bf84BFc5382aF534df5C7461a  // Safe 1.4.1
+            || singleton == 0xEdd160fEBBD92E350D4D398fb636302fccd67C7e  // SafeL2 1.5.0
+            || singleton == 0xFf51A5898e281Db6DfC7855790607438dF2ca44b  // Safe 1.5.0
             || singleton == 0x3E5c63644E683549055b9Be8653de26E0B4CD36E  // SafeL2 1.3.0
             || singleton == 0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552  // Safe 1.3.0
             || singleton == 0xfb1bffC9d739B8D520DaF37dF666da4C687191EA  // SafeL2 1.3.0 (eip155)
