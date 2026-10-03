@@ -181,6 +181,20 @@ contract WeightedRootKernelTest is Test {
         assertTrue(kernel.isValidSignature(h, _rootSig(PK_A, h)) != ERC1271_MAGIC, "removed passkey, root path");
     }
 
+    /// What the ZeroDev SDK actually sends for ERC-1271 (`createKernelAccount.signTypedData`):
+    /// the validator's own id - 0x01 || validator - before the signature, not the 0x00 root byte.
+    /// Today's ECDSA accounts sign names this way; after the switch the same shape names weighted.
+    function test_F4_erc1271_withTheSdkValidatorPrefix() public {
+        bytes32 h = keccak256("a name pointer");
+        assertEq(kernel.isValidSignature(h, _validatorSig(ECDSA_VALIDATOR, PK_A, h)), ERC1271_MAGIC, "ECDSA root, SDK prefix");
+        _changeRoot(_pair(A, B), true);
+        assertEq(kernel.isValidSignature(h, _validatorSig(WEIGHTED, PK_B, h)), ERC1271_MAGIC, "weighted root, SDK prefix");
+        assertEq(kernel.isValidSignature(h, _validatorSig(WEIGHTED, PK_A, h)), ERC1271_MAGIC, "first passkey too");
+        assertFalse(_try1271(h, _validatorSig(WEIGHTED, PK_C, h)), "stranger");
+        _renew(_one(B));
+        assertFalse(_try1271(h, _validatorSig(WEIGHTED, PK_A, h)), "removed passkey");
+    }
+
     // ------------------------------------------------------------------ F5
 
     /// The validator does NOT refuse these: each leaves an account no passkey can sign for, for good.
@@ -368,9 +382,13 @@ contract WeightedRootKernelTest is Test {
         return abi.encodePacked(bytes1(0x00), _rawSig(pk, _wrapped(h)));
     }
 
-    /// A named secondary validator: 0x01 || validator || signature.
+    /// A named validator: 0x01 || validator || signature.
+    function _validatorSig(address validator, uint256 pk, bytes32 h) internal view returns (bytes memory) {
+        return abi.encodePacked(VALIDATION_TYPE_VALIDATOR, validator, _rawSig(pk, _wrapped(h)));
+    }
+
     function _ecdsaSecondarySig(uint256 pk, bytes32 h) internal view returns (bytes memory) {
-        return abi.encodePacked(VALIDATION_TYPE_VALIDATOR, ECDSA_VALIDATOR, _rawSig(pk, _wrapped(h)));
+        return _validatorSig(ECDSA_VALIDATOR, pk, h);
     }
 
     function _try1271(bytes32 h, bytes memory sig) internal view returns (bool) {
