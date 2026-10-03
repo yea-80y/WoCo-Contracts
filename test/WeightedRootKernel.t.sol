@@ -68,7 +68,8 @@ interface IECDSAValidator {
 ///        F4  ERC-1271 typed data signed by one listed signer is valid (names are signed this way).
 ///        F5  what renew does with an empty list, or a threshold above the total weight.
 ///        F6  the OLD ECDSA validation is still installed after the switch: unless the switch also
-///            uninstalls it, the first passkey's key keeps an ERC-1271 path that renew cannot remove.
+///            uninstalls it, the first passkey's key keeps an ERC-1271 path that renew cannot remove
+///            (not a userOp path: Kernel refuses a non-root validation the selector it was never granted).
 ///
 ///      Fixtures: test/fixtures/kernel-v3.1/ (Kernel, factory and ECDSAValidator captured at block
 ///      504856734 and re-checked equal at 511330785; WeightedECDSAValidator 0xeD89…EEEE captured at
@@ -84,6 +85,10 @@ contract WeightedRootKernelTest is Test {
     bytes32 constant SINGLE_MODE = bytes32(0);
     bytes32 constant BATCH_MODE = bytes32(uint256(1) << 248);
     bytes1 constant VALIDATION_TYPE_VALIDATOR = 0x01;
+    /// IValidator.validateUserOp(PackedUserOperation, bytes32).
+    bytes4 constant ECDSA_VALIDATE_USEROP = 0x97003203;
+    /// Kernel's InvalidValidator().
+    bytes4 constant INVALID_VALIDATOR = 0x682a6e7c;
 
     uint256 constant PK_A = 0xA11CE; // the passkey the account was made with
     uint256 constant PK_B = 0xB0B; // a passkey added later
@@ -211,6 +216,22 @@ contract WeightedRootKernelTest is Test {
         assertEq(kernel.isValidSignature(h, _ecdsaSecondarySig(PK_A, h)), ERC1271_MAGIC, "old key, ECDSA path");
     }
 
+    /// Not worse than the ERC-1271 path (a sign-off asked whether it was): after the switch alone, a
+    /// userOp through the ECDSA nonce key IS routed to the still-installed ECDSA validation, and that
+    /// validator accepts the removed first passkey's signature - but Kernel v3.1 then refuses with
+    /// InvalidValidator, because a non-root validation was never granted the selector being called.
+    /// So the hazard the uninstall closes is the names (ERC-1271) path. `expectCall` is the positive
+    /// control for `_ecdsaNonce()`: the refusals in the next test are not a mis-encoded nonce.
+    function test_F6_switchAlone_oldKeyUserOp_reachesEcdsa_butKernelRefusesTheSelector() public {
+        _changeRoot(_pair(A, B), false);
+        _renew(_one(B));
+        (PackedUserOperation memory op, bytes32 userOpHash) = _signedOp(_ecdsaNonce() | ++seq, PK_A);
+        vm.expectCall(ECDSA_VALIDATOR, abi.encodeWithSelector(ECDSA_VALIDATE_USEROP));
+        vm.prank(ENTRYPOINT);
+        vm.expectRevert(INVALID_VALIDATOR);
+        kernel.validateUserOp(op, userOpHash, 0);
+    }
+
     function test_F6_switchWithUninstall_closesOldKeyPaths() public {
         _changeRoot(_pair(A, B), true);
         assertEq(IECDSAValidator(ECDSA_VALIDATOR).ecdsaValidatorStorage(address(kernel)), address(0), "ECDSA storage cleared");
@@ -294,21 +315,25 @@ contract WeightedRootKernelTest is Test {
     /// `key` is the nonce's top 192 bits (0 = root validator); each call takes the next sequence
     /// number, as the EntryPoint gives one per included userOp.
     function _userOpValid(uint256 key, uint256 pk) internal returns (bool) {
-        uint256 nonce = key | ++seq;
-        PackedUserOperation memory op;
-        op.sender = address(kernel);
-        op.nonce = nonce;
-        op.callData = abi.encodeCall(IKernel31.execute, (SINGLE_MODE, abi.encodePacked(address(0xdead), uint256(0), hex"")));
-        bytes32 userOpHash = keccak256(abi.encode("op", nonce, pk));
-        (uint8 v, bytes32 r, bytes32 s) =
-            vm.sign(pk, keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", userOpHash)));
-        op.signature = abi.encodePacked(r, s, v);
+        (PackedUserOperation memory op, bytes32 userOpHash) = _signedOp(key | ++seq, pk);
         vm.prank(ENTRYPOINT);
         try kernel.validateUserOp(op, userOpHash, 0) returns (uint256 vd) {
             return uint160(vd) == 0;
         } catch {
             return false;
         }
+    }
+
+    /// A userOp calling `execute`, signed by one key as the weighted plugin signs for one local
+    /// signer (EIP-191 over the userOpHash) - which is also how the ECDSA validator checks it.
+    function _signedOp(uint256 nonce, uint256 pk) internal view returns (PackedUserOperation memory op, bytes32 userOpHash) {
+        op.sender = address(kernel);
+        op.nonce = nonce;
+        op.callData = abi.encodeCall(IKernel31.execute, (SINGLE_MODE, abi.encodePacked(address(0xdead), uint256(0), hex"")));
+        userOpHash = keccak256(abi.encode("op", nonce, pk));
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(pk, keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", userOpHash)));
+        op.signature = abi.encodePacked(r, s, v);
     }
 
     function _ecdsaNonce() internal pure returns (uint256) {
