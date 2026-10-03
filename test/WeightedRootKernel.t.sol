@@ -221,6 +221,22 @@ contract WeightedRootKernelTest is Test {
         assertTrue(_userOpValid(PK_B), "kept passkey still signs");
     }
 
+    /// An account that once had backups still carries the recovery route, and its doRecovery makes the
+    /// account call ECDSAValidator.onInstall(newOwner) - rewriting that validator's storage. Once the
+    /// switch has uninstalled the ECDSA validation, a key written there must open nothing.
+    function test_F7_afterUninstall_rewritingEcdsaStorageOpensNothing() public {
+        _changeRoot(_pair(A, B), true);
+        vm.prank(address(kernel));
+        (bool ok,) = ECDSA_VALIDATOR.call(abi.encodeWithSignature("onInstall(bytes)", abi.encodePacked(C)));
+        assertTrue(ok, "storage rewrite");
+        assertEq(IECDSAValidator(ECDSA_VALIDATOR).ecdsaValidatorStorage(address(kernel)), C);
+        bytes32 h = keccak256("a name pointer");
+        assertFalse(_try1271(h, _ecdsaSecondarySig(PK_C, h)), "rewritten key, ECDSA 1271 path");
+        assertFalse(_userOpValid(_ecdsaNonce(), PK_C), "rewritten key, ECDSA userOp");
+        assertFalse(_userOpValid(PK_C), "rewritten key, root userOp");
+        assertTrue(_userOpValid(PK_A), "listed passkey still signs");
+    }
+
     // ------------------------------------------------------------------ helpers
 
     function _etchFixture(address at, string memory name) internal {
