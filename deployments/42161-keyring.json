@@ -1,0 +1,16 @@
+{
+  "contract": "WoCoKeyRing",
+  "chainId": 42161,
+  "address": "0xf5dbe22C7C9F1A19ab39DC2770F246e0C4283AAb",
+  "deployedVia": "CREATE2 deterministic-deployment proxy 0x4e59b44847b379578588920cA78FbF26c0B4956C",
+  "salt": "0x797f7c8657db930dcf368e11ad923e4546afc59cc8ad1b10d52a7040c5491d39",
+  "saltPreimage": "woco/keyring/anchor/v1",
+  "creationCodeHash": "0x755478e432c13b4425f1c03c67f86b8fdbe22d923f4f8232ddefbcd745d650ee",
+  "deployTx": "0xf880f674dc84ae49b28771c21f08ca59ad01b5bd558a1c3b94f60493e8a97e59",
+  "deployBlock": 513250447,
+  "deployer": "0xff9758533Ec0FE75030820Af9468989B53b19a5c",
+  "deployerRole": "gas only — the contract has no owner, admin or upgrade path",
+  "arbiscan": "https://arbiscan.io/address/0xf5dbe22c7c9f1a19ab39dc2770f246e0c4283aab",
+  "verified": true,
+  "note": "Each account's current key ring, set by the account in the same batch as its co-owner change (WoCo-Event-App #186). Deployed from ed98dee, the commit audited by LeftClaw job #983 (2026-10-09: 0 critical/high/medium); runtime bytecode checked identical to that commit at deploy."
+}
