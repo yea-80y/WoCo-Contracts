@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {WoCoKeyRing} from "../src/WoCoKeyRing.sol";
+import {DeployKeyRing} from "../script/DeployKeyRing.s.sol";
 
 contract WoCoKeyRingTest is Test {
     WoCoKeyRing reg;
@@ -13,6 +14,12 @@ contract WoCoKeyRingTest is Test {
 
     function setUp() public {
         reg = new WoCoKeyRing();
+    }
+
+    /// The app hard-codes this address (@woco/shared keyring/anchor.ts). A compiler, setting or
+    /// submodule change that moves the CREATE2 address must fail here, not at the first ring write.
+    function test_singletonAddress_isPinned() public {
+        assertEq(new DeployKeyRing().predict(), 0xf5dbe22C7C9F1A19ab39DC2770F246e0C4283AAb);
     }
 
     function test_firstRing_fromNone() public {
