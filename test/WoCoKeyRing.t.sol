@@ -16,7 +16,7 @@ contract WoCoKeyRingTest is Test {
         reg = new WoCoKeyRing();
     }
 
-    /// The app hard-codes this address (@woco/shared keyring/anchor.ts). A compiler, setting or
+    /// The app hard-codes this address (packages/shared keyring/anchor.ts). A compiler, setting or
     /// submodule change that moves the CREATE2 address must fail here, not at the first ring write.
     function test_singletonAddress_isPinned() public {
         assertEq(new DeployKeyRing().predict(), 0xf5dbe22C7C9F1A19ab39DC2770F246e0C4283AAb);
