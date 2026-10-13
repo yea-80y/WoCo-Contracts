@@ -1,0 +1,13 @@
+{
+  "address": "0xecCd0401F624515231dBC0AFc3084f906774a405",
+  "chainId": 10143,
+  "contract": "WoCoTicketLedger",
+  "deployer": "0xdb866972CcF3Be0cCD3B98E4461A828DD6cc2bfA",
+  "owner": "0x5A85a9D761EEc2780d0E3A0b533FafA0f4Fc3088",
+  "disputeAuthority": "0x5A85a9D761EEc2780d0E3A0b533FafA0f4Fc3088",
+  "initialSponsor": "0x0445aE7B50A21A8d09437158bf548FDdD62EFd3e",
+  "initialSponsorPerHour": 1000,
+  "deployTx": "0x50260dcb1d5cc0b9c4cdb0b0907331211adea8f5dfcb3e705b1e12b2be6e91e7",
+  "note_payments": "Holds no funds. Money lives in WoCoPayments (not yet built)",
+  "note_monad": "Monad testnet hackathon demo 2026-10-13. Deployed with forge create (DeployTicketLedger.s.sol's _isTestnet list lacks 10143). Throwaway EOA owner/sponsor keys, not WoCo's Safe or production sponsor. Runtime code equals the Arbitrum One ledger 0xEa6E...65A2 outside the 7 EIP-712 immutables."
+}
