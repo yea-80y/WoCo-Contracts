@@ -112,7 +112,7 @@ contract RedeployRegistrar is Script {
 
     /// @notice Labels the registrar will never mint.
     function reservedLabels() public pure returns (string[] memory labels) {
-        labels = new string[](8);
+        labels = new string[](11);
         labels[0] = "woco";
         labels[1] = "admin";
         labels[2] = "support";
@@ -121,6 +121,12 @@ contract RedeployRegistrar is Script {
         labels[5] = "api";
         labels[6] = "app";
         labels[7] = "mail";
+        // The passkey sign-in host is auth.woco.eth, held on L1 with its own resolver,
+        // so an L2 name could never answer for it; reserved anyway, with the two names
+        // a sign-in page could be mistaken for.
+        labels[8] = "auth";
+        labels[9] = "accounts";
+        labels[10] = "login";
     }
 
     /// @notice The admin batch that swaps the new registrar in. A Safe batch is
