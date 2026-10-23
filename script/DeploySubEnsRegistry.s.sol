@@ -122,7 +122,7 @@ contract DeploySubEnsRegistry is Script {
 
     /// @notice Labels the registrar will never mint.
     function reservedLabels() public pure returns (string[] memory labels) {
-        labels = new string[](11);
+        labels = new string[](14);
         labels[0] = "woco";
         labels[1] = "admin";
         labels[2] = "support";
@@ -137,6 +137,11 @@ contract DeploySubEnsRegistry is Script {
         labels[8] = "auth";
         labels[9] = "accounts";
         labels[10] = "login";
+        // The door scanner is served at scan.woco.eth (the gateway answers it from the
+        // platform's own feed); the two names a door app could be mistaken for go with it.
+        labels[11] = "scan";
+        labels[12] = "door";
+        labels[13] = "scanner";
     }
 
     /// @notice The calldata the registry admin sends to the registry to let the

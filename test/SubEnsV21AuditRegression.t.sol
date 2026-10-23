@@ -61,7 +61,7 @@ contract SubEnsV21AuditRegressionTest is Test {
 
     /// The list both deploy scripts use.
     function _productionReservedLabels() internal pure returns (string[] memory labels) {
-        labels = new string[](11);
+        labels = new string[](14);
         labels[0] = "woco";
         labels[1] = "admin";
         labels[2] = "support";
@@ -76,6 +76,9 @@ contract SubEnsV21AuditRegressionTest is Test {
         labels[8] = "auth";
         labels[9] = "accounts";
         labels[10] = "login";
+        labels[11] = "scan";
+        labels[12] = "door";
+        labels[13] = "scanner";
     }
 
     function _mint(string memory label, address to) internal returns (bytes32 node) {
