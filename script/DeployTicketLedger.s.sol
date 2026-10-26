@@ -215,6 +215,7 @@ contract DeployWoCoTicketLedger is Script {
 
         string memory obj = "deployment";
         vm.serializeString (obj, "contract",              "WoCoTicketLedger");
+        vm.serializeString (obj, "version",               "2");
         vm.serializeUint   (obj, "chainId",               block.chainid);
         vm.serializeAddress(obj, "deployer",              deployer);
         vm.serializeAddress(obj, "owner",                 owner);
@@ -224,10 +225,13 @@ contract DeployWoCoTicketLedger is Script {
         vm.serializeString (obj, "note_payments",         "Holds no funds. Money lives in WoCoPayments (not yet built)");
         string memory json = vm.serializeAddress(obj, "address", contractAddr);
 
+        // Version 2's own record. `{chainId}-ledger.json` is the deployed
+        // version 1's, which the server's records still name: writing over it
+        // would lose the only record of where those events live.
         string memory path = string.concat(
             "deployments/",
             vm.toString(block.chainid),
-            "-ledger.json"
+            "-ledger2.json"
         );
         vm.writeJson(json, path);
         console.log("Deployment saved to:", path);
