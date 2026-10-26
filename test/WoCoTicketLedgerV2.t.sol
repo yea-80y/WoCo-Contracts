@@ -365,6 +365,38 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(ledger.slotOwner(id, s), fresh);
     }
 
+    /// What only reissue's nonce bump refuses: the slot comes back to the old
+    /// key (re-pointed away and back, which callers must never do), and the
+    /// old key's signature, still inside its deadline, names the right `from`
+    /// again. Without the bump its nonce would match too.
+    function test_Reissue_NonceKillsAnOldSignatureAfterARoundTrip() public {
+        bytes32 id = _register();
+        uint256 s = _bearer(id, 1, holder);
+        uint256 deadline = block.timestamp + 1 hours;
+        (uint8 v, bytes32 r, bytes32 sig) = vm.sign(HOLDER_KEY, ledger.transferSlotDigest(id, s, stranger, deadline));
+        _reissue(id, _slots(s), fresh);
+        _reissue(id, _slots(s), holder);
+        assertEq(ledger.slotOwner(id, s), holder);
+
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlotWithSignature(id, s, stranger, deadline, abi.encodePacked(r, sig, v));
+    }
+
+    /// A cutoff moved later reopens reissue with sales: the same window.
+    function test_Reissue_ReopensWithAnExtendedCutoff() public {
+        bytes32 id = _register();
+        uint256 s = _bearer(id, 1, holder);
+        vm.warp(END_TS);
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SalesClosed.selector);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
+
+        vm.prank(sponsor);
+        ledger.extendSalesEnd(id, END_TS + 1 days);
+        _reissue(id, _slots(s), fresh);
+        assertEq(ledger.slotOwner(id, s), fresh);
+    }
+
     /// A slot can be reissued again (the platform limits how often), until a
     /// holder moves it: then a key someone keeps holds it, for good.
     function test_Reissue_RepeatsUntilAHolderMoves() public {
@@ -573,6 +605,37 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.prank(holder);
         ledger.transferSlot(id, s, stranger);
         assertEq(ledger.slotOwner(id, s), stranger);
+    }
+
+    // ── the server's ABI ──────────────────────────────────────────────────────
+
+    /// The server encodes calls, decodes reverts and parses logs from its OWN
+    /// human-readable ABI (`LEDGER2_ABI` in event-contract-ledger.ts), never
+    /// from this artefact, so a signature drift here compiles everywhere and
+    /// fails only on chain. Written out, as in WoCoTicketLedger.t.sol's version
+    /// 1 pin, so that drift has to be made in two places.
+    function test_ServerAbi_Version2SelectorsUnchanged() public view {
+        assertEq(bytes32(WoCoTicketLedger.batchClaimBearer.selector), bytes32(bytes4(keccak256("batchClaimBearer(bytes32,address[],bytes32)"))));
+        assertEq(bytes32(WoCoTicketLedger.reissue.selector),          bytes32(bytes4(keccak256("reissue(bytes32,uint256[],address[])"))));
+        assertEq(bytes32(WoCoTicketLedger.getSlotFlags.selector),     bytes32(bytes4(keccak256("getSlotFlags(bytes32,uint256)"))));
+        assertEq(bytes32(WoCoTicketLedger.getRegistrant.selector),    bytes32(bytes4(keccak256("getRegistrant(bytes32)"))));
+        assertEq(bytes32(WoCoTicketLedger.setSupply.selector),        bytes32(bytes4(keccak256("setSupply(bytes32,uint64)"))));
+        assertEq(bytes32(WoCoTicketLedger.extendSalesEnd.selector),   bytes32(bytes4(keccak256("extendSalesEnd(bytes32,uint64)"))));
+        assertEq(bytes32(ledger.bearerMintsDisabled.selector),        bytes32(bytes4(keccak256("bearerMintsDisabled()"))));
+
+        assertEq(WoCoTicketLedger.SlotReissued.selector,        keccak256("SlotReissued(bytes32,uint256,address,address)"));
+        assertEq(WoCoTicketLedger.SupplySet.selector,           keccak256("SupplySet(bytes32,uint64,uint64)"));
+        assertEq(WoCoTicketLedger.SalesEndExtended.selector,    keccak256("SalesEndExtended(bytes32,uint64,uint64)"));
+        assertEq(WoCoTicketLedger.BearerMintsDisabled.selector, keccak256("BearerMintsDisabled(address)"));
+
+        assertEq(bytes32(WoCoTicketLedger.BearerMintsOff.selector),    bytes32(bytes4(keccak256("BearerMintsOff()"))));
+        assertEq(bytes32(WoCoTicketLedger.LengthMismatch.selector),    bytes32(bytes4(keccak256("LengthMismatch()"))));
+        assertEq(bytes32(WoCoTicketLedger.SlotsNotAscending.selector), bytes32(bytes4(keccak256("SlotsNotAscending()"))));
+        assertEq(bytes32(WoCoTicketLedger.NotBearer.selector),         bytes32(bytes4(keccak256("NotBearer()"))));
+        assertEq(bytes32(WoCoTicketLedger.NotSlotClaimer.selector),    bytes32(bytes4(keccak256("NotSlotClaimer()"))));
+        assertEq(bytes32(WoCoTicketLedger.SlotHeld.selector),          bytes32(bytes4(keccak256("SlotHeld()"))));
+        assertEq(bytes32(WoCoTicketLedger.NotRegistrant.selector),     bytes32(bytes4(keccak256("NotRegistrant()"))));
+        assertEq(bytes32(WoCoTicketLedger.SupplyUnchanged.selector),   bytes32(bytes4(keccak256("SupplyUnchanged()"))));
     }
 
     // ── views ─────────────────────────────────────────────────────────────────

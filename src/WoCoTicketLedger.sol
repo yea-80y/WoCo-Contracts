@@ -66,7 +66,12 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  *     holder's own key (`batchClaimFor`, `claimFor`), or moved there, is out
  *     of reach from then on, with no action by the holder.
  *   - BOUNDS: each re-point is charged to the hourly mint cap like a mint, so
- *     `setSponsorMintCap(sponsor, 0)` stops it.
+ *     `setSponsorMintCap(sponsor, 0)` stops it. That is also the width of a
+ *     leaked sponsor key here: per window, up to its cap, it can re-point any
+ *     bearer slot it minted, and by then moving each one as its new holder
+ *     (which sets `held`) put it beyond reissue for good. An `UNLIMITED_MINTS`
+ *     sponsor is unbounded in this too, so card sales must mint through a
+ *     capped sponsor.
  *   - VISIBILITY: every re-point is a `SlotReissued` log.
  *   - OFF-RAMP: `disableBearerMints` ends bearer minting and reissue for good.
  *     It is one-way so that it is a commitment anyone can read on chain, not a
@@ -309,11 +314,11 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///         registrar's owner brick minting by overflow (audit 925 F3).
     uint64 public constant MINT_WINDOW = 1 hours;
 
-    /// Per-slot counter consumed by EVERY ownership change, on either transfer
-    /// path. A signed transfer commits to its current value, so a signature is
-    /// dead once used and dead once the slot moves any other way — including a
-    /// round trip back to the signer, after which (from, to, deadline) alone
-    /// would validate again.
+    /// Per-slot counter consumed by EVERY ownership change: both transfer
+    /// paths and `reissue`. A signed transfer commits to its current value, so
+    /// a signature is dead once used and dead once the slot moves any other
+    /// way — including a round trip back to the signer, after which (from, to,
+    /// deadline) alone would validate again.
     mapping(bytes32 => mapping(uint256 => uint256)) public transferNonces;
 
     /// EIP-712 type a holder signs to move a slot (domain: "WoCoTicketLedger",
@@ -637,6 +642,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      slot's transfer nonce, so a signature the old key made is dead. A
      *      slot can be reissued again: limiting that is the platform's rule.
      *      `getSlotData` keeps the batch's claimer and orderRef: the sale.
+     *
+     *      CALLERS MUST NEVER RE-POINT A SLOT TO AN ADDRESS THAT HAS HELD IT.
+     *      Only `to == current owner` is refused here; pointing it back at an
+     *      earlier holder makes that holder's ticket verify at the door again,
+     *      because the door checks the ticket's signer against `slotOwner`.
+     *      Mint every re-point to a freshly generated key.
      * @param eventId   The event the slots belong to.
      * @param slots     The slots to re-point, strictly ascending.
      * @param newOwners One fresh holder per slot, in the same order.
@@ -876,8 +887,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      nonce, deadline)` under the EIP-712 domain ("WoCoTicketLedger", "2",
      *      chain id, this contract). `from` and `nonce` come from storage, so a
      *      signature counts only while its signer holds the slot, and only
-     *      until the slot next moves by EITHER path (`transferNonces`). The
-     *      domain stops it being replayed on another chain or deployment.
+     *      until the slot next moves by EITHER transfer path or by `reissue`
+     *      (`transferNonces`). The domain stops it being replayed on another
+     *      chain or deployment.
      *
      *      EOA SIGNATURES ONLY, deliberately — see "No reentrancy guard" in the
      *      contract header. A slot held by a contract account moves through
@@ -999,7 +1011,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         sd.owner = newOwner;
         // A key someone keeps holds it now: out of `reissue`'s reach for good.
         sd.held = true;
-        // Consumed by every move, on either path — see `transferNonces`.
+        // Consumed by every move: either transfer path, and `reissue` — see `transferNonces`.
         unchecked { ++transferNonces[eventId][slot]; }
 
         emit SlotTransferred(eventId, slot, previousOwner, newOwner);
