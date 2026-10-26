@@ -20,23 +20,80 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * replaceable contract (WoCoPayments). The split exists so that replacing the
  * money contract never puts the ticket ledger back in front of an auditor.
  *
+ * Version 2 (EIP-712 domain version "2") adds, over the deployed version 1:
+ * seats an event's registrant can change (`setSupply`), a sales cutoff it can
+ * only move later (`extendSalesEnd`), and the platform's replacement of a
+ * bearer ticket (`reissue`), with a one-way off switch (`disableBearerMints`).
+ *
  * ── The guarantee this contract makes ────────────────────────────────────────
  *
  *   On an event it did not itself register, sponsor authority grants exactly
- *   ONE power: appending new slots — within the supply stamped at
- *   registration, before `eventEndTs`, only while not cancelled, and within
- *   that sponsor's hourly mint cap.
+ *   TWO powers, both within that sponsor's hourly mint cap, before
+ *   `eventEndTs` and only while not cancelled:
+ *     1. appending new slots, within the event's supply;
+ *     2. re-pointing a BEARER slot it minted itself, that no holder has ever
+ *        moved, to a fresh key (`reissue`), until the owner calls
+ *        `disableBearerMints`.
  *
- * Sponsors cannot cancel such an event, cannot alter its stamped terms, and
- * cannot touch slots that already exist. That statement is what a payments
- * contract — present or future, correct or buggy — is audited against, and it
- * holds for every sponsor without re-reading this contract.
+ * Sponsors cannot cancel such an event, cannot alter its terms, and cannot
+ * touch any other slot that already exists: not one minted by another sponsor,
+ * not one minted non-bearer, not one its holder has ever moved. That statement
+ * is what a payments contract — present or future, correct or buggy — is
+ * audited against, and it holds for every sponsor without re-reading this
+ * contract.
  *
  * Stated precisely, because the scope matters: `registerEvent` is
  * PERMISSIONLESS. A sponsor may therefore also register its own events and,
- * having stamped itself as their organiser, cancel those. That is not sponsor
- * authority — it is what any address can do, and it reaches only events that
- * caller created. The guarantee above is about the events it did not.
+ * having stamped itself as their organiser, cancel those, and as their
+ * REGISTRANT change their supply and move their cutoff later. That is not
+ * sponsor authority — it is what any address can do for the events it
+ * registered, and it reaches only those. The guarantee above is about the
+ * events it did not.
+ *
+ * ── Reissue: the platform replacing a bearer ticket ──────────────────────────
+ *
+ * Card tickets are minted to a one-off key that signs the ticket and is then
+ * discarded, so such a ticket can never move (`transferSlot` needs its key).
+ * When one is emailed to a mistyped address that exists, a stranger holds a
+ * ticket the door accepts. `reissue` is the remedy: it points that slot at a
+ * fresh key. The old ticket's signature then recovers to a key that no longer
+ * owns the slot, so a door that verifies against the chain refuses it, and the
+ * ticket signed by the fresh key takes its place. This IS the platform moving
+ * a ticket, which the platform-authorised transfer rejected below
+ * (`transferSlot`) would also have done. What differs:
+ *   - SCOPE: only slots minted through `batchClaimBearer` by the calling
+ *     sponsor and never moved by a holder since (`held`). A slot minted to its
+ *     holder's own key (`batchClaimFor`, `claimFor`), or moved there, is out
+ *     of reach from then on, with no action by the holder.
+ *   - BOUNDS: each re-point is charged to the hourly mint cap like a mint, so
+ *     `setSponsorMintCap(sponsor, 0)` stops it. That is also the width of a
+ *     leaked sponsor key here: per window, up to its cap, it can re-point any
+ *     bearer slot it minted, and by then moving each one as its new holder
+ *     (which sets `held`) put it beyond reissue for good. An `UNLIMITED_MINTS`
+ *     sponsor is unbounded in this too, so card sales must mint through a
+ *     capped sponsor.
+ *   - VISIBILITY: every re-point is a `SlotReissued` log.
+ *   - OFF-RAMP: `disableBearerMints` ends bearer minting and reissue for good.
+ *     It is one-way so that it is a commitment anyone can read on chain, not a
+ *     policy the owner could reverse. Sales, supply changes and transfers
+ *     carry on after it.
+ *
+ * WHY IN PLACE, NOT REVOKE-AND-MINT. The slot index is the ticket's edition
+ * number off chain (edition = slot + 1), and the manifest committed by
+ * `manifestRef` holds exactly one leaf per edition up to the supply it was
+ * registered with. A replacement appended at `nextSlot` would be an edition
+ * the manifest never committed, refused at the door as out of range on a
+ * sold-out event. Keeping the index keeps the edition, uses no seat, and
+ * keeps every off-chain record keyed by slot valid.
+ *
+ * Refunds and chargebacks are NOT reissues: they can be reversed (a refund
+ * that fails, a dispute that is won), so they stay off chain.
+ *
+ * SPONSOR ROTATION. Reissue checks the slot's minting sponsor, so a sponsor
+ * key removed from service can no longer reissue the bearer tickets it minted
+ * (they still verify at the door). That is the right outcome for a key that
+ * leaked. For a routine rotation, keep the old key authorised with a small
+ * cap until the last event it minted into is over.
  *
  * ── What bounds a sponsor (audit 959 M-1) ────────────────────────────────────
  *
@@ -72,13 +129,20 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * or open refunds — never accelerate, enlarge, or redirect a payout.
  *   - `cancelled` is one-way (false → true). It only stops mints and opens
  *     refunds.
- *   - `eventEndTs` is immutable. Release time downstream is `eventEndTs +
- *     releaseDelay`, so it can never be pulled earlier than buyers agreed to.
+ *   - `eventEndTs` only ever moves LATER (`extendSalesEnd`, the registrant
+ *     only). Release time downstream is `eventEndTs + releaseDelay`, so it can
+ *     never be pulled earlier than buyers agreed to.
+ *   - Supply is not read across the boundary: changing it (`setSupply`)
+ *     decides how many tickets may still be sold, never who is paid or when.
+ *     It does NOT move the edition commitment: `manifestRef` has no setter
+ *     and commits the editions the event was registered with. Lowering supply
+ *     is usable as is; raising it is usable only once the platform accepts a
+ *     manifest that extends the registered one, which is an off-chain rule.
  *
- * COROLLARY, for anyone who later makes the sales cutoff mutable (see #294):
- * it must be MONOTONIC-INCREASE-ONLY. Extending the cutoff delays release,
- * which is conservative. Shortening it pulls the organiser's withdrawal
- * forward, which is the rug this rule exists to prevent.
+ * WHY THE CUTOFF IS MONOTONIC-INCREASE-ONLY (#294): extending it delays
+ * release, which is conservative. Shortening it would pull the organiser's
+ * withdrawal forward, which is the rug this rule exists to prevent. Any later
+ * change to `extendSalesEnd` must keep that.
  *
  * NOTE FOR THE PAYMENTS SPEC: WoCoEventV2 ordered cancel-before-withdraw
  * inside one contract (`cancelEvent` reverted `AlreadyWithdrawn`). Split
@@ -152,11 +216,12 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * Slot indices are 0-based (matches v1 and V2).
  */
 contract WoCoTicketLedger is Ownable2Step, EIP712 {
-    /// Packed layout — 3 storage slots (V2 used 5).
+    /// Packed layout — 4 storage slots (V2 used 5).
     ///
     /// Slot 0: totalSupply(64) + nextSlot(64) + eventEndTs(64) + exists(8) + cancelled(8)
     /// Slot 1: organiser(160)
     /// Slot 2: manifestRef(256)
+    /// Slot 3: registrant(160)
     struct Event {
         // ---- slot 0 ----
         uint64 totalSupply;
@@ -168,12 +233,24 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         address organiser;
         // ---- slot 2 ----
         bytes32 manifestRef;
+        // ---- slot 3 ----
+        /// `msg.sender` at registration: the one address that may change supply
+        /// or move the cutoff later. Authenticated, unlike `organiser`.
+        address registrant;
     }
 
-    /// Packed: address (20) + uint64 (8) = 28 bytes, one SSTORE per slot.
+    /// Packed: address (20) + uint64 (8) + 2 bools = 30 bytes, one SSTORE per slot.
+    ///
+    /// `bearer` is set at mint and never changes: true only through
+    /// `batchClaimBearer`, for a ticket whose key is not kept. Only a bearer
+    /// slot can be reissued. `held` is set by the first holder-authorised move
+    /// (`_transfer`) and never cleared: from then on a key someone keeps holds
+    /// the slot, and `reissue` cannot reach it. A reissue does not set it.
     struct Slot {
         address owner;
         uint64  batchFirstSlot;
+        bool    bearer;
+        bool    held;
     }
 
     // ── Storage ───────────────────────────────────────────────────────────────
@@ -200,6 +277,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// Addresses permitted to mint. The Stripe webhook's sponsor wallet today;
     /// WoCoPayments once it ships; any future sponsor contract after that.
     mapping(address => bool) public authorisedSponsors;
+
+    /// One-way: once true, `batchClaimBearer` and `reissue` revert for good.
+    /// Set by `disableBearerMints` (owner only); nothing clears it.
+    bool public bearerMintsDisabled;
 
     /// @notice A sponsor's hourly mint accounting. One slot.
     /// @dev `perHour` is `UNLIMITED_MINTS` (no accounting at all), 0 (the
@@ -233,15 +314,15 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///         registrar's owner brick minting by overflow (audit 925 F3).
     uint64 public constant MINT_WINDOW = 1 hours;
 
-    /// Per-slot counter consumed by EVERY ownership change, on either transfer
-    /// path. A signed transfer commits to its current value, so a signature is
-    /// dead once used and dead once the slot moves any other way — including a
-    /// round trip back to the signer, after which (from, to, deadline) alone
-    /// would validate again.
+    /// Per-slot counter consumed by EVERY ownership change: both transfer
+    /// paths and `reissue`. A signed transfer commits to its current value, so
+    /// a signature is dead once used and dead once the slot moves any other
+    /// way — including a round trip back to the signer, after which (from, to,
+    /// deadline) alone would validate again.
     mapping(bytes32 => mapping(uint256 => uint256)) public transferNonces;
 
     /// EIP-712 type a holder signs to move a slot (domain: "WoCoTicketLedger",
-    /// version "1", this chain, this contract). `from` and `nonce` are read from
+    /// version "2", this chain, this contract). `from` and `nonce` are read from
     /// storage at submission, never supplied by the submitter.
     bytes32 public constant TRANSFER_SLOT_TYPEHASH = keccak256(
         "TransferSlot(bytes32 eventId,uint256 slot,address from,address to,uint256 nonce,uint256 deadline)"
@@ -295,6 +376,26 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     event SponsorMintCapSet(address indexed sponsor, uint32 perHour);
     event DisputeAuthorityUpdated(address indexed authority);
 
+    /// @notice The registrant set the event's supply (`setSupply`).
+    event SupplySet(bytes32 indexed eventId, uint64 previous, uint64 supply);
+
+    /// @notice The registrant moved the sales cutoff later (`extendSalesEnd`).
+    event SalesEndExtended(bytes32 indexed eventId, uint64 previous, uint64 eventEndTs);
+
+    /// @notice `reissue` pointed a bearer slot at a fresh key.
+    /// @dev Indexers MUST fold this over `SlotClaimed` as they fold
+    ///      `SlotTransferred`: after it the holder is no longer the address in
+    ///      the claim log. A separate event, not `SlotTransferred`, so a
+    ///      platform re-point is never mistaken for a holder's own move. Like
+    ///      that event, it invalidates any snapshot of slot owners (the offline
+    ///      check-in pack): a pack built before it still accepts the old ticket
+    ///      until refreshed. `slot` is indexed: "what happened to this ticket"
+    ///      is the question, and the new key is one nobody looks up.
+    event SlotReissued(bytes32 indexed eventId, uint256 indexed slot, address indexed from, address to);
+
+    /// @notice The owner ended bearer minting and reissue, for good.
+    event BearerMintsDisabled(address indexed by);
+
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error EventNotFound();
@@ -323,6 +424,18 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      nothing was stored, so the next mint opens its own window.
     error MintCapExceeded(address sponsor, uint64 windowResetsAt);
     error TransferToLedger();
+    error NotRegistrant();
+    error SupplyUnchanged();
+    error LengthMismatch();
+    /// @dev `reissue`'s slots must be strictly ascending, so none appears twice.
+    error SlotsNotAscending();
+    error NotBearer();
+    error NotSlotClaimer();
+    /// @dev A holder has moved the slot at least once (`held`), so a key
+    ///      someone keeps holds it and it is out of `reissue`'s reach.
+    error SlotHeld();
+    error BearerMintsOff();
+    error AlreadyDisabled();
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -340,7 +453,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     constructor(address initialOwner, address initialSponsor, uint32 initialSponsorPerHour)
         Ownable(initialOwner)
-        EIP712("WoCoTicketLedger", "1")
+        EIP712("WoCoTicketLedger", "2")
     {
         disputeAuthority = initialOwner;
 
@@ -362,8 +475,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *                     `ZeroAddress` a zero organiser gets, so a caller can
      *                     tell which argument was wrong.
      * @param eventEndTs   UNIX seconds; the on-chain sales cutoff. `claimFor`
-     *                     reverts `SalesClosed` at or after this. Immutable
-     *                     once stamped — see the monotonicity note above.
+     *                     reverts `SalesClosed` at or after this. Only ever
+     *                     moves later (`extendSalesEnd`) — see the
+     *                     monotonicity note above.
      *                     It is CHAIN time (audit 961 M-2). The sequencer stamps
      *                     blocks from its own clock, which in practice tracks
      *                     real time to seconds. The hard rule on the final
@@ -425,13 +539,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         );
 
         _events[eventId] = Event({
-            totalSupply: supply,
-            nextSlot:    0,
-            eventEndTs:  eventEndTs,
-            exists:      true,
-            cancelled:   false,
-            organiser:   organiser,
-            manifestRef: manifestRef
+            totalSupply:  supply,
+            nextSlot:     0,
+            eventEndTs:   eventEndTs,
+            exists:       true,
+            cancelled:    false,
+            organiser:    organiser,
+            manifestRef:  manifestRef,
+            registrant:   msg.sender
         });
 
         emit Registered(eventId, organiser, msg.sender, supply, manifestRef, eventEndTs);
@@ -472,7 +587,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         // safe: first < totalSupply ≤ uint64.max
         unchecked { ev.nextSlot = first + 1; }
 
-        _slots[eventId][slot] = Slot({owner: to, batchFirstSlot: first});
+        _slots[eventId][slot] = Slot({owner: to, batchFirstSlot: first, bearer: false, held: false});
         _batchOrderRef[eventId][first] = orderRef;
         _batchClaimer[eventId][first]  = msg.sender;
 
@@ -494,25 +609,115 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         address[] calldata owners,
         bytes32 orderRef
     ) external onlyAuthorised returns (uint256 firstSlot) {
-        uint256 n = owners.length;
+        firstSlot = _claimBatch(eventId, owners, orderRef, false);
+    }
+
+    /**
+     * @notice Mint N contiguous BEARER slots: tickets whose key the platform
+     *         does not keep (the card checkout's one-off keys). Only bearer
+     *         slots can later be replaced by `reissue`. Authorised sponsors
+     *         only, until `disableBearerMints`.
+     * @dev Same checks and logs as `batchClaimFor`; the only difference is the
+     *      `bearer` bit, read back through `getSlotFlags`.
+     */
+    function batchClaimBearer(
+        bytes32 eventId,
+        address[] calldata owners,
+        bytes32 orderRef
+    ) external onlyAuthorised returns (uint256 firstSlot) {
+        if (bearerMintsDisabled) revert BearerMintsOff();
+        firstSlot = _claimBatch(eventId, owners, orderRef, true);
+    }
+
+    /**
+     * @notice Point bearer slots at fresh keys, all or nothing: slot
+     *         `slots[i]` goes to `newOwners[i]`. Same index, so the same
+     *         edition and no seat used. Authorised sponsors only, until
+     *         `disableBearerMints`. See "Reissue" in the contract header for
+     *         what this power is and what bounds it.
+     * @dev Each slot must be claimed, bearer, minted by the CALLING sponsor and
+     *      never moved by a holder (`held`). `slots` strictly ascending, so none
+     *      is listed twice. Charged to the hourly mint cap like any mint, and
+     *      refused once the event is cancelled or past its cutoff. Consumes the
+     *      slot's transfer nonce, so a signature the old key made is dead. A
+     *      slot can be reissued again: limiting that is the platform's rule.
+     *      `getSlotData` keeps the batch's claimer and orderRef: the sale.
+     *
+     *      CALLERS MUST NEVER RE-POINT A SLOT TO AN ADDRESS THAT HAS HELD IT.
+     *      Only `to == current owner` is refused here; pointing it back at an
+     *      earlier holder makes that holder's ticket verify at the door again,
+     *      because the door checks the ticket's signer against `slotOwner`.
+     *      Mint every re-point to a freshly generated key.
+     * @param eventId   The event the slots belong to.
+     * @param slots     The slots to re-point, strictly ascending.
+     * @param newOwners One fresh holder per slot, in the same order.
+     */
+    function reissue(
+        bytes32 eventId,
+        uint256[] calldata slots,
+        address[] calldata newOwners
+    ) external onlyAuthorised {
+        if (bearerMintsDisabled) revert BearerMintsOff();
+        uint256 n = slots.length;
+        if (newOwners.length != n) revert LengthMismatch();
+        _openForMint(eventId, n);
+
+        for (uint256 i; i < n;) {
+            if (i != 0 && slots[i] <= slots[i - 1]) revert SlotsNotAscending();
+            _repoint(eventId, slots[i], newOwners[i]);
+            // safe: i < n <= 100
+            unchecked { ++i; }
+        }
+    }
+
+    /// @dev One `reissue` re-point.
+    function _repoint(bytes32 eventId, uint256 slot, address to) private {
+        if (to == address(0)) revert ZeroAddress();
+        if (to == address(this)) revert TransferToLedger();
+
+        Slot storage sd = _slots[eventId][slot];
+        address previous = sd.owner;
+        // Mints are contiguous and nothing clears an owner, so owner 0 is
+        // exactly "never claimed".
+        if (previous == address(0)) revert SlotUnclaimed();
+        if (!sd.bearer) revert NotBearer();
+        if (_batchClaimer[eventId][sd.batchFirstSlot] != msg.sender) revert NotSlotClaimer();
+        if (sd.held) revert SlotHeld();
+        // A phantom re-point would still emit `SlotReissued`; see `_transfer`.
+        if (to == previous) revert TransferToSelf();
+
+        // ONLY the owner field, as in `_transfer`: `bearer`, `held` and the
+        // batch attribution stay as minted.
+        sd.owner = to;
+        unchecked { ++transferNonces[eventId][slot]; }
+
+        emit SlotReissued(eventId, slot, previous, to);
+    }
+
+    /// @dev The checks every mint path shares, the supply bound aside (`reissue`
+    ///      uses no seat). Charges `n` to the caller's hourly cap.
+    function _openForMint(bytes32 eventId, uint256 n) private returns (Event storage ev) {
         if (n == 0)  revert BatchEmpty();
         if (n > 100) revert BatchTooLarge();
-        // n ≤ 100 ⇒ fits trivially in uint64
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 n64 = uint64(n);
-
-        Event storage ev = _events[eventId];
+        ev = _events[eventId];
         if (!ev.exists)                       revert EventNotFound();
         if (ev.cancelled)                     revert AlreadyCancelled();
         if (block.timestamp >= ev.eventEndTs) revert SalesClosed();
+        _consumeMintAllowance(n);
+    }
 
+    function _claimBatch(bytes32 eventId, address[] calldata owners, bytes32 orderRef, bool bearer)
+        private
+        returns (uint256 firstSlot)
+    {
+        uint256 n = owners.length;
+        Event storage ev = _openForMint(eventId, n);
         uint64 first = ev.nextSlot;
         firstSlot = uint256(first);
         // safe: first < 2^64 and n <= 100, so the uint256 sum cannot overflow
         unchecked {
-            if (uint256(first) + n > ev.totalSupply) revert InsufficientSupply();
+            if (firstSlot + n > ev.totalSupply) revert InsufficientSupply();
         }
-        _consumeMintAllowance(n);
 
         _batchOrderRef[eventId][first] = orderRef;
         _batchClaimer[eventId][first]  = msg.sender;
@@ -524,14 +729,59 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
             uint256 s;
             // safe: firstSlot + i < first + n <= totalSupply < 2^64
             unchecked { s = firstSlot + i; }
-            _slots[eventId][s] = Slot({owner: to, batchFirstSlot: first});
+            _slots[eventId][s] = Slot({owner: to, batchFirstSlot: first, bearer: bearer, held: false});
             emit SlotClaimed(eventId, s, to, msg.sender, orderRef);
             // safe: i < n <= 100
             unchecked { ++i; }
         }
 
-        // safe: first + n <= totalSupply <= uint64.max, checked above
-        unchecked { ev.nextSlot = first + n64; }
+        // safe: first + n <= totalSupply <= uint64.max, checked above; n <= 100 fits uint64
+        // forge-lint: disable-next-line(unsafe-typecast)
+        unchecked { ev.nextSlot = first + uint64(n); }
+    }
+
+    // ── Supply and sales cutoff (the registrant) ──────────────────────────────
+
+    /**
+     * @notice Set the event's supply: more seats for a bigger venue, fewer for
+     *         a smaller one. The REGISTRANT only — the address that registered
+     *         it, which could have stamped any supply in the first place.
+     * @dev An absolute value, not a delta, so a retried transaction changes
+     *      nothing twice. Never below the slots minted (a sold ticket is never
+     *      taken back) and never 0. Refused once cancelled (terminal) or past
+     *      the sales cutoff (move it later first). Raising it does not extend
+     *      the edition commitment (`manifestRef`): see the header's trust
+     *      boundary section before raising supply on a live event.
+     */
+    function setSupply(bytes32 eventId, uint64 supply) external {
+        Event storage ev = _events[eventId];
+        if (!ev.exists)                       revert EventNotFound();
+        if (msg.sender != ev.registrant)      revert NotRegistrant();
+        if (ev.cancelled)                     revert AlreadyCancelled();
+        if (block.timestamp >= ev.eventEndTs) revert SalesClosed();
+        if (supply == ev.totalSupply)         revert SupplyUnchanged();
+        if (supply == 0 || supply < ev.nextSlot) revert InsufficientSupply();
+
+        uint64 previous = ev.totalSupply;
+        ev.totalSupply = supply;
+        emit SupplySet(eventId, previous, supply);
+    }
+
+    /**
+     * @notice Move the sales cutoff LATER, for a postponed event. The
+     *         REGISTRANT only. Reopens sales on an event whose old cutoff has
+     *         passed. Never earlier: see the monotonicity note in the header.
+     */
+    function extendSalesEnd(bytes32 eventId, uint64 eventEndTs) external {
+        Event storage ev = _events[eventId];
+        if (!ev.exists)                  revert EventNotFound();
+        if (msg.sender != ev.registrant) revert NotRegistrant();
+        if (ev.cancelled)                revert AlreadyCancelled();
+        if (eventEndTs <= ev.eventEndTs || eventEndTs <= block.timestamp) revert InvalidEventEnd();
+
+        uint64 previous = ev.eventEndTs;
+        ev.eventEndTs = eventEndTs;
+        emit SalesEndExtended(eventId, previous, eventEndTs);
     }
 
     // ── Cancellation ──────────────────────────────────────────────────────────
@@ -567,6 +817,13 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      owner decision 2026-09-13): a ticket minted to a key nobody holds
      *      stays where it is. Tickets meant to move must be minted to a key
      *      their holder controls.
+     *
+     *      Version 2's `reissue` is the one narrow exception, accepted by the
+     *      owner on 2026-10-26 with its off switch: only slots minted bearer
+     *      (to a key nobody holds) by the calling sponsor, never one a holder
+     *      has moved, within the mint cap, and never after
+     *      `disableBearerMints`. It reaches no ticket minted to, or moved to, a
+     *      key someone keeps. See "Reissue" in the contract header.
      *
      *      ⚠️ THIS SHRINKS THE OFFLINE CHECK-IN PACK'S SOUNDNESS WINDOW, and
      *      the door is the consumer that assumed permanence. The pack snapshots
@@ -627,11 +884,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      there is no form in which the submitter picks the recipient.
      *
      *      WHAT THE SIGNATURE COMMITS TO: `TransferSlot(eventId, slot, from, to,
-     *      nonce, deadline)` under the EIP-712 domain ("WoCoTicketLedger", "1",
+     *      nonce, deadline)` under the EIP-712 domain ("WoCoTicketLedger", "2",
      *      chain id, this contract). `from` and `nonce` come from storage, so a
      *      signature counts only while its signer holds the slot, and only
-     *      until the slot next moves by EITHER path (`transferNonces`). The
-     *      domain stops it being replayed on another chain or deployment.
+     *      until the slot next moves by EITHER transfer path or by `reissue`
+     *      (`transferNonces`). The domain stops it being replayed on another
+     *      chain or deployment.
      *
      *      EOA SIGNATURES ONLY, deliberately — see "No reentrancy guard" in the
      *      contract header. A slot held by a contract account moves through
@@ -746,12 +1004,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         // the omission is identical, so it is refused rather than tolerated.)
         if (newOwner == previousOwner) revert TransferToSelf();
 
-        // ONLY the owner field. Never reconstruct the struct: writing
-        // `Slot({owner: newOwner, batchFirstSlot: 0})` compiles and silently
+        // ONLY these fields. Never reconstruct the struct: writing
+        // `Slot({owner: newOwner, batchFirstSlot: 0, ...})` compiles and silently
         // re-points this slot's claimer/orderRef at batch 0's real data — a
         // live misattribution, not zero values.
         sd.owner = newOwner;
-        // Consumed by every move, on either path — see `transferNonces`.
+        // A key someone keeps holds it now: out of `reissue`'s reach for good.
+        sd.held = true;
+        // Consumed by every move: either transfer path, and `reissue` — see `transferNonces`.
         unchecked { ++transferNonces[eventId][slot]; }
 
         emit SlotTransferred(eventId, slot, previousOwner, newOwner);
@@ -807,7 +1067,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     // ── Views ─────────────────────────────────────────────────────────────────
 
-    /// @notice Core event params stamped at registration.
+    /// @notice Core event params. `totalSupply` is the CURRENT supply
+    ///         (`setSupply` moves it); `manifestRef` is the one registered.
+    /// @dev Same signature as version 1, so a reader written for it works here.
     function getEvent(bytes32 eventId)
         external
         view
@@ -843,9 +1105,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      at slot 0 — real data belonging to a different slot. V2 returned
     ///      exactly that and told callers to check `owner` first; payments will
     ///      read this view, and a rule every caller must remember is one some
-    ///      caller forgets.
+    ///      caller forgets. `owner == address(0)` is still THE test for
+    ///      "unclaimed".
     ///
-    ///      `owner == address(0)` is still THE test for "unclaimed".
+    ///      Same signature and meaning as version 1. After a `reissue` or a
+    ///      transfer, `holder` is the new key and `claimer`/`orderRef` stay
+    ///      the sale's.
     function getSlotData(bytes32 eventId, uint256 slot)
         external
         view
@@ -860,8 +1125,25 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         );
     }
 
+    /// @notice address(0) for a slot that was never claimed.
     function slotOwner(bytes32 eventId, uint256 slot) external view returns (address) {
         return _slots[eventId][slot].owner;
+    }
+
+    /// @notice Whether a slot was minted bearer, and whether a holder has
+    ///         moved it since (`held`). `reissue` reaches a slot only while it
+    ///         is bearer and not held. Both false for an unclaimed slot.
+    function getSlotFlags(bytes32 eventId, uint256 slot) external view returns (bool bearer, bool held) {
+        Slot memory sd = _slots[eventId][slot];
+        return (sd.bearer, sd.held);
+    }
+
+    /// @notice The address that registered the event: the one that may change
+    ///         its supply and move its cutoff later.
+    function getRegistrant(bytes32 eventId) external view returns (address) {
+        Event storage ev = _events[eventId];
+        if (!ev.exists) revert EventNotFound();
+        return ev.registrant;
     }
 
     /// @notice Slots remaining to be sold now: zero once the event is cancelled
@@ -886,7 +1168,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         if (!ev.exists)                       revert EventNotFound();
         if (ev.cancelled)                     return 0;
         if (block.timestamp >= ev.eventEndTs) return 0;
-        return ev.totalSupply - ev.nextSlot;
+        // safe: every path keeps nextSlot <= totalSupply (mint bounds, setSupply's floor)
+        unchecked { return ev.totalSupply - ev.nextSlot; }
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -942,6 +1225,20 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         // A lowered cap can sit below what the window already spent.
         mintable = a.used >= perHour ? 0 : perHour - a.used;
         windowResetsAt = a.windowEnd;
+    }
+
+    /// @notice End bearer minting and `reissue`, for good. One-way: there is no
+    ///         function that turns them back on, so once it is called anyone can
+    ///         read on chain that the platform can no longer replace a ticket.
+    ///         Sales through `batchClaimFor`/`claimFor`, `setSupply`,
+    ///         `extendSalesEnd` and transfers carry on.
+    /// @dev The off-ramp for the day tickets are minted to keys their holders
+    ///      control (WoCo-Event-App #298): call it once the last bearer sale's
+    ///      event is over.
+    function disableBearerMints() external onlyOwner {
+        if (bearerMintsDisabled) revert AlreadyDisabled();
+        bearerMintsDisabled = true;
+        emit BearerMintsDisabled(msg.sender);
     }
 
     function setDisputeAuthority(address authority) external onlyOwner {

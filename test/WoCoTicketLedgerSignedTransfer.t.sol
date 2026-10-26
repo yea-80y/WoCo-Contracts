@@ -86,7 +86,8 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
         uint256 deadline
     ) internal pure returns (bytes32) {
         bytes32 domainSeparator = keccak256(
-            abi.encode(DOMAIN_TYPEHASH, keccak256("WoCoTicketLedger"), keccak256("1"), chainId, verifyingContract)
+            // Version "2": the successor ledger. A version-1 signature must never move a version-2 slot.
+            abi.encode(DOMAIN_TYPEHASH, keccak256("WoCoTicketLedger"), keccak256("2"), chainId, verifyingContract)
         );
         bytes32 structHash = keccak256(abi.encode(TRANSFER_TYPEHASH, eventId, slot, from, to, nonce, deadline));
         return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
@@ -145,7 +146,7 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
         (, string memory name, string memory version, uint256 chainId, address verifyingContract, , ) =
             ledger.eip712Domain();
         assertEq(name, "WoCoTicketLedger");
-        assertEq(version, "1");
+        assertEq(version, "2");
         assertEq(chainId, block.chainid);
         assertEq(verifyingContract, address(ledger));
     }
