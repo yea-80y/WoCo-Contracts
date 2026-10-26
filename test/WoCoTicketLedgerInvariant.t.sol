@@ -25,10 +25,10 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * not register. If the invariants hold for it, they hold for any sponsor.
  *
  * VERSION 2 adds three moving parts, each with its own rule here: seats move
- * only through `setSupply` by the registrant, never below the seats in use; the
- * cutoff moves only later; and a slot is revoked only by `reissue`, only if it
- * was minted bearer and never moved, one for one with a replacement (no seat
- * used), never again after `disableBearerMints`, and for good.
+ * only through `setSupply` by the registrant, never below the slots minted; the
+ * cutoff moves only later; and a slot is re-pointed by `reissue` only if it was
+ * minted bearer and no holder has moved it, in place (no slot minted, no seat
+ * used), and never after `disableBearerMints`.
  *
  * WHAT THIS CAMPAIGN DOES NOT COVER: the handler never calls
  * `forceCancelEvent`, `addSponsor`/`removeSponsor`, or `setDisputeAuthority`,
@@ -100,7 +100,6 @@ contract LedgerHandler is Test {
 
     address internal ledgerOwner;
     mapping(bytes32 => mapping(uint256 => bool)) public seenBearer;
-    mapping(bytes32 => mapping(uint256 => bool)) public seenRevoked;
     /// A slot its holder has moved at least once: out of `reissue`'s reach.
     mapping(bytes32 => mapping(uint256 => bool)) public seenMoved;
     bytes32[] internal bearerSlotEvent;
@@ -111,10 +110,10 @@ contract LedgerHandler is Test {
     uint256 public supplySets;
     uint256 public cutoffExtensions;
     bool public bearerMintsSeenDisabled;
-    /// Set if a revocation or bearer mint landed that the rules forbid: a
-    /// non-bearer or moved slot revoked, or either after the off switch.
-    bool public forbiddenRevocation;
-    /// Set if a reissue changed the seats in use.
+    /// Set if a reissue or bearer mint landed that the rules forbid: a
+    /// non-bearer or moved slot re-pointed, or either after the off switch.
+    bool public forbiddenReissue;
+    /// Set if a reissue minted a slot (moved `nextSlot`).
     bool public reissueUsedASeat;
     /// Set if the cutoff ever moved earlier.
     bool public cutoffMovedEarlier;
@@ -375,19 +374,20 @@ contract LedgerHandler is Test {
         for (uint256 i; i < count; ++i) owners[i] = owner;
 
         try ledger.batchClaimBearer(id, owners, orderRef) returns (uint256 first) {
-            if (bearerMintsSeenDisabled) forbiddenRevocation = true;
+            if (bearerMintsSeenDisabled) forbiddenReissue = true;
             for (uint256 i; i < count; ++i) _recordBearer(id, first + i, owner);
         } catch {
             // See claimFor.
         }
     }
 
-    /// Reissue one bearer slot. When none is usable, one is minted first in
-    /// this same call, so the campaign never starves of reissues (the #18
+    /// Reissue one bearer slot. The pick must be reissuable NOW (not moved, its
+    /// event still on sale); when it is not, a bearer slot is minted on an open
+    /// event first, in this same call, so the campaign never starves of
+    /// reissues once warps and cancels have closed the early events (the #18
     /// lesson: a precondition built by other random actions may never exist).
-    function reissue(uint256 eventIndex, uint256 pick, address newOwner, bytes32 orderRef) external {
+    function reissue(uint256 eventIndex, uint256 pick, address newOwner) external {
         if (eventIds.length == 0) return;
-        if (newOwner == address(0)) newOwner = address(0x2);
         bytes32 id;
         uint256 slot;
         bool found;
@@ -395,14 +395,15 @@ contract LedgerHandler is Test {
             uint256 i = bound(pick, 0, bearerSlotEvent.length - 1);
             id = bearerSlotEvent[i];
             slot = bearerSlotIndex[i];
-            found = !seenRevoked[id][slot] && !seenMoved[id][slot];
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(id);
+            found = !seenMoved[id][slot] && !cancelled && block.timestamp < endTs;
         }
         if (!found) {
             id = _openEvent(eventIndex);
             address[] memory one = new address[](1);
             one[0] = address(0x3);
-            try ledger.batchClaimBearer(id, one, orderRef) returns (uint256 first) {
-                if (bearerMintsSeenDisabled) forbiddenRevocation = true;
+            try ledger.batchClaimBearer(id, one, bytes32(uint256(5))) returns (uint256 first) {
+                if (bearerMintsSeenDisabled) forbiddenReissue = true;
                 _recordBearer(id, first, address(0x3));
                 slot = first;
             } catch {
@@ -410,18 +411,20 @@ contract LedgerHandler is Test {
             }
         }
 
-        (, uint64 liveBefore, ) = ledger.getEventAdmin(id);
+        address current = seenSlotOwner[id][slot];
+        if (newOwner == address(0) || newOwner == address(ledger)) newOwner = address(0x2);
+        if (newOwner == current) newOwner = current == address(0x4) ? address(0x5) : address(0x4);
+
+        (, uint64 nextBefore, , ) = ledger.getEvent(id);
         uint256[] memory slots = new uint256[](1);
         slots[0] = slot;
         address[] memory owners = new address[](1);
         owners[0] = newOwner;
-        try ledger.reissue(id, slots, owners, orderRef) returns (uint256 first) {
-            if (bearerMintsSeenDisabled || seenMoved[id][slot] || !seenBearer[id][slot]) forbiddenRevocation = true;
-            (, uint64 liveAfter, ) = ledger.getEventAdmin(id);
-            if (liveAfter != liveBefore) reissueUsedASeat = true;
-            seenRevoked[id][slot] = true;
-            seenSlotOwner[id][slot] = address(0);
-            _recordBearer(id, first, newOwner);
+        try ledger.reissue(id, slots, owners) {
+            if (bearerMintsSeenDisabled || seenMoved[id][slot] || !seenBearer[id][slot]) forbiddenReissue = true;
+            (, uint64 nextAfter, , ) = ledger.getEvent(id);
+            if (nextAfter != nextBefore) reissueUsedASeat = true;
+            seenSlotOwner[id][slot] = newOwner;
             reissuesMade++;
         } catch {
             // See claimFor.
@@ -436,7 +439,6 @@ contract LedgerHandler is Test {
         uint256 count = seenSlotCount[id];
         if (count == 0) return;
         uint256 slot = bound(slotSeed, 0, count - 1);
-        if (seenRevoked[id][slot]) return;
         bool eligible = seenBearer[id][slot] && !seenMoved[id][slot] && !bearerMintsSeenDisabled;
         if (eligible) return;
         if (newOwner == address(0)) newOwner = address(0x2);
@@ -446,8 +448,8 @@ contract LedgerHandler is Test {
         address[] memory owners = new address[](1);
         owners[0] = newOwner;
         ineligibleReissueAttempts++;
-        try ledger.reissue(id, slots, owners, bytes32(0)) {
-            forbiddenRevocation = true;
+        try ledger.reissue(id, slots, owners) {
+            forbiddenReissue = true;
         } catch {}
     }
 
@@ -455,10 +457,9 @@ contract LedgerHandler is Test {
     function setSupply(uint256 eventIndex, uint256 supplySeed) external {
         if (eventIds.length == 0) return;
         bytes32 id = _openEvent(eventIndex);
-        (uint64 current, , , ) = ledger.getEvent(id);
-        (, uint64 live, ) = ledger.getEventAdmin(id);
+        (uint64 current, uint64 minted, , ) = ledger.getEvent(id);
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 supply = uint64(bound(supplySeed, live == 0 ? 1 : live, 600));
+        uint64 supply = uint64(bound(supplySeed, minted == 0 ? 1 : minted, 600));
         if (supply == current) supply = current + 1;
         try ledger.setSupply(id, supply) {
             stamped[id].totalSupply = supply;
@@ -500,9 +501,8 @@ contract LedgerHandler is Test {
     function _openEvent(uint256 eventIndex) internal returns (bytes32 id) {
         id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
         (uint64 endTs, bool cancelled) = ledger.getEventStatus(id);
-        (uint64 supply, , , ) = ledger.getEvent(id);
-        (, uint64 live, ) = ledger.getEventAdmin(id);
-        if (!cancelled && block.timestamp < endTs && live < supply) return id;
+        (uint64 supply, uint64 minted, , ) = ledger.getEvent(id);
+        if (!cancelled && block.timestamp < endTs && minted < supply) return id;
 
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 freshEnd = uint64(block.timestamp + 30 days);
@@ -576,16 +576,15 @@ contract WoCoTicketLedgerInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// Never oversell: the seats in use (every slot minted, less those revoked)
-    /// never exceed the event's supply, whoever moved it and however.
+    /// Never oversell: allocation never exceeds the event's supply, whoever
+    /// moved it and however. A reissue mints nothing, so this covers it too.
     /// forge-config: default.invariant.runs = 64
     function invariant_NeverOversells() public view {
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
             bytes32 id = handler.eventIds(i);
-            (uint64 totalSupply, , , ) = ledger.getEvent(id);
-            (, uint64 live, ) = ledger.getEventAdmin(id);
-            assertLe(live, totalSupply, "seats in use exceeded supply");
+            (uint64 totalSupply, uint64 nextSlot, , ) = ledger.getEvent(id);
+            assertLe(nextSlot, totalSupply, "nextSlot exceeded supply");
         }
     }
 
@@ -604,7 +603,7 @@ contract WoCoTicketLedgerInvariantTest is Test {
 
             (uint64 totalSupply, , address org, bytes32 manifest) = ledger.getEvent(id);
             (uint64 endTs, ) = ledger.getEventStatus(id);
-            (address registrant, , ) = ledger.getEventAdmin(id);
+            address registrant = ledger.getRegistrant(id);
 
             assertEq(totalSupply, sSupply,   "totalSupply moved other than by setSupply");
             assertEq(org,         sOrg,      "organiser changed after registration");
@@ -614,25 +613,24 @@ contract WoCoTicketLedgerInvariantTest is Test {
         }
     }
 
-    /// Revocation is permanent and reaches only what the rules allow: a
-    /// revoked slot stays revoked with no holder, every revoked slot is bearer,
-    /// and no non-bearer or moved slot, nor anything after the off switch, was
-    /// ever revoked or bearer-minted. A reissue never changes the seats in use.
+    /// Reissue reaches only what the rules allow: no non-bearer or
+    /// holder-moved slot, nor anything after the off switch, was ever
+    /// re-pointed or bearer-minted, and no reissue minted a slot. The flags
+    /// are what the handler saw: `bearer` exactly as minted, `held` exactly
+    /// when a holder has moved the slot (never set by a reissue).
     /// forge-config: default.invariant.runs = 64
-    function invariant_RevocationIsBoundedAndPermanent() public view {
-        assertFalse(handler.forbiddenRevocation(), "a revocation or bearer mint landed that the rules forbid");
-        assertFalse(handler.reissueUsedASeat(), "a reissue changed the seats in use");
+    function invariant_ReissueIsBounded() public view {
+        assertFalse(handler.forbiddenReissue(), "a reissue or bearer mint landed that the rules forbid");
+        assertFalse(handler.reissueUsedASeat(), "a reissue minted a slot");
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
             bytes32 id = handler.eventIds(i);
             uint256 count = handler.seenSlotCount(id);
             for (uint256 s; s < count; ++s) {
-                (bool revoked, bool bearer) = ledger.getSlotFlags(id, s);
-                if (handler.seenRevoked(id, s)) {
-                    assertTrue(revoked, "a revoked slot came back");
-                    assertEq(ledger.slotOwner(id, s), address(0), "a revoked slot has a holder");
-                }
-                if (revoked) assertTrue(bearer, "a non-bearer slot was revoked");
+                if (ledger.slotOwner(id, s) == address(0)) continue;
+                (bool bearer, bool held) = ledger.getSlotFlags(id, s);
+                assertEq(bearer, handler.seenBearer(id, s), "a slot's bearer bit is not as minted");
+                assertEq(held, handler.seenMoved(id, s), "held is not exactly 'a holder moved it'");
             }
         }
     }
@@ -694,7 +692,9 @@ contract WoCoTicketLedgerInvariantTest is Test {
     }
 
     /// A slot's owner changes ONLY through a transfer its own owner authorised —
-    /// by sending it, or by signing it.
+    /// by sending it, or by signing it — or through version 2's `reissue` of a
+    /// bearer slot no holder has moved, which `invariant_ReissueIsBounded`
+    /// fences.
     ///
     /// This used to read "once a slot has an owner, that owner never changes",
     /// and that literal form is no longer true — transfers exist so a ticket
@@ -706,9 +706,9 @@ contract WoCoTicketLedgerInvariantTest is Test {
     /// if no sponsor/organiser/clock/submitter action rewrites a slot here,
     /// none can.
     ///
-    /// The handler tracks ownership THROUGH both transfer paths, so this still
-    /// fails on any rewrite that did not come from the holder — which is the
-    /// property that was actually load-bearing all along.
+    /// The handler tracks ownership THROUGH both transfer paths and reissue, so
+    /// this still fails on any rewrite that came from none of them — which is
+    /// the property that was actually load-bearing all along.
     /// forge-config: default.invariant.runs = 64
     function invariant_SlotsAreOnlyMovedByTheirOwner() public view {
         assertFalse(

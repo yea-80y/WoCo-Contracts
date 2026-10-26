@@ -8,8 +8,8 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
 /**
  * Version 2 of WoCoTicketLedger: seats the registrant can change
  * (`setSupply`), a cutoff it can only move later (`extendSalesEnd`), the
- * platform's replacement of a bearer ticket (`reissue`), and the one-way off
- * switch for it (`disableBearerMints`).
+ * platform's re-point of a bearer ticket to a fresh key (`reissue`), and the
+ * one-way off switch for it (`disableBearerMints`).
  *
  * As in WoCoTicketLedger.t.sol, every new guard has a test that fails if the
  * guard is removed; the invariant suite proves the properties across random
@@ -69,28 +69,29 @@ contract WoCoTicketLedgerV2Test is Test {
         s[1] = b;
     }
 
-    function _reissue(bytes32 eventId, uint256[] memory slots) internal returns (uint256 first) {
+    function _reissue(bytes32 eventId, uint256[] memory slots, address to) internal {
         vm.prank(sponsor);
-        first = ledger.reissue(eventId, slots, _owners(slots.length, fresh), ORDER);
+        ledger.reissue(eventId, slots, _owners(slots.length, to));
     }
 
-    function _live(bytes32 eventId) internal view returns (uint64 live) {
-        (, live, ) = ledger.getEventAdmin(eventId);
+    function _nextSlot(bytes32 eventId) internal view returns (uint64 nextSlot) {
+        (, nextSlot, , ) = ledger.getEvent(eventId);
+    }
+
+    function _held(bytes32 eventId, uint256 slot) internal view returns (bool held) {
+        (, held) = ledger.getSlotFlags(eventId, slot);
     }
 
     // ── registrant ────────────────────────────────────────────────────────────
 
     function test_RegistrantIsTheCaller() public {
         bytes32 id = _register();
-        (address registrant, uint64 live, uint32 revoked) = ledger.getEventAdmin(id);
-        assertEq(registrant, sponsor);
-        assertEq(live, 0);
-        assertEq(revoked, 0);
+        assertEq(ledger.getRegistrant(id), sponsor);
     }
 
-    function test_GetEventAdmin_UnknownEvent() public {
+    function test_GetRegistrant_UnknownEvent() public {
         vm.expectRevert(WoCoTicketLedger.EventNotFound.selector);
-        ledger.getEventAdmin(keccak256("nope"));
+        ledger.getRegistrant(keccak256("nope"));
     }
 
     // ── setSupply ─────────────────────────────────────────────────────────────
@@ -112,7 +113,7 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(ledger.remaining(id), 0);
     }
 
-    function test_SetSupply_LowerToExactlyLive() public {
+    function test_SetSupply_LowerToExactlyMinted() public {
         bytes32 id = _register();
         vm.prank(sponsor);
         ledger.batchClaimFor(id, _owners(4, holder), ORDER);
@@ -125,13 +126,26 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.claimFor(id, holder, ORDER);
     }
 
-    function test_SetSupply_NeverBelowLive() public {
+    function test_SetSupply_NeverBelowMinted() public {
         bytes32 id = _register();
         vm.prank(sponsor);
         ledger.batchClaimFor(id, _owners(4, holder), ORDER);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.InsufficientSupply.selector);
         ledger.setSupply(id, 3);
+    }
+
+    /// A reissue keeps the slot, so it never frees one: the floor after it is
+    /// still every slot minted.
+    function test_SetSupply_FloorUnmovedByReissue() public {
+        bytes32 id = _register();
+        _bearer(id, 4, holder);
+        _reissue(id, _slots(0), fresh);
+        vm.startPrank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.InsufficientSupply.selector);
+        ledger.setSupply(id, 3);
+        ledger.setSupply(id, 4);
+        vm.stopPrank();
     }
 
     function test_SetSupply_NeverZero() public {
@@ -253,13 +267,13 @@ contract WoCoTicketLedgerV2Test is Test {
         uint256 bearerSlot = ledger.batchClaimBearer(id, _owners(1, holder), ORDER);
         vm.stopPrank();
 
-        (, bool b0) = ledger.getSlotFlags(id, holderSlot);
-        (, bool b1) = ledger.getSlotFlags(id, batchSlot);
-        (bool revoked, bool b2) = ledger.getSlotFlags(id, bearerSlot);
+        (bool b0, ) = ledger.getSlotFlags(id, holderSlot);
+        (bool b1, ) = ledger.getSlotFlags(id, batchSlot);
+        (bool b2, bool held) = ledger.getSlotFlags(id, bearerSlot);
         assertFalse(b0, "claimFor minted bearer");
         assertFalse(b1, "batchClaimFor minted bearer");
         assertTrue(b2, "batchClaimBearer did not mint bearer");
-        assertFalse(revoked);
+        assertFalse(held, "a fresh mint reads as held");
     }
 
     function test_BatchClaimBearer_SameSupplyRule() public {
@@ -278,57 +292,95 @@ contract WoCoTicketLedgerV2Test is Test {
 
     // ── reissue: the happy path ───────────────────────────────────────────────
 
-    function test_Reissue_RevokesAndReplacesOneForOne() public {
+    function test_Reissue_RepointsInPlace() public {
         bytes32 id = _register();
         uint256 first = _bearer(id, 3, holder);
-        uint64 remainingBefore = uint64(ledger.remaining(id));
+        uint256 remainingBefore = ledger.remaining(id);
 
         vm.expectEmit(true, true, true, true);
-        emit WoCoTicketLedger.SlotRevoked(id, first, holder, 3);
+        emit WoCoTicketLedger.SlotReissued(id, first, holder, fresh);
         vm.expectEmit(true, true, true, true);
-        emit WoCoTicketLedger.SlotRevoked(id, first + 2, holder, 4);
-        vm.expectEmit(true, true, true, true);
-        emit WoCoTicketLedger.SlotClaimed(id, 3, fresh, sponsor, ORDER);
-        uint256 replacement = _reissue(id, _slots(first, first + 2));
-        assertEq(replacement, 3);
+        emit WoCoTicketLedger.SlotReissued(id, first + 2, holder, fresh);
+        _reissue(id, _slots(first, first + 2), fresh);
 
-        // The old slots: nobody holds them, history kept.
         for (uint256 s = first; s <= first + 2; s += 2) {
-            assertEq(ledger.slotOwner(id, s), address(0));
             (address h, address c, bytes32 r) = ledger.getSlotData(id, s);
-            assertEq(h, address(0), "a revoked slot still has a holder");
-            assertEq(c, sponsor, "a revoked slot lost its claimer");
-            assertEq(r, ORDER, "a revoked slot lost its orderRef");
-            (bool revoked, bool bearer) = ledger.getSlotFlags(id, s);
-            assertTrue(revoked && bearer);
+            assertEq(h, fresh, "not re-pointed");
+            assertEq(c, sponsor, "the sale's claimer was rewritten");
+            assertEq(r, ORDER, "the sale's orderRef was rewritten");
+            (bool bearer, bool held) = ledger.getSlotFlags(id, s);
+            assertTrue(bearer, "a reissued slot must stay replaceable");
+            assertFalse(held, "a reissue is not a holder's move");
+            assertEq(ledger.transferNonces(id, s), 1, "the old key's signatures still count");
         }
         // The sibling is untouched.
         assertEq(ledger.slotOwner(id, first + 1), holder);
-        // The replacements: fresh, bearer, the sale's order.
-        for (uint256 s = 3; s <= 4; ++s) {
-            assertEq(ledger.slotOwner(id, s), fresh);
-            (, bool bearer) = ledger.getSlotFlags(id, s);
-            assertTrue(bearer, "a replacement must stay replaceable");
-        }
-        (, uint64 nextSlot, , ) = ledger.getEvent(id);
-        (, uint64 live, uint32 revokedCount) = ledger.getEventAdmin(id);
-        assertEq(nextSlot, 5);
-        assertEq(live, 3, "a reissue used a seat");
-        assertEq(revokedCount, 2);
+        assertEq(ledger.transferNonces(id, first + 1), 0);
+        // No slot minted, no seat used.
+        assertEq(_nextSlot(id), 3, "a reissue minted a slot");
         assertEq(ledger.remaining(id), remainingBefore, "seats left moved");
     }
 
-    function test_Reissue_WorksOnASoldOutEvent() public {
+    /// The point of re-pointing in place: the ticket's edition (slot + 1) is
+    /// one the manifest committed, also on a sold-out event.
+    function test_Reissue_KeepsTheEditionOnASoldOutEvent() public {
         bytes32 id = _register();
         _bearer(id, SUPPLY, holder);
+        _reissue(id, _slots(SUPPLY - 1), fresh);
+        assertEq(ledger.slotOwner(id, SUPPLY - 1), fresh);
+        assertEq(_nextSlot(id), SUPPLY, "an index past the supply was used");
         assertEq(ledger.remaining(id), 0);
-        _reissue(id, _slots(0));
-        assertEq(ledger.slotOwner(id, SUPPLY), fresh);
-        assertEq(ledger.remaining(id), 0);
-        // Still sold out: the replacement did not open a seat.
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.InsufficientSupply.selector);
         ledger.claimFor(id, holder, ORDER);
+    }
+
+    function test_Reissue_UsesNoSeat() public {
+        bytes32 id = _register();
+        _bearer(id, SUPPLY - 1, holder);
+        _reissue(id, _slots(0), fresh);
+        assertEq(ledger.remaining(id), 1);
+        vm.prank(sponsor);
+        ledger.claimFor(id, holder, ORDER);
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.InsufficientSupply.selector);
+        ledger.claimFor(id, holder, ORDER);
+    }
+
+    /// The old key cannot move the slot afterwards, by either path, and a
+    /// signature it made before is dead.
+    function test_Reissue_OldKeyLosesTheSlot() public {
+        bytes32 id = _register();
+        uint256 s = _bearer(id, 1, holder);
+        uint256 deadline = block.timestamp + 1 hours;
+        (uint8 v, bytes32 r, bytes32 sig) = vm.sign(HOLDER_KEY, ledger.transferSlotDigest(id, s, stranger, deadline));
+        _reissue(id, _slots(s), fresh);
+
+        vm.prank(holder);
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlot(id, s, stranger);
+
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.transferSlotWithSignature(id, s, stranger, deadline, abi.encodePacked(r, sig, v));
+        assertEq(ledger.slotOwner(id, s), fresh);
+    }
+
+    /// A slot can be reissued again (the platform limits how often), until a
+    /// holder moves it: then a key someone keeps holds it, for good.
+    function test_Reissue_RepeatsUntilAHolderMoves() public {
+        bytes32 id = _register();
+        uint256 s = _bearer(id, 1, stranger);
+        _reissue(id, _slots(s), fresh);
+        _reissue(id, _slots(s), holder);
+        assertEq(ledger.slotOwner(id, s), holder);
+
+        vm.prank(holder);
+        ledger.transferSlot(id, s, stranger);
+        assertTrue(_held(id, s), "a holder's move did not mark the slot held");
+
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SlotHeld.selector);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     function test_Reissue_ChargedToTheMintCap_AllOrNothing() public {
@@ -336,13 +388,15 @@ contract WoCoTicketLedgerV2Test is Test {
         _bearer(id, 3, holder);
         vm.prank(owner);
         ledger.setSponsorMintCap(sponsor, 1);
+        // The move out of unlimited closed the window, so the refusing call
+        // opens one (in memory) ending a window from now. Read before the
+        // prank: a call in expectRevert's arguments would consume it.
+        uint64 resetsAt = uint64(block.timestamp + ledger.MINT_WINDOW());
         vm.prank(sponsor);
-        vm.expectRevert();
-        ledger.reissue(id, _slots(0, 1), _owners(2, fresh), ORDER);
-        (bool r0, ) = ledger.getSlotFlags(id, 0);
-        (bool r1, ) = ledger.getSlotFlags(id, 1);
-        assertFalse(r0 || r1, "a refused reissue revoked something");
-        assertEq(ledger.slotOwner(id, 0), holder);
+        vm.expectRevert(abi.encodeWithSelector(WoCoTicketLedger.MintCapExceeded.selector, sponsor, resetsAt));
+        ledger.reissue(id, _slots(0, 1), _owners(2, fresh));
+        assertEq(ledger.slotOwner(id, 0), holder, "a refused reissue moved a slot");
+        assertEq(ledger.slotOwner(id, 1), holder, "a refused reissue moved a slot");
     }
 
     // ── reissue: what it may never touch ──────────────────────────────────────
@@ -353,7 +407,7 @@ contract WoCoTicketLedgerV2Test is Test {
         uint256 s = ledger.claimFor(id, holder, ORDER);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.NotBearer.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     function test_Reissue_MovedSlotIsHeld() public {
@@ -363,7 +417,19 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.transferSlot(id, s, stranger);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.SlotHeld.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
+    }
+
+    function test_Reissue_SignedMoveMakesHeldToo() public {
+        bytes32 id = _register();
+        uint256 s = _bearer(id, 1, holder);
+        uint256 deadline = block.timestamp + 1 hours;
+        (uint8 v, bytes32 r, bytes32 sig) = vm.sign(HOLDER_KEY, ledger.transferSlotDigest(id, s, stranger, deadline));
+        ledger.transferSlotWithSignature(id, s, stranger, deadline, abi.encodePacked(r, sig, v));
+        assertTrue(_held(id, s));
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SlotHeld.selector);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     function test_Reissue_AnotherSponsorsSlot() public {
@@ -371,24 +437,23 @@ contract WoCoTicketLedgerV2Test is Test {
         uint256 s = _bearer(id, 1, holder);
         vm.prank(sponsor2);
         vm.expectRevert(WoCoTicketLedger.NotSlotClaimer.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
-    }
-
-    function test_Reissue_AlreadyRevoked() public {
-        bytes32 id = _register();
-        uint256 s = _bearer(id, 1, holder);
-        _reissue(id, _slots(s));
-        vm.prank(sponsor);
-        vm.expectRevert(WoCoTicketLedger.SlotIsRevoked.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     function test_Reissue_DuplicateInOneCall() public {
         bytes32 id = _register();
         uint256 s = _bearer(id, 1, holder);
         vm.prank(sponsor);
-        vm.expectRevert(WoCoTicketLedger.SlotIsRevoked.selector);
-        ledger.reissue(id, _slots(s, s), _owners(2, fresh), ORDER);
+        vm.expectRevert(WoCoTicketLedger.SlotsNotAscending.selector);
+        ledger.reissue(id, _slots(s, s), _owners(2, fresh));
+    }
+
+    function test_Reissue_Descending() public {
+        bytes32 id = _register();
+        _bearer(id, 2, holder);
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SlotsNotAscending.selector);
+        ledger.reissue(id, _slots(1, 0), _owners(2, fresh));
     }
 
     function test_Reissue_UnclaimedSlot() public {
@@ -396,17 +461,15 @@ contract WoCoTicketLedgerV2Test is Test {
         _bearer(id, 1, holder);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.SlotUnclaimed.selector);
-        ledger.reissue(id, _slots(1), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(1), _owners(1, fresh));
     }
 
-    /// The first replacement's index is listed: it does not exist before this
-    /// call, so it is refused rather than minted and revoked in one breath.
-    function test_Reissue_NeverItsOwnReplacement() public {
+    function test_Reissue_ToTheSameKey() public {
         bytes32 id = _register();
         uint256 s = _bearer(id, 1, holder);
         vm.prank(sponsor);
-        vm.expectRevert(WoCoTicketLedger.SlotUnclaimed.selector);
-        ledger.reissue(id, _slots(s, s + 1), _owners(2, fresh), ORDER);
+        vm.expectRevert(WoCoTicketLedger.TransferToSelf.selector);
+        ledger.reissue(id, _slots(s), _owners(1, holder));
     }
 
     function test_Reissue_RemovedSponsor() public {
@@ -416,7 +479,7 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.removeSponsor(sponsor);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.NotAuthorised.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     function test_Reissue_RefusedAfterCancel() public {
@@ -426,7 +489,7 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.cancelEvent(id);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.AlreadyCancelled.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     function test_Reissue_RefusedAfterCutoff() public {
@@ -435,7 +498,7 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.warp(END_TS);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.SalesClosed.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     function test_Reissue_ShapeGuards() public {
@@ -443,17 +506,17 @@ contract WoCoTicketLedgerV2Test is Test {
         uint256 s = _bearer(id, 1, holder);
         vm.startPrank(sponsor);
         vm.expectRevert(WoCoTicketLedger.LengthMismatch.selector);
-        ledger.reissue(id, _slots(s), _owners(2, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(2, fresh));
         vm.expectRevert(WoCoTicketLedger.BatchEmpty.selector);
-        ledger.reissue(id, new uint256[](0), new address[](0), ORDER);
+        ledger.reissue(id, new uint256[](0), new address[](0));
         vm.expectRevert(WoCoTicketLedger.BatchTooLarge.selector);
-        ledger.reissue(id, new uint256[](101), new address[](101), ORDER);
+        ledger.reissue(id, new uint256[](101), new address[](101));
         vm.expectRevert(WoCoTicketLedger.ZeroAddress.selector);
-        ledger.reissue(id, _slots(s), _owners(1, address(0)), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, address(0)));
         vm.expectRevert(WoCoTicketLedger.TransferToLedger.selector);
-        ledger.reissue(id, _slots(s), _owners(1, address(ledger)), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, address(ledger)));
         vm.expectRevert(WoCoTicketLedger.EventNotFound.selector);
-        ledger.reissue(keccak256("nope"), _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(keccak256("nope"), _slots(s), _owners(1, fresh));
         vm.stopPrank();
     }
 
@@ -462,38 +525,7 @@ contract WoCoTicketLedgerV2Test is Test {
         uint256 s = _bearer(id, 1, holder);
         vm.prank(stranger);
         vm.expectRevert(WoCoTicketLedger.NotAuthorised.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
-    }
-
-    /// After a reissue, live accounting holds the line: supply bounds seats in
-    /// use, not slots ever minted.
-    function test_Reissue_LiveAccountingBoundsLaterMints() public {
-        bytes32 id = _register();
-        _bearer(id, SUPPLY - 1, holder);
-        _reissue(id, _slots(0));
-        assertEq(ledger.remaining(id), 1);
-        vm.prank(sponsor);
-        ledger.claimFor(id, holder, ORDER);
-        vm.prank(sponsor);
-        vm.expectRevert(WoCoTicketLedger.InsufficientSupply.selector);
-        ledger.claimFor(id, holder, ORDER);
-    }
-
-    // ── a revoked slot never moves again ──────────────────────────────────────
-
-    function test_RevokedSlot_RefusesBothTransferPaths() public {
-        bytes32 id = _register();
-        uint256 s = _bearer(id, 1, holder);
-        uint256 deadline = block.timestamp + 1 hours;
-        (uint8 v, bytes32 r, bytes32 sig) = vm.sign(HOLDER_KEY, ledger.transferSlotDigest(id, s, stranger, deadline));
-        _reissue(id, _slots(s));
-
-        vm.prank(holder);
-        vm.expectRevert(WoCoTicketLedger.SlotIsRevoked.selector);
-        ledger.transferSlot(id, s, stranger);
-
-        vm.expectRevert(WoCoTicketLedger.SlotIsRevoked.selector);
-        ledger.transferSlotWithSignature(id, s, stranger, deadline, abi.encodePacked(r, sig, v));
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
     }
 
     // ── the off switch ────────────────────────────────────────────────────────
@@ -530,7 +562,7 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.expectRevert(WoCoTicketLedger.BearerMintsOff.selector);
         ledger.batchClaimBearer(id, _owners(1, holder), ORDER);
         vm.expectRevert(WoCoTicketLedger.BearerMintsOff.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh), ORDER);
+        ledger.reissue(id, _slots(s), _owners(1, fresh));
 
         // Everything else carries on.
         ledger.claimFor(id, holder, ORDER);
@@ -547,8 +579,8 @@ contract WoCoTicketLedgerV2Test is Test {
 
     function test_GetSlotFlags_UnclaimedSlot() public {
         bytes32 id = _register();
-        (bool revoked, bool bearer) = ledger.getSlotFlags(id, 0);
-        assertFalse(revoked || bearer);
+        (bool bearer, bool held) = ledger.getSlotFlags(id, 0);
+        assertFalse(bearer || held);
         (address h, address c, bytes32 r) = ledger.getSlotData(id, 0);
         assertEq(h, address(0));
         assertEq(c, address(0));
