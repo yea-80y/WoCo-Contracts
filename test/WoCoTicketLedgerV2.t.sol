@@ -348,8 +348,8 @@ contract WoCoTicketLedgerV2Test is Test {
         _expectLive(id, sponsor);
     }
 
-    /// The repair the header names: add the key back with a small cap, set the
-    /// terms right, remove it again.
+    /// The repair `removeSponsor` names: add the key back with a small cap,
+    /// restore the supply, remove it again.
     function test_RegistrantPowers_ReturnWhenReAdded() public {
         bytes32 id = _register();
         vm.startPrank(owner);

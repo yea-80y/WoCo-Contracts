@@ -102,7 +102,7 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * SPONSOR ROTATION. Reissue checks the slot's minting sponsor, so a sponsor
  * key removed from service can no longer reissue the bearer tickets it minted
  * (they still verify at the door). That is the right outcome for a key that
- * leaked. Removal also fixes the terms of every event the key registered
+ * leaked. Removal also freezes the terms of every event the key registered
  * (supply and cutoff, see above). For a routine rotation, keep the old key
  * authorised with a small cap until the last event it minted into or
  * registered is over.
@@ -1275,8 +1275,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///
     ///      Also ends the removed key's registrant powers over the events it
     ///      registered (`setSupply`, `extendSalesEnd`): their terms stay as they
-    ///      are. To repair terms a key changed before it was removed, add it
-    ///      back with a cap of 1, set them right, and remove it again.
+    ///      are. To restore a supply the key lowered before it was removed, add
+    ///      it back with a cap of 1, set it, and remove it again. A cutoff it
+    ///      moved later stays: the cutoff never moves earlier.
     function removeSponsor(address sponsor) external onlyOwner {
         authorisedSponsors[sponsor] = false;
         emit SponsorRemoved(sponsor);
