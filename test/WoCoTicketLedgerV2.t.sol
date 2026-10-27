@@ -588,8 +588,8 @@ contract WoCoTicketLedgerV2Test is Test {
 
     // ── the owner moves the role between sponsors (audit 1060) ───────────────
 
-    /// The leak response: withdraw the key and move its events in one owner
-    /// transaction, then the new key restores each supply.
+    /// The leak response: withdraw the key, move its events, then the new key
+    /// restores each supply.
     function test_ReassignRegistrant_RepairsAWithdrawnKey() public {
         bytes32 a = _register();
         bytes32 b = _register();
@@ -722,6 +722,109 @@ contract WoCoTicketLedgerV2Test is Test {
         _reassign(_ids(id), sponsor3);
         assertEq(ledger.getRegistrant(id), sponsor3);
         _expectLive(id, sponsor3);
+    }
+
+    /// Audit 1060 I-1, pinned as the natspec states it: a never-sponsor
+    /// organiser's role stays put only while its address is never made a
+    /// sponsor. Appointing it at cap 0 pauses its powers and lets the owner
+    /// move the role on, and the organiser, now withdrawn, cannot pull it back.
+    function test_ReassignRegistrant_ReachesAnOrganiserOnlyOnceMadeASponsor() public {
+        bytes32 id = _register();
+        _assume(id);
+        vm.prank(owner);
+        vm.expectRevert(WoCoTicketLedger.RegistrantNeverSponsor.selector);
+        ledger.reassignRegistrant(_ids(id), sponsor2);
+
+        vm.prank(owner);
+        ledger.addSponsor(organiser, 0);
+        vm.prank(organiser);
+        vm.expectRevert(WoCoTicketLedger.SponsorWithdrawn.selector);
+        ledger.setSupply(id, SUPPLY - 1);
+        _reassign(_ids(id), sponsor2);
+        assertEq(ledger.getRegistrant(id), sponsor2);
+        vm.prank(organiser);
+        vm.expectRevert(WoCoTicketLedger.SponsorWithdrawn.selector);
+        ledger.assumeRegistrant(id);
+    }
+
+    /// `to` is any authorised sponsor, so an organiser's address made a
+    /// sponsor can receive the role: the rule that it never is one is what
+    /// keeps the owner from handing events to organisers.
+    function test_ReassignRegistrant_ToAnOrganiserThatIsASponsor() public {
+        bytes32 id = _register();
+        vm.prank(owner);
+        ledger.addSponsor(organiser, 1);
+        _reassign(_ids(id), organiser);
+        assertEq(ledger.getRegistrant(id), organiser);
+    }
+
+    /// A duplicate id reverts the batch on its second pass: never a double
+    /// move or a double event.
+    function test_ReassignRegistrant_DuplicateIdRevertsTheBatch() public {
+        bytes32 id = _register();
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = id;
+        ids[1] = id;
+        vm.prank(owner);
+        vm.expectRevert(WoCoTicketLedger.RegistrantUnchanged.selector);
+        ledger.reassignRegistrant(ids, sponsor2);
+        assertEq(ledger.getRegistrant(id), sponsor);
+    }
+
+    /// Check order: a withdrawn caller is refused before the registrant is
+    /// looked at.
+    function test_AssumeRegistrant_WithdrawnCallerBeforeNeverSponsorRegistrant() public {
+        vm.prank(stranger);
+        bytes32 id = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        vm.startPrank(owner);
+        ledger.addSponsor(organiser, 1);
+        ledger.removeSponsor(organiser);
+        vm.stopPrank();
+        vm.prank(organiser);
+        vm.expectRevert(WoCoTicketLedger.SponsorWithdrawn.selector);
+        ledger.assumeRegistrant(id);
+    }
+
+    /// Why the natspec says never to bundle the leak response atomically: an
+    /// organiser's pull landing before the batch reverts it, and the removal
+    /// inside it is rolled back, leaving the key live.
+    function test_ReassignRegistrant_AtomicLeakBatchRevertsOnAnOrganiserPull() public {
+        bytes32 a = _register();
+        bytes32 b = _register();
+        _assume(b);
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = a;
+        ids[1] = b;
+        vm.expectRevert(WoCoTicketLedger.RegistrantNeverSponsor.selector);
+        this.atomicLeakBatch(ids);
+        assertTrue(ledger.authorisedSponsors(sponsor), "the bundled removal survived the revert");
+        assertEq(ledger.getRegistrant(a), sponsor);
+    }
+
+    /// One call frame standing in for an atomic Safe batch.
+    function atomicLeakBatch(bytes32[] calldata ids) external {
+        vm.startPrank(owner);
+        ledger.addSponsor(fresh, 1);
+        ledger.removeSponsor(sponsor);
+        ledger.reassignRegistrant(ids, fresh);
+        vm.stopPrank();
+    }
+
+    /// Audit 1060 L-1 as the header states it: a never-sponsor registrant can
+    /// keep moving its own cutoff, one `MAX_SALES_EXTENSION` per move.
+    function test_ExtendSalesEnd_NeverSponsorRegistrantRatchetsWithoutLimit() public {
+        bytes32 id = _register();
+        _assume(id);
+        uint64 max = ledger.MAX_SALES_EXTENSION();
+        for (uint256 i; i < 5; ++i) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint64 target = uint64(block.timestamp + max);
+            vm.prank(organiser);
+            ledger.extendSalesEnd(id, target);
+            vm.warp(target - 1);
+        }
+        (uint64 endTs, ) = ledger.getEventStatus(id);
+        assertGt(endTs, END_TS + 4 * max);
     }
 
     function test_ReassignRegistrant_CancelledAndLapsedEventsMove() public {

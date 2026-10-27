@@ -64,14 +64,19 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * The registrant role moves in exactly two ways, and only away from an
  * address that was ever a sponsor (audit 1060 N-1, I-2):
  *   - the event's organiser takes it (`assumeRegistrant`), and from then on
- *     manages the event from its own account. A never-sponsor organiser keeps
- *     it for good: nothing can move it again.
+ *     manages the event from its own account. A never-sponsor organiser then
+ *     holds it, and nothing moves it again unless the owner later appoints
+ *     that organiser's address as a sponsor (`addSponsor`, audit 1060 I-1),
+ *     which binds its powers to sponsor state and lets the owner move the
+ *     role on. The platform never makes an organiser's address a sponsor.
  *   - the owner moves it to another sponsor (`reassignRegistrant`): a key
  *     rotation, or the repair after a sponsor key is withdrawn, where the new
  *     key restores what the old one changed. The owner chooses WHICH platform
  *     key holds powers the organiser entrusted to the platform; it never
- *     changes an event's terms itself, never hands the role to an organiser,
- *     and never reaches an event whose registrant was never a sponsor.
+ *     changes an event's terms itself, never hands the role to an address
+ *     that is not an authorised sponsor (so never to an organiser, under the
+ *     rule above), and never reaches an event whose current registrant was
+ *     never a sponsor.
  * A registrant can never give the role away. A pushed handover was rejected:
  * a key in other hands could lower every supply and then hand each event to
  * its organiser, out of the owner's reach, before anyone could repair it.
@@ -123,9 +128,11 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * registrant DO move: for a routine rotation, add the new key and
  * `reassignRegistrant` the old key's events to it, keep the old key
  * authorised with a small cap for reissue only, and remove it once the last
- * bearer event it minted into is over. After a leak: add the new key, remove
- * the old one and reassign its events in one owner transaction, then restore
- * from the new key what the old one changed.
+ * bearer event it minted into is over. After a leak: `removeSponsor(old)`
+ * first, in its own transaction (it never reverts, and the gap loses nothing:
+ * a withdrawn key's events are frozen), then add the new key and reassign the
+ * old one's events (see `reassignRegistrant`), then restore from the new key
+ * what the old one changed.
  *
  * ── What bounds a sponsor (audit 959 M-1) ────────────────────────────────────
  *
@@ -242,10 +249,10 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * `registrant`, or require a signature at a higher layer. The consequence
  * inside this contract is contained. A stamped organiser can cancel the event
  * that named them, which is buyer-protective and one-way. It can take the
- * registrant role (`assumeRegistrant`) only of an event a sponsor registered:
- * a sponsor is a key the owner appointed, so that organiser is one the
- * platform stamped. An organiser named by an address that was never a
- * sponsor gets no role.
+ * registrant role (`assumeRegistrant`) only of an event whose current
+ * registrant was ever a sponsor: a sponsor is a key the owner appointed, so
+ * that organiser is one the platform stamped. An organiser named by an
+ * address that was never a sponsor gets no role while it stays one.
  *
  * `registrant` is authenticated, and it MOVES in exactly the two ways the
  * header names (`RegistrantChanged`); `getRegistrant` reads the current one.
@@ -542,7 +549,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @dev Later than `block.timestamp + MAX_SALES_EXTENSION`.
     error SalesEndTooFar();
     /// @dev The registrant was never a sponsor: an organiser's own
-    ///      registration, whose powers are its own and cannot be moved.
+    ///      registration, or an organiser that took the role, whose powers are
+    ///      its own and are not moved while that address is never made a
+    ///      sponsor.
     error RegistrantNeverSponsor();
     /// @dev The role would move to the address that already holds it.
     error RegistrantUnchanged();
@@ -966,20 +975,30 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      withdrawn, and `to` is always an authorised sponsor. So the owner
      *      chooses which platform key holds powers the organiser entrusted to
      *      the platform, never exercises them itself, never hands an event to
-     *      an organiser (only the organiser's own `assumeRegistrant` does),
-     *      and never reaches an event whose registrant was never a sponsor,
-     *      including one an organiser took. A live registrant is allowed: the
+     *      an address that is not an authorised sponsor (so never to an
+     *      organiser while an organiser's address is never made a sponsor;
+     *      only the organiser's own `assumeRegistrant` does), and never
+     *      reaches an event whose current registrant was never a sponsor,
+     *      including one a never-sponsor organiser took (audit 1060 I-1: the
+     *      owner appointing that address as a sponsor would change that).
+     *      A live registrant is allowed: the
      *      owner could withdraw, move and re-add it anyway, and requiring the
      *      cap-0 pause first would risk a cutoff lapsing mid-pause (audit 1060
      *      L-2).
      *
      *      `to` at a cap of 0 is accepted: its events wait, paused, until its
      *      cap is raised. All or nothing, like `reissue`: build the list from
-     *      `getRegistrant` reads just before signing. No size cap: owner only,
-     *      bounded by the block's gas.
+     *      `getRegistrant` reads just before signing. An organiser's
+     *      `assumeRegistrant` landing in between reverts the batch
+     *      (`RegistrantNeverSponsor`), and so does a duplicate id
+     *      (`RegistrantUnchanged`): rebuild the list and send again. No size
+     *      cap: owner only, bounded by the block's gas.
      *
-     *      Leak response, one owner transaction: `addSponsor(new, cap)`,
-     *      `removeSponsor(old)`, `reassignRegistrant(oldEvents, new)`.
+     *      Leak response: `removeSponsor(old)` first, in its own transaction,
+     *      then `addSponsor(new, cap)`, then this, from `getRegistrant` reads
+     *      made at that moment. Never bundle it atomically with
+     *      `removeSponsor`, whose never reverting is the point (audit 960
+     *      I-3): a refused batch would roll the removal back with it.
      */
     function reassignRegistrant(bytes32[] calldata eventIds, address to) external onlyOwner {
         uint256 n = eventIds.length;
