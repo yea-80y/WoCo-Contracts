@@ -6,10 +6,12 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
 
 /**
- * Version 2 of WoCoTicketLedger: seats the registrant can change
- * (`setSupply`), a cutoff it can only move later (`extendSalesEnd`), the
- * platform's re-point of a bearer ticket to a fresh key (`reissue`), and the
- * one-way off switch for it (`disableBearerMints`).
+ * Version 2 of WoCoTicketLedger: seats the registrant can lower and restore,
+ * never above the registered supply (`setSupply`), a cutoff it can only move
+ * later, while open and at most `MAX_SALES_EXTENSION` ahead (`extendSalesEnd`),
+ * both only while a registrant that was ever a sponsor is still a live one
+ * (audit 1059 M-1), the platform's re-point of a bearer ticket to a fresh key
+ * (`reissue`), and the one-way off switch for it (`disableBearerMints`).
  *
  * As in WoCoTicketLedger.t.sol, every new guard has a test that fails if the
  * guard is removed; the invariant suite proves the properties across random
@@ -94,23 +96,49 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.getRegistrant(keccak256("nope"));
     }
 
+    function test_GetRegisteredSupply() public {
+        bytes32 id = _register();
+        assertEq(ledger.getRegisteredSupply(id), SUPPLY);
+        vm.expectRevert(WoCoTicketLedger.EventNotFound.selector);
+        ledger.getRegisteredSupply(keccak256("nope"));
+    }
+
     // ── setSupply ─────────────────────────────────────────────────────────────
 
-    function test_SetSupply_RaiseLetsMoreSell() public {
+    function test_SetSupply_LowerThenRaiseBackLetsMoreSell() public {
         bytes32 id = _register();
         vm.prank(sponsor);
-        ledger.batchClaimFor(id, _owners(SUPPLY, holder), ORDER);
+        ledger.batchClaimFor(id, _owners(SUPPLY - 5, holder), ORDER);
+
+        vm.expectEmit(true, false, false, true);
+        emit WoCoTicketLedger.SupplySet(id, SUPPLY, SUPPLY - 5);
+        vm.prank(sponsor);
+        ledger.setSupply(id, SUPPLY - 5);
         assertEq(ledger.remaining(id), 0);
 
         vm.expectEmit(true, false, false, true);
-        emit WoCoTicketLedger.SupplySet(id, SUPPLY, SUPPLY + 5);
+        emit WoCoTicketLedger.SupplySet(id, SUPPLY - 5, SUPPLY);
         vm.prank(sponsor);
-        ledger.setSupply(id, SUPPLY + 5);
+        ledger.setSupply(id, SUPPLY);
 
         assertEq(ledger.remaining(id), 5);
         vm.prank(sponsor);
         ledger.batchClaimFor(id, _owners(5, holder), ORDER);
         assertEq(ledger.remaining(id), 0);
+    }
+
+    /// The manifest commits an edition for each registered seat and no more
+    /// (audit 1059 L-1), so a seat past them is refused, lowered first or not.
+    function test_SetSupply_NeverAboveRegistered() public {
+        bytes32 id = _register();
+        vm.startPrank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SupplyAboveRegistered.selector);
+        ledger.setSupply(id, SUPPLY + 1);
+        ledger.setSupply(id, SUPPLY - 1);
+        vm.expectRevert(WoCoTicketLedger.SupplyAboveRegistered.selector);
+        ledger.setSupply(id, SUPPLY + 1);
+        vm.stopPrank();
+        assertEq(ledger.getRegisteredSupply(id), SUPPLY, "the ceiling moved with the supply");
     }
 
     function test_SetSupply_LowerToExactlyMinted() public {
@@ -168,7 +196,7 @@ contract WoCoTicketLedgerV2Test is Test {
         for (uint256 i; i < notRegistrant.length; ++i) {
             vm.prank(notRegistrant[i]);
             vm.expectRevert(WoCoTicketLedger.NotRegistrant.selector);
-            ledger.setSupply(id, SUPPLY + 1);
+            ledger.setSupply(id, SUPPLY - 1);
         }
     }
 
@@ -178,7 +206,7 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.cancelEvent(id);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.AlreadyCancelled.selector);
-        ledger.setSupply(id, SUPPLY + 1);
+        ledger.setSupply(id, SUPPLY - 1);
     }
 
     function test_SetSupply_RefusedAfterCutoff() public {
@@ -186,7 +214,7 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.warp(END_TS);
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.SalesClosed.selector);
-        ledger.setSupply(id, SUPPLY + 1);
+        ledger.setSupply(id, SUPPLY - 1);
     }
 
     function test_SetSupply_UnknownEvent() public {
@@ -197,10 +225,8 @@ contract WoCoTicketLedgerV2Test is Test {
 
     // ── extendSalesEnd ────────────────────────────────────────────────────────
 
-    function test_ExtendSalesEnd_ReopensAClosedEvent() public {
+    function test_ExtendSalesEnd_KeepsAnOpenEventSelling() public {
         bytes32 id = _register();
-        vm.warp(END_TS + 1);
-        assertEq(ledger.remaining(id), 0);
         uint64 later = END_TS + 30 days;
 
         vm.expectEmit(true, false, false, true);
@@ -210,8 +236,45 @@ contract WoCoTicketLedgerV2Test is Test {
 
         (uint64 endTs, ) = ledger.getEventStatus(id);
         assertEq(endTs, later);
+        vm.warp(END_TS + 1);
         vm.prank(sponsor);
         ledger.claimFor(id, holder, ORDER);
+    }
+
+    /// The cutoff is the event's real end: once it has passed, the event is
+    /// over and is registered again, never reopened (audit 1059 L-4).
+    function test_ExtendSalesEnd_RefusedAfterCutoff() public {
+        bytes32 id = _register();
+        vm.warp(END_TS);
+        assertEq(ledger.remaining(id), 0);
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SalesClosed.selector);
+        ledger.extendSalesEnd(id, END_TS + 30 days);
+    }
+
+    /// At most `MAX_SALES_EXTENSION` past now, however many calls are made in
+    /// one block, so a key can postpone a cutoff by a bounded time, never for
+    /// good (audit 1059 M-1).
+    function test_ExtendSalesEnd_AtMostMaxAheadOfNow() public {
+        bytes32 id = _register();
+        uint256 max = ledger.MAX_SALES_EXTENSION();
+        assertEq(max, 730 days);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 limit = uint64(block.timestamp + max);
+
+        vm.startPrank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SalesEndTooFar.selector);
+        ledger.extendSalesEnd(id, limit + 1);
+        vm.expectRevert(WoCoTicketLedger.SalesEndTooFar.selector);
+        ledger.extendSalesEnd(id, type(uint64).max);
+        ledger.extendSalesEnd(id, limit);
+        // A second call in the same block gains nothing.
+        vm.expectRevert(WoCoTicketLedger.SalesEndTooFar.selector);
+        ledger.extendSalesEnd(id, limit + 1);
+        vm.stopPrank();
+
+        (uint64 endTs, ) = ledger.getEventStatus(id);
+        assertEq(endTs, limit);
     }
 
     function test_ExtendSalesEnd_NeverEarlierOrEqual() public {
@@ -222,14 +285,6 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.expectRevert(WoCoTicketLedger.InvalidEventEnd.selector);
         ledger.extendSalesEnd(id, END_TS - 1);
         vm.stopPrank();
-    }
-
-    function test_ExtendSalesEnd_NeverIntoThePast() public {
-        bytes32 id = _register();
-        vm.warp(END_TS + 10 days);
-        vm.prank(sponsor);
-        vm.expectRevert(WoCoTicketLedger.InvalidEventEnd.selector);
-        ledger.extendSalesEnd(id, END_TS + 5 days);
     }
 
     function test_ExtendSalesEnd_RegistrantOnly() public {
@@ -255,6 +310,87 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.prank(sponsor);
         vm.expectRevert(WoCoTicketLedger.EventNotFound.selector);
         ledger.extendSalesEnd(keccak256("nope"), END_TS + 1 days);
+    }
+
+    // ── registrant powers end with sponsor authority (audit 1059 M-1) ────────
+
+    function _expectWithdrawn(bytes32 id, address registrant) internal {
+        vm.startPrank(registrant);
+        vm.expectRevert(WoCoTicketLedger.SponsorWithdrawn.selector);
+        ledger.setSupply(id, SUPPLY - 1);
+        vm.expectRevert(WoCoTicketLedger.SponsorWithdrawn.selector);
+        ledger.extendSalesEnd(id, END_TS + 1 days);
+        vm.stopPrank();
+    }
+
+    function _expectLive(bytes32 id, address registrant) internal {
+        vm.startPrank(registrant);
+        ledger.setSupply(id, SUPPLY - 1);
+        ledger.extendSalesEnd(id, END_TS + 1 days);
+        vm.stopPrank();
+    }
+
+    function test_RegistrantPowers_EndWithRemoveSponsor() public {
+        bytes32 id = _register();
+        assertTrue(ledger.wasSponsor(sponsor), "the constructor's sponsor is not marked");
+        vm.prank(owner);
+        ledger.removeSponsor(sponsor);
+        _expectWithdrawn(id, sponsor);
+    }
+
+    function test_RegistrantPowers_PausedByCapZero() public {
+        bytes32 id = _register();
+        vm.prank(owner);
+        ledger.setSponsorMintCap(sponsor, 0);
+        _expectWithdrawn(id, sponsor);
+        vm.prank(owner);
+        ledger.setSponsorMintCap(sponsor, 1);
+        _expectLive(id, sponsor);
+    }
+
+    /// The repair `removeSponsor` names: add the key back with a small cap,
+    /// restore the supply, remove it again.
+    function test_RegistrantPowers_ReturnWhenReAdded() public {
+        bytes32 id = _register();
+        vm.startPrank(owner);
+        ledger.removeSponsor(sponsor);
+        ledger.addSponsor(sponsor, 1);
+        vm.stopPrank();
+        _expectLive(id, sponsor);
+    }
+
+    /// An organiser registering its own events was never a sponsor, and keeps
+    /// its powers for good: `removeSponsor` on it takes nothing.
+    function test_RegistrantPowers_NeverSponsorKeepsThem() public {
+        vm.prank(stranger);
+        bytes32 id = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        vm.prank(owner);
+        ledger.removeSponsor(stranger);
+        assertFalse(ledger.wasSponsor(stranger), "removeSponsor marked a never-sponsor");
+        _expectLive(id, stranger);
+    }
+
+    /// The rule reads the address at call time: registering before becoming a
+    /// sponsor does not keep an event out of it.
+    function test_RegistrantPowers_RegisteredBeforeAddedIsGated() public {
+        vm.prank(stranger);
+        bytes32 id = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        vm.startPrank(owner);
+        ledger.addSponsor(stranger, 5);
+        ledger.removeSponsor(stranger);
+        vm.stopPrank();
+        assertTrue(ledger.wasSponsor(stranger));
+        _expectWithdrawn(id, stranger);
+    }
+
+    /// A withdrawn sponsor that is not the registrant is refused as before.
+    function test_RegistrantPowers_WithdrawnNonRegistrantIsNotRegistrant() public {
+        bytes32 id = _register();
+        vm.prank(owner);
+        ledger.removeSponsor(sponsor2);
+        vm.prank(sponsor2);
+        vm.expectRevert(WoCoTicketLedger.NotRegistrant.selector);
+        ledger.setSupply(id, SUPPLY - 1);
     }
 
     // ── bearer mints ──────────────────────────────────────────────────────────
@@ -382,19 +518,20 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.transferSlotWithSignature(id, s, stranger, deadline, abi.encodePacked(r, sig, v));
     }
 
-    /// A cutoff moved later reopens reissue with sales: the same window.
-    function test_Reissue_ReopensWithAnExtendedCutoff() public {
+    /// Reissue follows a cutoff moved later: the same window as sales.
+    function test_Reissue_FollowsAnExtendedCutoff() public {
         bytes32 id = _register();
         uint256 s = _bearer(id, 1, holder);
-        vm.warp(END_TS);
-        vm.prank(sponsor);
-        vm.expectRevert(WoCoTicketLedger.SalesClosed.selector);
-        ledger.reissue(id, _slots(s), _owners(1, fresh));
-
         vm.prank(sponsor);
         ledger.extendSalesEnd(id, END_TS + 1 days);
+        vm.warp(END_TS);
         _reissue(id, _slots(s), fresh);
         assertEq(ledger.slotOwner(id, s), fresh);
+
+        vm.warp(END_TS + 1 days);
+        vm.prank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.SalesClosed.selector);
+        ledger.reissue(id, _slots(s), _owners(1, holder));
     }
 
     /// A slot can be reissued again (the platform limits how often), until a
@@ -599,7 +736,7 @@ contract WoCoTicketLedgerV2Test is Test {
         // Everything else carries on.
         ledger.claimFor(id, holder, ORDER);
         ledger.batchClaimFor(id, _owners(1, holder), ORDER);
-        ledger.setSupply(id, SUPPLY + 1);
+        ledger.setSupply(id, SUPPLY - 1);
         ledger.extendSalesEnd(id, END_TS + 1 days);
         vm.stopPrank();
         vm.prank(holder);
@@ -622,6 +759,9 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(bytes32(WoCoTicketLedger.setSupply.selector),        bytes32(bytes4(keccak256("setSupply(bytes32,uint64)"))));
         assertEq(bytes32(WoCoTicketLedger.extendSalesEnd.selector),   bytes32(bytes4(keccak256("extendSalesEnd(bytes32,uint64)"))));
         assertEq(bytes32(ledger.bearerMintsDisabled.selector),        bytes32(bytes4(keccak256("bearerMintsDisabled()"))));
+        assertEq(bytes32(WoCoTicketLedger.getRegisteredSupply.selector), bytes32(bytes4(keccak256("getRegisteredSupply(bytes32)"))));
+        assertEq(bytes32(ledger.wasSponsor.selector),                 bytes32(bytes4(keccak256("wasSponsor(address)"))));
+        assertEq(bytes32(ledger.MAX_SALES_EXTENSION.selector),        bytes32(bytes4(keccak256("MAX_SALES_EXTENSION()"))));
 
         assertEq(WoCoTicketLedger.SlotReissued.selector,        keccak256("SlotReissued(bytes32,uint256,address,address)"));
         assertEq(WoCoTicketLedger.SupplySet.selector,           keccak256("SupplySet(bytes32,uint64,uint64)"));
@@ -636,6 +776,9 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(bytes32(WoCoTicketLedger.SlotHeld.selector),          bytes32(bytes4(keccak256("SlotHeld()"))));
         assertEq(bytes32(WoCoTicketLedger.NotRegistrant.selector),     bytes32(bytes4(keccak256("NotRegistrant()"))));
         assertEq(bytes32(WoCoTicketLedger.SupplyUnchanged.selector),   bytes32(bytes4(keccak256("SupplyUnchanged()"))));
+        assertEq(bytes32(WoCoTicketLedger.SponsorWithdrawn.selector),  bytes32(bytes4(keccak256("SponsorWithdrawn()"))));
+        assertEq(bytes32(WoCoTicketLedger.SupplyAboveRegistered.selector), bytes32(bytes4(keccak256("SupplyAboveRegistered()"))));
+        assertEq(bytes32(WoCoTicketLedger.SalesEndTooFar.selector),    bytes32(bytes4(keccak256("SalesEndTooFar()"))));
     }
 
     // ── views ─────────────────────────────────────────────────────────────────

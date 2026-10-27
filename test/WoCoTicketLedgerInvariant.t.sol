@@ -25,15 +25,19 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * not register. If the invariants hold for it, they hold for any sponsor.
  *
  * VERSION 2 adds three moving parts, each with its own rule here: seats move
- * only through `setSupply` by the registrant, never below the slots minted; the
- * cutoff moves only later; and a slot is re-pointed by `reissue` only if it was
- * minted bearer and no holder has moved it, in place (no slot minted, no seat
- * used), and never after `disableBearerMints`.
+ * only through `setSupply` by the registrant, never below the slots minted and
+ * never above the registered supply; the cutoff moves only later, only while
+ * open and at most `MAX_SALES_EXTENSION` ahead of now; and a slot is re-pointed
+ * by `reissue` only if it was minted bearer and no holder has moved it, in
+ * place (no slot minted, no seat used), and never after `disableBearerMints`.
  *
  * WHAT THIS CAMPAIGN DOES NOT COVER: the handler never calls
  * `forceCancelEvent`, `addSponsor`/`removeSponsor`, or `setDisputeAuthority`,
- * so these invariants say nothing about admin churn. Those paths are covered
- * by the unit suite instead. The signature ENCODING (domain, typehash, field
+ * so these invariants say nothing about admin churn. That includes the rule
+ * that a registrant which was ever a sponsor loses `setSupply` and
+ * `extendSalesEnd` once withdrawn (`wasSponsor`): the handler stays a live
+ * sponsor throughout. Those paths are covered by the unit suite instead. The
+ * signature ENCODING (domain, typehash, field
  * order) is pinned by WoCoTicketLedgerSignedTransfer.t.sol, not here: the
  * handler signs `transferSlotDigest` exactly as the contract computes it.
  *
@@ -54,6 +58,7 @@ contract LedgerHandler is Test {
         address organiser;
         bytes32 manifestRef;
         bool    seenCancelled;
+        uint64  registeredSupply;
     }
 
     mapping(bytes32 => Stamped) public stamped;
@@ -117,6 +122,15 @@ contract LedgerHandler is Test {
     bool public reissueUsedASeat;
     /// Set if the cutoff ever moved earlier.
     bool public cutoffMovedEarlier;
+    /// Attempts at terms version 2 forbids (audit 1059): supply above the
+    /// registered supply, a cutoff past `MAX_SALES_EXTENSION`, extending a
+    /// cutoff that has passed. Each flag is set if one ever landed.
+    uint256 public aboveRegisteredAttempts;
+    uint256 public tooFarAttempts;
+    uint256 public lapsedExtendAttempts;
+    bool public supplyAboveRegisteredLanded;
+    bool public cutoffTooFarLanded;
+    bool public lapsedCutoffExtended;
 
     constructor(WoCoTicketLedger _ledger, address _ledgerOwner) {
         ledger = _ledger;
@@ -147,7 +161,8 @@ contract LedgerHandler is Test {
             eventEndTs:    endTs,
             organiser:     address(this),
             manifestRef:   manifestRef,
-            seenCancelled: false
+            seenCancelled: false,
+            registeredSupply: supply64
         });
     }
 
@@ -432,15 +447,28 @@ contract LedgerHandler is Test {
     }
 
     /// Reissue a slot the rules put out of reach: minted non-bearer, moved by
-    /// its holder, or anything after the off switch. Must always revert.
+    /// its holder, or anything after the off switch. Must always revert. When
+    /// the pick is not out of reach, a non-bearer slot is minted on an open
+    /// event in this same call, so the witness never starves (seed 0x1 did).
     function reissueIneligible(uint256 eventIndex, uint256 slotSeed, address newOwner) external {
         if (eventIds.length == 0) return;
         bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
         uint256 count = seenSlotCount[id];
-        if (count == 0) return;
-        uint256 slot = bound(slotSeed, 0, count - 1);
-        bool eligible = seenBearer[id][slot] && !seenMoved[id][slot] && !bearerMintsSeenDisabled;
-        if (eligible) return;
+        uint256 slot;
+        bool eligible = true;
+        if (count > 0) {
+            slot = bound(slotSeed, 0, count - 1);
+            eligible = seenBearer[id][slot] && !seenMoved[id][slot] && !bearerMintsSeenDisabled;
+        }
+        if (eligible) {
+            id = _openEvent(eventIndex);
+            try ledger.claimFor(id, address(0x3), bytes32(uint256(6))) returns (uint256 s) {
+                _recordSlot(id, s, address(0x3));
+                slot = s;
+            } catch {
+                return;
+            }
+        }
         if (newOwner == address(0)) newOwner = address(0x2);
 
         uint256[] memory slots = new uint256[](1);
@@ -458,9 +486,15 @@ contract LedgerHandler is Test {
         if (eventIds.length == 0) return;
         bytes32 id = _openEvent(eventIndex);
         (uint64 current, uint64 minted, , ) = ledger.getEvent(id);
+        uint64 floor = minted == 0 ? 1 : minted;
+        uint64 ceiling = stamped[id].registeredSupply;
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 supply = uint64(bound(supplySeed, minted == 0 ? 1 : minted, 600));
-        if (supply == current) supply = current + 1;
+        uint64 supply = uint64(bound(supplySeed, floor, ceiling));
+        if (supply == current) {
+            if (current < ceiling) supply = current + 1;
+            else if (current > floor) supply = current - 1;
+            else return;
+        }
         try ledger.setSupply(id, supply) {
             stamped[id].totalSupply = supply;
             supplySets++;
@@ -472,10 +506,12 @@ contract LedgerHandler is Test {
     function extendSalesEnd(uint256 eventIndex, uint256 offset) external {
         if (eventIds.length == 0) return;
         bytes32 id = _openEvent(eventIndex);
+        // `_openEvent` returns an event whose cutoff is still ahead.
         (uint64 endTs, ) = ledger.getEventStatus(id);
-        uint256 base = endTs > block.timestamp ? endTs : block.timestamp;
+        uint256 limit = block.timestamp + ledger.MAX_SALES_EXTENSION();
+        if (limit <= endTs) return;
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 newEnd = uint64(base + bound(offset, 1, 365 days));
+        uint64 newEnd = uint64(endTs + bound(offset, 1, limit - endTs));
         try ledger.extendSalesEnd(id, newEnd) {
             if (newEnd <= stamped[id].eventEndTs) cutoffMovedEarlier = true;
             stamped[id].eventEndTs = newEnd;
@@ -483,6 +519,72 @@ contract LedgerHandler is Test {
         } catch {
             // See claimFor: cancelled.
         }
+    }
+
+    /// Always refused: a supply above the registered one.
+    function setSupplyAboveRegistered(uint256 eventIndex, uint256 overSeed) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = _openEvent(eventIndex);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 supply = stamped[id].registeredSupply + uint64(bound(overSeed, 1, 1000));
+        aboveRegisteredAttempts++;
+        try ledger.setSupply(id, supply) {
+            supplyAboveRegisteredLanded = true;
+        } catch {}
+    }
+
+    /// Always refused: a cutoff more than `MAX_SALES_EXTENSION` past now.
+    function extendSalesEndTooFar(uint256 eventIndex, uint256 overSeed) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = _openEvent(eventIndex);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 newEnd = uint64(block.timestamp + ledger.MAX_SALES_EXTENSION() + bound(overSeed, 1, 365 days));
+        tooFarAttempts++;
+        try ledger.extendSalesEnd(id, newEnd) {
+            cutoffTooFarLanded = true;
+        } catch {}
+    }
+
+    /// Always refused: moving a cutoff that has passed. Uses an event the
+    /// campaign closed if there is one, else closes a fresh one, so the
+    /// witness never starves.
+    function extendLapsedEvent(uint256 eventIndex, uint256 offset) external {
+        if (eventIds.length == 0) return;
+        uint256 n = eventIds.length;
+        uint256 start = bound(eventIndex, 0, n - 1);
+        bytes32 id;
+        bool found;
+        for (uint256 k; k < n; ++k) {
+            bytes32 candidate = eventIds[(start + k) % n];
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(candidate);
+            if (!cancelled && block.timestamp >= endTs) {
+                id = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint64 end = uint64(block.timestamp + 1);
+            bytes32 manifest = bytes32(uint256(8));
+            id = ledger.registerEvent(address(this), 10, manifest, end);
+            eventIds.push(id);
+            stamped[id] = Stamped({
+                totalSupply:   10,
+                eventEndTs:    end,
+                organiser:     address(this),
+                manifestRef:   manifest,
+                seenCancelled: false,
+                registeredSupply: 10
+            });
+            vm.warp(end);
+        }
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 newEnd = uint64(block.timestamp + bound(offset, 1, 365 days));
+        lapsedExtendAttempts++;
+        try ledger.extendSalesEnd(id, newEnd) {
+            lapsedCutoffExtended = true;
+        } catch {}
     }
 
     /// The off switch. Held back until a reissue has run, or most campaigns
@@ -514,7 +616,8 @@ contract LedgerHandler is Test {
             eventEndTs:    freshEnd,
             organiser:     address(this),
             manifestRef:   manifest,
-            seenCancelled: false
+            seenCancelled: false,
+            registeredSupply: 100
         });
     }
 
@@ -585,6 +688,7 @@ contract WoCoTicketLedgerInvariantTest is Test {
             bytes32 id = handler.eventIds(i);
             (uint64 totalSupply, uint64 nextSlot, , ) = ledger.getEvent(id);
             assertLe(nextSlot, totalSupply, "nextSlot exceeded supply");
+            assertLe(totalSupply, ledger.getRegisteredSupply(id), "supply above the registered supply");
         }
     }
 
@@ -595,11 +699,15 @@ contract WoCoTicketLedgerInvariantTest is Test {
     /// forge-config: default.invariant.runs = 64
     function invariant_TermsMoveOnlyAsAllowed() public view {
         assertFalse(handler.cutoffMovedEarlier(), "the sales cutoff moved earlier");
+        assertFalse(handler.supplyAboveRegisteredLanded(), "supply was set above the registered supply");
+        assertFalse(handler.cutoffTooFarLanded(), "a cutoff moved past MAX_SALES_EXTENSION");
+        assertFalse(handler.lapsedCutoffExtended(), "a cutoff that had passed was moved");
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
             bytes32 id = handler.eventIds(i);
-            (uint64 sSupply, uint64 sEndTs, address sOrg, bytes32 sManifest, ) =
+            (uint64 sSupply, uint64 sEndTs, address sOrg, bytes32 sManifest, , uint64 sRegistered) =
                 handler.stamped(id);
+            assertEq(ledger.getRegisteredSupply(id), sRegistered, "registeredSupply changed after registration");
 
             (uint64 totalSupply, , address org, bytes32 manifest) = ledger.getEvent(id);
             (uint64 endTs, ) = ledger.getEventStatus(id);
@@ -650,7 +758,7 @@ contract WoCoTicketLedgerInvariantTest is Test {
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
             bytes32 id = handler.eventIds(i);
-            (, , , , bool seenCancelled) = handler.stamped(id);
+            (, , , , bool seenCancelled, ) = handler.stamped(id);
             if (!seenCancelled) continue;
             (, bool cancelled) = ledger.getEventStatus(id);
             assertTrue(cancelled, "a cancelled event became live again");
@@ -689,6 +797,9 @@ contract WoCoTicketLedgerInvariantTest is Test {
         assertGt(handler.ineligibleReissueAttempts(), 0, "campaign never attempted an ineligible reissue");
         assertGt(handler.supplySets(), 0, "campaign never exercised setSupply");
         assertGt(handler.cutoffExtensions(), 0, "campaign never exercised extendSalesEnd");
+        assertGt(handler.aboveRegisteredAttempts(), 0, "campaign never tried a supply above the registered one");
+        assertGt(handler.tooFarAttempts(), 0, "campaign never tried a cutoff past MAX_SALES_EXTENSION");
+        assertGt(handler.lapsedExtendAttempts(), 0, "campaign never tried to move a cutoff that had passed");
     }
 
     /// A slot's owner changes ONLY through a transfer its own owner authorised —
