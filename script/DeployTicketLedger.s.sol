@@ -45,9 +45,9 @@ import {WoCoTicketLedger, LEDGER_UNLIMITED_MINTS} from "../src/WoCoTicketLedger.
  *                          a contract the server cannot mint through,
  *                          discovered at first sale.
  *   INITIAL_SPONSOR_MINTS_PER_HOUR — that sponsor's hourly mint cap (audit 959
- *                          M-1). Finite and non-zero: the first sponsor is the
- *                          hot card key. The Safe retunes it later with
- *                          setSponsorMintCap.
+ *                          M-1). Non-zero and at most 100,000: the first
+ *                          sponsor is the hot card key. The Safe retunes it
+ *                          later with setSponsorMintCap.
  *
  * POST-DEPLOY, IN THIS ORDER (1 before 2 — reversing them opens a window in
  * which every mint reverts NotAuthorised and ticket fulfilment stops):
@@ -86,12 +86,17 @@ contract DeployWoCoTicketLedger is Script {
         address deployer = vm.addr(c.deployerPk);
         require(c.owner != address(0), "INITIAL_OWNER must not be the zero address");
         require(c.sponsor != address(0), "INITIAL_SPONSOR must not be the zero address");
-        require(c.perHour <= type(uint32).max, "INITIAL_SPONSOR_MINTS_PER_HOUR exceeds uint32");
         require(c.perHour > 0, "INITIAL_SPONSOR_MINTS_PER_HOUR must not be 0: that is the stopped state, set it later with setSponsorMintCap");
         // The first sponsor is always the hot card key, the one the cap exists
         // to bound (audit 960 L-2). A payments contract that may run unlimited
         // needs this ledger's address, so it is always added later.
         require(c.perHour != LEDGER_UNLIMITED_MINTS, "INITIAL_SPONSOR must have a finite cap: UNLIMITED_MINTS is for a sponsor the chain can check, added later");
+        // A finite cap just under UNLIMITED_MINTS bounds nothing (audit 1059
+        // L-8). This ceiling also keeps the cast below in uint32.
+        require(
+            c.perHour <= MAX_INITIAL_SPONSOR_MINTS_PER_HOUR,
+            "INITIAL_SPONSOR_MINTS_PER_HOUR above 100000: a cap that high bounds nothing, raise it later with setSponsorMintCap if a sale needs it"
+        );
         if (!_isTestnet(block.chainid)) {
             // No check below can tell OUR Safe from a genuine Safe that happens to
             // list our signer (a second Safe of ours, or a substituted one), so on
@@ -112,6 +117,8 @@ contract DeployWoCoTicketLedger is Script {
             require(c.ownerSigner != address(0), "INITIAL_OWNER_SIGNER must be set to a signer of the owner Safe");
             require(_safeIsOwner(c.owner, c.ownerSigner), "INITIAL_OWNER_SIGNER is not an owner of INITIAL_OWNER");
             require(c.owner != c.sponsor, "INITIAL_OWNER must not be the sponsor");
+            // The Safe signer's key and the hot card key must stay apart (audit 1059 L-8).
+            require(c.ownerSigner != c.sponsor, "INITIAL_OWNER_SIGNER must not be the sponsor");
             // An EIP-7702 deployer has code, so the checks above do not rule it out (audit 960 I-4).
             require(c.owner != deployer, "INITIAL_OWNER must not be the deployer");
             // The gas-only deployer key must never double as the hot sponsor (audit 961 L-3).
@@ -132,7 +139,7 @@ contract DeployWoCoTicketLedger is Script {
         console.log("  Initial sponsor:     ", c.sponsor);
         console.log("  Sponsor mints/hour:  ", c.perHour);
 
-        // safe: bounded to uint32 by the require above
+        // safe: bounded by MAX_INITIAL_SPONSOR_MINTS_PER_HOUR above
         // forge-lint: disable-next-line(unsafe-typecast)
         uint32 perHour = uint32(c.perHour);
 
@@ -172,6 +179,10 @@ contract DeployWoCoTicketLedger is Script {
     ///      owner of the live sub-ENS contracts. A redeploy to another Safe edits
     ///      this line, in review, which is the point.
     address internal constant WOCO_OWNER_SAFE_ARBITRUM_ONE = 0xD26abFb5fBd37eFBD876e87cB169286eF0f14BA2;
+
+    /// @dev Ten times version 1's live cap (10,000 per hour), so it never gets
+    ///      in a real deploy's way, yet far below a cap that bounds nothing.
+    uint256 internal constant MAX_INITIAL_SPONSOR_MINTS_PER_HOUR = 100_000;
 
     /// @dev Runtime codehash of the proxy the official SafeProxyFactory deploys,
     ///      one per release, independent of singleton and factory deployment.

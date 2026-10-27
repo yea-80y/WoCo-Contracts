@@ -54,10 +54,29 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         s.run();
     }
 
+    bytes constant CAP_TOO_HIGH =
+        "INITIAL_SPONSOR_MINTS_PER_HOUR above 100000: a cap that high bounds nothing, raise it later with setSponsorMintCap if a sale needs it";
+
+    /// Just under UNLIMITED_MINTS is effectively unlimited (audit 1059 L-8).
+    function test_Refuses_CapJustUnderUnlimited() public {
+        TestableDeployTicketLedger s = _script(owner, sponsor, uint256(type(uint32).max) - 1);
+        vm.expectRevert(CAP_TOO_HIGH);
+        s.run();
+    }
+
     function test_Refuses_CapAboveUint32() public {
         TestableDeployTicketLedger s = _script(owner, sponsor, uint256(type(uint32).max) + 1);
-        vm.expectRevert(bytes("INITIAL_SPONSOR_MINTS_PER_HOUR exceeds uint32"));
+        vm.expectRevert(CAP_TOO_HIGH);
         s.run();
+    }
+
+    function test_CapCeiling_Boundary() public {
+        TestableDeployTicketLedger s = _script(owner, sponsor, 100_001);
+        vm.expectRevert(CAP_TOO_HIGH);
+        s.run();
+        WoCoTicketLedger ledger = _script(owner, sponsor, 100_000).run();
+        (uint32 perHour, , ) = ledger.sponsorMintAllowance(sponsor);
+        assertEq(perHour, 100_000);
     }
 
     function test_Refuses_ZeroCap() public {
@@ -157,6 +176,16 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         _etchSafe(sponsor);
         TestableDeployTicketLedger s = _script(sponsor, sponsor, 1_000);
         vm.expectRevert(bytes("INITIAL_OWNER must not be the sponsor"));
+        s.run();
+    }
+
+    /// The Safe signer's key is not the hot card key (audit 1059 L-8). The
+    /// sponsor here is the one signer MockSafe lists, so only this check trips.
+    function test_Production_RefusesTheSignerAsSponsor() public {
+        vm.chainId(OTHER_PROD_CHAIN);
+        _etchSafe(owner);
+        TestableDeployTicketLedger s = _script(owner, address(uint160(0x5165)), 1_000);
+        vm.expectRevert(bytes("INITIAL_OWNER_SIGNER must not be the sponsor"));
         s.run();
     }
 

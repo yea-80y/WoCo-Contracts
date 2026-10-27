@@ -21,9 +21,11 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * money contract never puts the ticket ledger back in front of an auditor.
  *
  * Version 2 (EIP-712 domain version "2") adds, over the deployed version 1:
- * seats an event's registrant can change (`setSupply`), a sales cutoff it can
- * only move later (`extendSalesEnd`), and the platform's replacement of a
- * bearer ticket (`reissue`), with a one-way off switch (`disableBearerMints`).
+ * seats an event's registrant can lower and restore, never above the supply
+ * it registered (`setSupply`), a sales cutoff it can only move later, while
+ * still open and at most two years ahead (`extendSalesEnd`), and the
+ * platform's replacement of a bearer ticket (`reissue`), with a one-way off
+ * switch (`disableBearerMints`).
  *
  * ── The guarantee this contract makes ────────────────────────────────────────
  *
@@ -45,10 +47,18 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * Stated precisely, because the scope matters: `registerEvent` is
  * PERMISSIONLESS. A sponsor may therefore also register its own events and,
  * having stamped itself as their organiser, cancel those, and as their
- * REGISTRANT change their supply and move their cutoff later. That is not
- * sponsor authority — it is what any address can do for the events it
- * registered, and it reaches only those. The guarantee above is about the
- * events it did not.
+ * REGISTRANT change their supply (within the registered supply) and move their
+ * cutoff later. That is not sponsor authority — it is what any address can do
+ * for the events it registered, and it reaches only those. The guarantee above
+ * is about the events it did not.
+ *
+ * One difference, because in production the platform's sponsor key is the
+ * registrant of every platform event (audit 1059 M-1): an address that was
+ * EVER a sponsor (`wasSponsor`) keeps those registrant powers only while its
+ * sponsor authority is live — authorised, with a cap above 0. Withdrawing a
+ * sponsor (`removeSponsor`, or a cap of 0) therefore withdraws everything it
+ * could do, not only its minting. An address that was never a sponsor, such
+ * as an organiser registering its own events, keeps them for good.
  *
  * ── Reissue: the platform replacing a bearer ticket ──────────────────────────
  *
@@ -92,8 +102,10 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * SPONSOR ROTATION. Reissue checks the slot's minting sponsor, so a sponsor
  * key removed from service can no longer reissue the bearer tickets it minted
  * (they still verify at the door). That is the right outcome for a key that
- * leaked. For a routine rotation, keep the old key authorised with a small
- * cap until the last event it minted into is over.
+ * leaked. Removal also fixes the terms of every event the key registered
+ * (supply and cutoff, see above). For a routine rotation, keep the old key
+ * authorised with a small cap until the last event it minted into or
+ * registered is over.
  *
  * ── What bounds a sponsor (audit 959 M-1) ────────────────────────────────────
  *
@@ -104,7 +116,10 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * bounded by an hourly mint cap the owner sets per sponsor: a leaked key takes
  * at most its cap per window, and at most twice it across a window boundary
  * (see `MintAllowance`), until the owner calls `removeSponsor` or
- * `setSponsorMintCap(sponsor, 0)`.
+ * `setSponsorMintCap(sponsor, 0)`. Either lever withdraws all of it: minting,
+ * reissue, and its registrant powers over the events it registered. What such
+ * a key can leave behind is bounded too: supply never above the registered
+ * supply, and no cutoff later than `MAX_SALES_EXTENSION` past its withdrawal.
  *
  * `UNLIMITED_MINTS` is for a sponsor whose mints the chain CAN check — a
  * payments contract that mints only in the transaction that takes the money.
@@ -129,15 +144,23 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * or open refunds — never accelerate, enlarge, or redirect a payout.
  *   - `cancelled` is one-way (false → true). It only stops mints and opens
  *     refunds.
- *   - `eventEndTs` only ever moves LATER (`extendSalesEnd`, the registrant
- *     only). Release time downstream is `eventEndTs + releaseDelay`, so it can
- *     never be pulled earlier than buyers agreed to.
+ *   - `eventEndTs` only ever moves LATER (`extendSalesEnd`, the live
+ *     registrant only), only while it has not passed, and never more than
+ *     `MAX_SALES_EXTENSION` ahead of the moment it moves. Release time
+ *     downstream is `eventEndTs + releaseDelay`, so it can never be pulled
+ *     earlier than buyers agreed to, and a key can postpone it by a bounded
+ *     time, never for good. Payments must still do its release arithmetic in
+ *     uint256 (a registered `eventEndTs` itself is unbounded, below).
  *   - Supply is not read across the boundary: changing it (`setSupply`)
  *     decides how many tickets may still be sold, never who is paid or when.
- *     It does NOT move the edition commitment: `manifestRef` has no setter
- *     and commits the editions the event was registered with. Lowering supply
- *     is usable as is; raising it is usable only once the platform accepts a
- *     manifest that extends the registered one, which is an off-chain rule.
+ *     It never passes the edition commitment: `manifestRef` has no setter and
+ *     commits the editions the event was registered with, and supply can go
+ *     down and back up to that number (`registeredSupply`), never above it.
+ *     More seats than that is a new registration.
+ *
+ * `registerEvent` leaves the cutoff unbounded on purpose: registration sets an
+ * event's terms before any buyer exists (collectables register a cutoff a
+ * century out), while an extension changes terms that money was taken under.
  *
  * WHY THE CUTOFF IS MONOTONIC-INCREASE-ONLY (#294): extending it delays
  * release, which is conservative. Shortening it would pull the organiser's
@@ -219,7 +242,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// Packed layout — 4 storage slots (V2 used 5).
     ///
     /// Slot 0: totalSupply(64) + nextSlot(64) + eventEndTs(64) + exists(8) + cancelled(8)
-    /// Slot 1: organiser(160)
+    /// Slot 1: organiser(160) + registeredSupply(64)
     /// Slot 2: manifestRef(256)
     /// Slot 3: registrant(160)
     struct Event {
@@ -231,11 +254,16 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         bool   cancelled;
         // ---- slot 1 ----
         address organiser;
+        /// The supply at registration, written once: the editions `manifestRef`
+        /// commits, and so the ceiling `setSupply` can never pass.
+        uint64  registeredSupply;
         // ---- slot 2 ----
         bytes32 manifestRef;
         // ---- slot 3 ----
         /// `msg.sender` at registration: the one address that may change supply
-        /// or move the cutoff later. Authenticated, unlike `organiser`.
+        /// or move the cutoff later, and only while its sponsor authority is
+        /// live if it was ever a sponsor (`wasSponsor`). Authenticated, unlike
+        /// `organiser`.
         address registrant;
     }
 
@@ -278,6 +306,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// WoCoPayments once it ships; any future sponsor contract after that.
     mapping(address => bool) public authorisedSponsors;
 
+    /// Set by every `addSponsor` (and the constructor's), never cleared. A
+    /// registrant that was ever a sponsor keeps its registrant powers only while
+    /// its sponsor authority is live (`_registrantLive`), so withdrawing a sponsor
+    /// key withdraws those too (audit 1059 M-1).
+    mapping(address => bool) public wasSponsor;
+
     /// One-way: once true, `batchClaimBearer` and `reissue` revert for good.
     /// Set by `disableBearerMints` (owner only); nothing clears it.
     bool public bearerMintsDisabled;
@@ -313,6 +347,13 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///         cap is the one knob, and a tunable window is what let the
     ///         registrar's owner brick minting by overflow (audit 925 F3).
     uint64 public constant MINT_WINDOW = 1 hours;
+
+    /// @notice How far ahead of now `extendSalesEnd` may move a cutoff. Absolute
+    ///         from now, not a step per call, which a loop in one block would
+    ///         multiply. With withdrawal ending the registrant's powers, the
+    ///         latest a withdrawn key can leave a cutoff is withdrawn-at plus
+    ///         this (audit 1059 M-1). Two festival cycles.
+    uint64 public constant MAX_SALES_EXTENSION = 730 days;
 
     /// Per-slot counter consumed by EVERY ownership change: both transfer
     /// paths and `reissue`. A signed transfer commits to its current value, so
@@ -436,6 +477,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error SlotHeld();
     error BearerMintsOff();
     error AlreadyDisabled();
+    /// @dev The registrant was a sponsor and is no longer a live one (removed,
+    ///      or capped at 0), so its registrant powers are withdrawn with it.
+    error SponsorWithdrawn();
+    /// @dev Never above the supply the event was registered with: more seats
+    ///      than that is a new registration (a new ticket type).
+    error SupplyAboveRegistered();
+    /// @dev Later than `block.timestamp + MAX_SALES_EXTENSION`.
+    error SalesEndTooFar();
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -476,8 +525,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *                     tell which argument was wrong.
      * @param eventEndTs   UNIX seconds; the on-chain sales cutoff. `claimFor`
      *                     reverts `SalesClosed` at or after this. Only ever
-     *                     moves later (`extendSalesEnd`) — see the
-     *                     monotonicity note above.
+     *                     moves later (`extendSalesEnd`, while it has not
+     *                     passed) — see the monotonicity note above.
      *                     It is CHAIN time (audit 961 M-2). The sequencer stamps
      *                     blocks from its own clock, which in practice tracks
      *                     real time to seconds. The hard rule on the final
@@ -545,6 +594,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
             exists:       true,
             cancelled:    false,
             organiser:    organiser,
+            registeredSupply: supply,
             manifestRef:  manifestRef,
             registrant:   msg.sender
         });
@@ -743,24 +793,29 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     // ── Supply and sales cutoff (the registrant) ──────────────────────────────
 
     /**
-     * @notice Set the event's supply: more seats for a bigger venue, fewer for
-     *         a smaller one. The REGISTRANT only — the address that registered
-     *         it, which could have stamped any supply in the first place.
+     * @notice Set the event's supply: fewer seats for a smaller venue, and back
+     *         up again, never above the supply it was registered with. The
+     *         REGISTRANT only — the address that registered it, which could
+     *         have stamped any supply in the first place — and, if it was ever
+     *         a sponsor, only while it is a live one.
      * @dev An absolute value, not a delta, so a retried transaction changes
      *      nothing twice. Never below the slots minted (a sold ticket is never
-     *      taken back) and never 0. Refused once cancelled (terminal) or past
-     *      the sales cutoff (move it later first). Raising it does not extend
-     *      the edition commitment (`manifestRef`): see the header's trust
-     *      boundary section before raising supply on a live event.
+     *      taken back), never 0, and never above `registeredSupply`: the
+     *      edition commitment (`manifestRef`) has a leaf for exactly that many,
+     *      so a seat past it is one the door has no edition for (audit 1059
+     *      L-1). More seats than that is a new registration. Refused once
+     *      cancelled (terminal) or past the sales cutoff.
      */
     function setSupply(bytes32 eventId, uint64 supply) external {
         Event storage ev = _events[eventId];
         if (!ev.exists)                       revert EventNotFound();
         if (msg.sender != ev.registrant)      revert NotRegistrant();
+        if (!_registrantLive(msg.sender))     revert SponsorWithdrawn();
         if (ev.cancelled)                     revert AlreadyCancelled();
         if (block.timestamp >= ev.eventEndTs) revert SalesClosed();
         if (supply == ev.totalSupply)         revert SupplyUnchanged();
         if (supply == 0 || supply < ev.nextSlot) revert InsufficientSupply();
+        if (supply > ev.registeredSupply)     revert SupplyAboveRegistered();
 
         uint64 previous = ev.totalSupply;
         ev.totalSupply = supply;
@@ -768,20 +823,38 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     }
 
     /**
-     * @notice Move the sales cutoff LATER, for a postponed event. The
-     *         REGISTRANT only. Reopens sales on an event whose old cutoff has
-     *         passed. Never earlier: see the monotonicity note in the header.
+     * @notice Move the sales cutoff LATER, for a postponed event, while it is
+     *         still open. The REGISTRANT only and, if it was ever a sponsor,
+     *         only while it is a live one. Never earlier: see the monotonicity
+     *         note in the header.
+     * @dev Refused once the cutoff has passed (audit 1059 L-4): the cutoff is
+     *      the event's real end, so a postponement is known before it, and an
+     *      event that is over is registered again rather than reopened. At most
+     *      `MAX_SALES_EXTENSION` ahead of now (audit 1059 M-1).
      */
     function extendSalesEnd(bytes32 eventId, uint64 eventEndTs) external {
         Event storage ev = _events[eventId];
-        if (!ev.exists)                  revert EventNotFound();
-        if (msg.sender != ev.registrant) revert NotRegistrant();
-        if (ev.cancelled)                revert AlreadyCancelled();
-        if (eventEndTs <= ev.eventEndTs || eventEndTs <= block.timestamp) revert InvalidEventEnd();
+        if (!ev.exists)                       revert EventNotFound();
+        if (msg.sender != ev.registrant)      revert NotRegistrant();
+        if (!_registrantLive(msg.sender))     revert SponsorWithdrawn();
+        if (ev.cancelled)                     revert AlreadyCancelled();
+        if (block.timestamp >= ev.eventEndTs) revert SalesClosed();
+        // With the cutoff still ahead, later than it is later than now.
+        if (eventEndTs <= ev.eventEndTs)      revert InvalidEventEnd();
+        if (eventEndTs > block.timestamp + MAX_SALES_EXTENSION) revert SalesEndTooFar();
 
         uint64 previous = ev.eventEndTs;
         ev.eventEndTs = eventEndTs;
         emit SalesEndExtended(eventId, previous, eventEndTs);
+    }
+
+    /// @dev A registrant that was never a sponsor keeps its powers; one that was
+    ///      keeps them only while authorised with a cap above 0, the state in
+    ///      which it can also mint. Read at call time, so the order in which an
+    ///      address registered and became a sponsor does not matter.
+    function _registrantLive(address registrant) private view returns (bool) {
+        if (!wasSponsor[registrant]) return true;
+        return authorisedSponsors[registrant] && _mintAllowance[registrant].perHour != 0;
     }
 
     // ── Cancellation ──────────────────────────────────────────────────────────
@@ -1068,7 +1141,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     // ── Views ─────────────────────────────────────────────────────────────────
 
     /// @notice Core event params. `totalSupply` is the CURRENT supply
-    ///         (`setSupply` moves it); `manifestRef` is the one registered.
+    ///         (`setSupply` moves it, never above `getRegisteredSupply`);
+    ///         `manifestRef` is the one registered.
     /// @dev Same signature as version 1, so a reader written for it works here.
     function getEvent(bytes32 eventId)
         external
@@ -1139,11 +1213,19 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     }
 
     /// @notice The address that registered the event: the one that may change
-    ///         its supply and move its cutoff later.
+    ///         its supply and move its cutoff later, while live (`wasSponsor`).
     function getRegistrant(bytes32 eventId) external view returns (address) {
         Event storage ev = _events[eventId];
         if (!ev.exists) revert EventNotFound();
         return ev.registrant;
+    }
+
+    /// @notice The supply the event was registered with: the editions its
+    ///         `manifestRef` commits, and the most `setSupply` can set.
+    function getRegisteredSupply(bytes32 eventId) external view returns (uint64) {
+        Event storage ev = _events[eventId];
+        if (!ev.exists) revert EventNotFound();
+        return ev.registeredSupply;
     }
 
     /// @notice Slots remaining to be sold now: zero once the event is cancelled
@@ -1188,7 +1270,13 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      purpose (audit 960 I-3, 961 L-1): the emergency lever must stay
     ///      idempotent, so a Safe batch never reverts because a key was
     ///      already removed. `authorisedSponsors` is the state; the event is
-    ///      not proof a sponsor existed.
+    ///      not proof a sponsor existed. It never sets `wasSponsor`, so removing
+    ///      an address that never was one takes nothing from it.
+    ///
+    ///      Also ends the removed key's registrant powers over the events it
+    ///      registered (`setSupply`, `extendSalesEnd`): their terms stay as they
+    ///      are. To repair terms a key changed before it was removed, add it
+    ///      back with a cap of 1, set them right, and remove it again.
     function removeSponsor(address sponsor) external onlyOwner {
         authorisedSponsors[sponsor] = false;
         emit SponsorRemoved(sponsor);
@@ -1197,7 +1285,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice Retune an authorised sponsor's hourly cap. Takes effect on its
     ///         next mint; raising it lifts a refusal at once, and 0 stops the
     ///         sponsor minting without de-authorising it.
-    /// @dev Between finite caps it writes `perHour` only: the open window keeps
+    /// @dev 0 also pauses the sponsor's registrant powers over the events it
+    ///      registered, like `removeSponsor`. A cutoff that passes during the
+    ///      pause cannot be moved later afterwards (`extendSalesEnd` is refused
+    ///      once the cutoff has passed).
+    ///
+    ///      Between finite caps it writes `perHour` only: the open window keeps
     ///      its end and its count. Into or out of `UNLIMITED_MINTS` it closes the
     ///      window (audit 960 M-2).
     function setSponsorMintCap(address sponsor, uint32 perHour) external onlyOwner {
@@ -1279,6 +1372,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     function _addSponsor(address sponsor, uint32 perHour) private {
         if (sponsor == address(0)) revert ZeroAddress();
         authorisedSponsors[sponsor] = true;
+        wasSponsor[sponsor] = true;
         emit SponsorAdded(sponsor);
         _setMintCap(sponsor, perHour);
     }
