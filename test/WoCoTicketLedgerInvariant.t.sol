@@ -19,10 +19,11 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * caller, not a non-holder's signature, and not a signature already spent.
  * That is the sponsor-boundary guarantee the split exists for.
  *
- * The handler is an authorised sponsor AND the stamped organiser of every
- * event it registers, so it holds strictly MORE power than a real payments
- * contract would — it can cancel, which a sponsor cannot do on an event it did
- * not register. If the invariants hold for it, they hold for any sponsor.
+ * The handler is an authorised sponsor AND the stamped organiser of half the
+ * events it registers (a fixed address, `ORGANISER_B`, pranked, of the rest),
+ * so it holds strictly MORE power than a real payments contract would — it can
+ * cancel, which a sponsor cannot do on an event it did not register. If the
+ * invariants hold for it, they hold for any sponsor.
  *
  * VERSION 2 adds three moving parts, each with its own rule here: seats move
  * only through `setSupply` by the registrant, never below the slots minted and
@@ -30,13 +31,17 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * open and at most `MAX_SALES_EXTENSION` ahead of now; and a slot is re-pointed
  * by `reissue` only if it was minted bearer and no holder has moved it, in
  * place (no slot minted, no seat used), and never after `disableBearerMints`.
+ * The registrant role moves only as audit 1060's fix allows: to the organiser
+ * that takes it, or by the owner between the two sponsors here (the handler
+ * and `OTHER_SPONSOR`), never by anyone else, and never off an address that
+ * was never a sponsor. Every terms action calls as the current registrant.
  *
  * WHAT THIS CAMPAIGN DOES NOT COVER: the handler never calls
  * `forceCancelEvent`, `addSponsor`/`removeSponsor`, or `setDisputeAuthority`,
  * so these invariants say nothing about admin churn. That includes the rule
  * that a registrant which was ever a sponsor loses `setSupply` and
- * `extendSalesEnd` once withdrawn (`wasSponsor`): the handler stays a live
- * sponsor throughout. Those paths are covered by the unit suite instead. The
+ * `extendSalesEnd` once withdrawn (`wasSponsor`): both sponsors stay live
+ * throughout. Those paths are covered by the unit suite instead. The
  * signature ENCODING (domain, typehash, field
  * order) is pinned by WoCoTicketLedgerSignedTransfer.t.sol, not here: the
  * handler signs `transferSlotDigest` exactly as the contract computes it.
@@ -132,6 +137,42 @@ contract LedgerHandler is Test {
     bool public cutoffTooFarLanded;
     bool public lapsedCutoffExtended;
 
+    // ── the registrant role (audit 1060) ──────────────────────────────────────
+
+    /// The organiser of every event whose organiser is not the handler. Never a
+    /// sponsor, so the role it takes is its own for good.
+    address internal constant ORGANISER_B = address(0x0B0B);
+    /// Registers its own events: a registrant that was never a sponsor.
+    address internal constant NEVER_SPONSOR = address(0x5E1F);
+    /// The ledger's constructor sponsor (see setUp): the owner moves the role
+    /// between it and the handler. Both stay live throughout.
+    address internal constant OTHER_SPONSOR = address(0xDEAD);
+
+    /// The registrant each event must have: set at registration, and moved
+    /// only by the two role actions, when the move lands.
+    mapping(bytes32 => address) public expectedRegistrant;
+    /// Events whose registrant was never a sponsor: an organiser that took
+    /// the role, or `NEVER_SPONSOR`'s own registrations. Nothing moves them.
+    bytes32[] internal neverSponsorHeld;
+    uint256 public assumptionsMade;
+    uint256 public unauthorisedAssumeAttempts;
+    uint256 public reassignmentsMade;
+    uint256 public neverSponsorReassignAttempts;
+    uint256 public neverSponsorAssumeAttempts;
+    /// `setSupply`/`extendSalesEnd` landed from a registrant the role moved
+    /// to: the witness that the powers moved, not only the field.
+    uint256 public termsSetAfterHandover;
+    mapping(bytes32 => bool) internal roleMoved;
+    /// Set if anyone but the organiser took the role.
+    bool public registrantMovedByOutsider;
+    /// Set if the role of an event a never-sponsor holds moved.
+    bool public neverSponsorEventMoved;
+    /// Set if a move the rules allow, or terms from the registrant it moved
+    /// to, was refused.
+    bool public allowedMoveRefused;
+    /// Set if the handler set terms on an event whose role had moved off it.
+    bool public formerRegistrantKeptPowers;
+
     constructor(WoCoTicketLedger _ledger, address _ledgerOwner) {
         ledger = _ledger;
         ledgerOwner = _ledgerOwner;
@@ -152,18 +193,40 @@ contract LedgerHandler is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 endTs = uint64(block.timestamp + bound(endOffset, 1, 365 days));
 
-        // Handler is its own organiser, so it can also exercise cancelEvent.
-        bytes32 id = ledger.registerEvent(address(this), supply64, manifestRef, endTs);
+        // Handler is its own organiser on half, so it can exercise cancelEvent
+        // without a prank; `ORGANISER_B` takes the role of the other half.
+        address organiser = uint256(manifestRef) & 1 == 0 ? address(this) : ORGANISER_B;
+        bytes32 id = ledger.registerEvent(organiser, supply64, manifestRef, endTs);
+        _track(id, supply64, endTs, organiser, manifestRef, address(this));
+    }
 
+    function _track(
+        bytes32 id,
+        uint64 supply,
+        uint64 endTs,
+        address organiser,
+        bytes32 manifestRef,
+        address registrant
+    ) internal {
         eventIds.push(id);
         stamped[id] = Stamped({
-            totalSupply:   supply64,
+            totalSupply:   supply,
             eventEndTs:    endTs,
-            organiser:     address(this),
+            organiser:     organiser,
             manifestRef:   manifestRef,
             seenCancelled: false,
-            registeredSupply: supply64
+            registeredSupply: supply
         });
+        expectedRegistrant[id] = registrant;
+    }
+
+    /// A fresh open event the handler registers, named for `organiser`.
+    function _registerFresh(address organiser) internal returns (bytes32 id) {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 freshEnd = uint64(block.timestamp + 30 days);
+        bytes32 manifest = bytes32(uint256(7));
+        id = ledger.registerEvent(organiser, 100, manifest, freshEnd);
+        _track(id, 100, freshEnd, organiser, manifest, address(this));
     }
 
     function claimFor(uint256 eventIndex, address owner, bytes32 orderRef) external {
@@ -216,13 +279,9 @@ contract LedgerHandler is Test {
     /// asserts "changed only by its owner", not "never changed".
     function transferSlot(uint256 eventIndex, uint256 slotSeed, address newOwner) external {
         if (eventIds.length == 0) return;
-        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
-        uint256 count = seenSlotCount[id];
-        if (count == 0) return;
-
-        uint256 slot = bound(slotSeed, 0, count - 1);
+        (bytes32 id, uint256 slot) = _claimedSlot(eventIndex, slotSeed);
+        if (slot == type(uint256).max) return;
         address current = seenSlotOwner[id][slot];
-        if (current == address(0)) return;
         if (newOwner == address(0) || newOwner == current) return;
 
         vm.prank(current);
@@ -239,13 +298,10 @@ contract LedgerHandler is Test {
     /// revert; the invariant's job is to prove no state moved when it did.
     function transferSlotUnauthorised(uint256 eventIndex, uint256 slotSeed, address caller) external {
         if (eventIds.length == 0) return;
-        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
-        uint256 count = seenSlotCount[id];
-        if (count == 0) return;
-
-        uint256 slot = bound(slotSeed, 0, count - 1);
+        (bytes32 id, uint256 slot) = _claimedSlot(eventIndex, slotSeed);
+        if (slot == type(uint256).max) return;
         address current = seenSlotOwner[id][slot];
-        if (current == address(0) || caller == current || caller == address(0)) return;
+        if (caller == current || caller == address(0)) return;
 
         unauthorisedAttempts++;
         vm.prank(caller);
@@ -481,10 +537,11 @@ contract LedgerHandler is Test {
         } catch {}
     }
 
-    /// The handler registered every event, so it is the registrant.
+    /// As the current registrant, wherever the role has moved.
     function setSupply(uint256 eventIndex, uint256 supplySeed) external {
         if (eventIds.length == 0) return;
         bytes32 id = _openEvent(eventIndex);
+        address registrant = expectedRegistrant[id];
         (uint64 current, uint64 minted, , ) = ledger.getEvent(id);
         uint64 floor = minted == 0 ? 1 : minted;
         uint64 ceiling = stamped[id].registeredSupply;
@@ -495,6 +552,7 @@ contract LedgerHandler is Test {
             else if (current > floor) supply = current - 1;
             else return;
         }
+        vm.prank(registrant);
         try ledger.setSupply(id, supply) {
             stamped[id].totalSupply = supply;
             supplySets++;
@@ -512,6 +570,8 @@ contract LedgerHandler is Test {
         if (limit <= endTs) return;
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 newEnd = uint64(endTs + bound(offset, 1, limit - endTs));
+        address registrant = expectedRegistrant[id];
+        vm.prank(registrant);
         try ledger.extendSalesEnd(id, newEnd) {
             if (newEnd <= stamped[id].eventEndTs) cutoffMovedEarlier = true;
             stamped[id].eventEndTs = newEnd;
@@ -528,6 +588,7 @@ contract LedgerHandler is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 supply = stamped[id].registeredSupply + uint64(bound(overSeed, 1, 1000));
         aboveRegisteredAttempts++;
+        vm.prank(expectedRegistrant[id]);
         try ledger.setSupply(id, supply) {
             supplyAboveRegisteredLanded = true;
         } catch {}
@@ -540,6 +601,7 @@ contract LedgerHandler is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 newEnd = uint64(block.timestamp + ledger.MAX_SALES_EXTENSION() + bound(overSeed, 1, 365 days));
         tooFarAttempts++;
+        vm.prank(expectedRegistrant[id]);
         try ledger.extendSalesEnd(id, newEnd) {
             cutoffTooFarLanded = true;
         } catch {}
@@ -568,20 +630,13 @@ contract LedgerHandler is Test {
             uint64 end = uint64(block.timestamp + 1);
             bytes32 manifest = bytes32(uint256(8));
             id = ledger.registerEvent(address(this), 10, manifest, end);
-            eventIds.push(id);
-            stamped[id] = Stamped({
-                totalSupply:   10,
-                eventEndTs:    end,
-                organiser:     address(this),
-                manifestRef:   manifest,
-                seenCancelled: false,
-                registeredSupply: 10
-            });
+            _track(id, 10, end, address(this), manifest, address(this));
             vm.warp(end);
         }
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 newEnd = uint64(block.timestamp + bound(offset, 1, 365 days));
         lapsedExtendAttempts++;
+        vm.prank(expectedRegistrant[id]);
         try ledger.extendSalesEnd(id, newEnd) {
             lapsedCutoffExtended = true;
         } catch {}
@@ -605,20 +660,186 @@ contract LedgerHandler is Test {
         (uint64 endTs, bool cancelled) = ledger.getEventStatus(id);
         (uint64 supply, uint64 minted, , ) = ledger.getEvent(id);
         if (!cancelled && block.timestamp < endTs && minted < supply) return id;
+        id = _registerFresh(address(this));
+    }
 
+    // ── the registrant role (audit 1060) ──────────────────────────────────────
+
+    /// The organiser takes the role, of the first event from the pick on whose
+    /// role can move to its organiser (it does not hold it, and the registrant
+    /// was ever a sponsor). With none, a fresh event naming `ORGANISER_B`, so
+    /// the witness never starves.
+    function assumeRegistrant(uint256 eventIndex) external {
+        if (eventIds.length == 0) return;
+        uint256 n = eventIds.length;
+        uint256 start = bound(eventIndex, 0, n - 1);
+        bytes32 id;
+        bool found;
+        for (uint256 k; k < n; ++k) {
+            bytes32 candidate = eventIds[(start + k) % n];
+            address current = expectedRegistrant[candidate];
+            if (stamped[candidate].organiser != current && ledger.wasSponsor(current)) {
+                id = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found) id = _registerFresh(ORGANISER_B);
+        _assume(id);
+    }
+
+    function _assume(bytes32 id) internal {
+        address organiser = stamped[id].organiser;
+        vm.prank(organiser);
+        try ledger.assumeRegistrant(id) {
+            expectedRegistrant[id] = organiser;
+            roleMoved[id] = true;
+            if (!ledger.wasSponsor(organiser)) neverSponsorHeld.push(id);
+            assumptionsMade++;
+        } catch {
+            allowedMoveRefused = true;
+        }
+    }
+
+    /// Terms set by a registrant the role moved to land, and the handler, when
+    /// it no longer holds the role, is refused. On an open event whose role has
+    /// moved; with none, a fresh one whose role is moved first (to its
+    /// organiser or to `OTHER_SPONSOR`, by the seed), so the witness never
+    /// starves.
+    function setSupplyAfterHandover(uint256 eventIndex, uint256 supplySeed) external {
+        if (eventIds.length == 0) return;
+        uint256 n = eventIds.length;
+        uint256 start = bound(eventIndex, 0, n - 1);
+        bytes32 id;
+        bool found;
+        for (uint256 k; k < n; ++k) {
+            bytes32 candidate = eventIds[(start + k) % n];
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(candidate);
+            if (roleMoved[candidate] && !cancelled && block.timestamp < endTs) {
+                id = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (supplySeed & 1 == 0) {
+                id = _registerFresh(ORGANISER_B);
+                _assume(id);
+            } else {
+                id = _registerFresh(address(this));
+                _reassign(id, OTHER_SPONSOR);
+            }
+        }
+
+        address registrant = expectedRegistrant[id];
+        (uint64 current, uint64 minted, , ) = ledger.getEvent(id);
+        uint64 floor = minted == 0 ? 1 : minted;
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 freshEnd = uint64(block.timestamp + 30 days);
-        bytes32 manifest = bytes32(uint256(7));
-        id = ledger.registerEvent(address(this), 100, manifest, freshEnd);
-        eventIds.push(id);
-        stamped[id] = Stamped({
-            totalSupply:   100,
-            eventEndTs:    freshEnd,
-            organiser:     address(this),
-            manifestRef:   manifest,
-            seenCancelled: false,
-            registeredSupply: 100
-        });
+        uint64 supply = uint64(bound(supplySeed, floor, stamped[id].registeredSupply));
+        if (supply == current) {
+            if (current < stamped[id].registeredSupply) supply = current + 1;
+            else if (current > floor) supply = current - 1;
+            else return;
+        }
+        if (registrant != address(this)) {
+            try ledger.setSupply(id, supply) {
+                formerRegistrantKeptPowers = true;
+            } catch {}
+        }
+        vm.prank(registrant);
+        try ledger.setSupply(id, supply) {
+            stamped[id].totalSupply = supply;
+            supplySets++;
+            termsSetAfterHandover++;
+        } catch {
+            allowedMoveRefused = true;
+        }
+    }
+
+    /// Anyone but the organiser tries to take the role. Must always revert.
+    function assumeRegistrantUnauthorised(uint256 eventIndex, address caller) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        if (caller == stamped[id].organiser) return;
+        unauthorisedAssumeAttempts++;
+        vm.prank(caller);
+        try ledger.assumeRegistrant(id) {
+            registrantMovedByOutsider = true;
+        } catch {}
+    }
+
+    /// The owner moves the role between the handler and `OTHER_SPONSOR`. When
+    /// the picked event's registrant was never a sponsor, a fresh event is
+    /// used, so the witness never starves.
+    function reassignRegistrant(uint256 eventIndex) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        address current = expectedRegistrant[id];
+        if (!ledger.wasSponsor(current)) {
+            id = _registerFresh(address(this));
+            current = address(this);
+        }
+        _reassign(id, current == address(this) ? OTHER_SPONSOR : address(this));
+    }
+
+    function _reassign(bytes32 id, address to) internal {
+        vm.prank(ledgerOwner);
+        try ledger.reassignRegistrant(_one(id), to) {
+            expectedRegistrant[id] = to;
+            roleMoved[id] = true;
+            reassignmentsMade++;
+        } catch {
+            allowedMoveRefused = true;
+        }
+    }
+
+    /// `NEVER_SPONSOR` registers its own event, naming `ORGANISER_B`.
+    function registerAsNeverSponsor(uint256 supply, uint256 endOffset) external {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        _registerAsNeverSponsor(uint64(bound(supply, 1, 500)), endOffset);
+    }
+
+    function _registerAsNeverSponsor(uint64 supply, uint256 endOffset) internal returns (bytes32 id) {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 endTs = uint64(block.timestamp + bound(endOffset, 1, 365 days));
+        bytes32 manifest = bytes32(uint256(11));
+        vm.prank(NEVER_SPONSOR);
+        id = ledger.registerEvent(ORGANISER_B, supply, manifest, endTs);
+        _track(id, supply, endTs, ORGANISER_B, manifest, NEVER_SPONSOR);
+        neverSponsorHeld.push(id);
+    }
+
+    /// Always refused: the owner moving the role of an event a never-sponsor
+    /// holds.
+    function reassignNeverSponsorEvent(uint256 pick, uint256 endOffset) external {
+        bytes32 id = _neverSponsorEvent(pick, endOffset);
+        address to = expectedRegistrant[id] == address(this) ? OTHER_SPONSOR : address(this);
+        neverSponsorReassignAttempts++;
+        vm.prank(ledgerOwner);
+        try ledger.reassignRegistrant(_one(id), to) {
+            neverSponsorEventMoved = true;
+        } catch {}
+    }
+
+    /// Always refused: the organiser taking the role of an event a
+    /// never-sponsor holds (its own, or `NEVER_SPONSOR`'s).
+    function assumeNeverSponsorEvent(uint256 pick, uint256 endOffset) external {
+        bytes32 id = _neverSponsorEvent(pick, endOffset);
+        neverSponsorAssumeAttempts++;
+        vm.prank(stamped[id].organiser);
+        try ledger.assumeRegistrant(id) {
+            neverSponsorEventMoved = true;
+        } catch {}
+    }
+
+    function _neverSponsorEvent(uint256 pick, uint256 endOffset) internal returns (bytes32) {
+        if (neverSponsorHeld.length == 0) return _registerAsNeverSponsor(10, endOffset);
+        return neverSponsorHeld[bound(pick, 0, neverSponsorHeld.length - 1)];
+    }
+
+    function _one(bytes32 id) internal pure returns (bytes32[] memory ids) {
+        ids = new bytes32[](1);
+        ids[0] = id;
     }
 
     function _recordBearer(bytes32 id, uint256 slot, address owner) internal {
@@ -632,6 +853,7 @@ contract LedgerHandler is Test {
         if (eventIds.length == 0) return;
         bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
 
+        vm.prank(stamped[id].organiser);
         try ledger.cancelEvent(id) {
             stamped[id].seenCancelled = true;
         } catch {}
@@ -639,6 +861,25 @@ contract LedgerHandler is Test {
 
     function warp(uint256 secondsForward) external {
         vm.warp(block.timestamp + bound(secondsForward, 1, 30 days));
+    }
+
+    /// A claimed slot to move: the pick if it is one, else one minted on an
+    /// open event in the same call, so the transfer witnesses never starve as
+    /// the action list grows (#31). `type(uint256).max` if even the mint fails.
+    function _claimedSlot(uint256 eventIndex, uint256 slotSeed) internal returns (bytes32 id, uint256 slot) {
+        id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        uint256 count = seenSlotCount[id];
+        if (count > 0) {
+            slot = bound(slotSeed, 0, count - 1);
+            if (seenSlotOwner[id][slot] != address(0)) return (id, slot);
+        }
+        id = _openEvent(eventIndex);
+        try ledger.claimFor(id, address(0x3), bytes32(uint256(10))) returns (uint256 s) {
+            _recordSlot(id, s, address(0x3));
+            slot = s;
+        } catch {
+            slot = type(uint256).max;
+        }
     }
 
     function _recordSlot(bytes32 id, uint256 slot, address owner) internal {
@@ -694,14 +935,21 @@ contract WoCoTicketLedgerInvariantTest is Test {
 
     /// Terms change only as version 2 allows: supply only by `setSupply` and
     /// the cutoff only later by `extendSalesEnd` (the handler tracks both),
-    /// organiser, manifest and registrant never. Nothing a sponsor, an
-    /// organiser, or the passage of time does may reinterpret them otherwise.
+    /// organiser and manifest never, and the registrant only by the
+    /// organiser's own `assumeRegistrant` or the owner's `reassignRegistrant`
+    /// between sponsors, never off a never-sponsor (audit 1060). Nothing a
+    /// sponsor, an organiser, or the passage of time does may reinterpret them
+    /// otherwise.
     /// forge-config: default.invariant.runs = 64
     function invariant_TermsMoveOnlyAsAllowed() public view {
         assertFalse(handler.cutoffMovedEarlier(), "the sales cutoff moved earlier");
         assertFalse(handler.supplyAboveRegisteredLanded(), "supply was set above the registered supply");
         assertFalse(handler.cutoffTooFarLanded(), "a cutoff moved past MAX_SALES_EXTENSION");
         assertFalse(handler.lapsedCutoffExtended(), "a cutoff that had passed was moved");
+        assertFalse(handler.registrantMovedByOutsider(), "someone but the organiser took the registrant role");
+        assertFalse(handler.neverSponsorEventMoved(), "the role moved off a registrant that was never a sponsor");
+        assertFalse(handler.allowedMoveRefused(), "a registrant move the rules allow was refused");
+        assertFalse(handler.formerRegistrantKeptPowers(), "a key the role moved off still set terms");
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
             bytes32 id = handler.eventIds(i);
@@ -717,7 +965,7 @@ contract WoCoTicketLedgerInvariantTest is Test {
             assertEq(org,         sOrg,      "organiser changed after registration");
             assertEq(manifest,    sManifest, "manifestRef changed after registration");
             assertEq(endTs,       sEndTs,    "eventEndTs moved other than by extendSalesEnd");
-            assertEq(registrant,  address(handler), "registrant changed after registration");
+            assertEq(registrant,  handler.expectedRegistrant(id), "registrant moved other than as allowed");
         }
     }
 
@@ -800,6 +1048,12 @@ contract WoCoTicketLedgerInvariantTest is Test {
         assertGt(handler.aboveRegisteredAttempts(), 0, "campaign never tried a supply above the registered one");
         assertGt(handler.tooFarAttempts(), 0, "campaign never tried a cutoff past MAX_SALES_EXTENSION");
         assertGt(handler.lapsedExtendAttempts(), 0, "campaign never tried to move a cutoff that had passed");
+        assertGt(handler.assumptionsMade(), 0, "campaign never had an organiser take the registrant role");
+        assertGt(handler.unauthorisedAssumeAttempts(), 0, "campaign never tried a non-organiser assumeRegistrant");
+        assertGt(handler.reassignmentsMade(), 0, "campaign never exercised reassignRegistrant");
+        assertGt(handler.neverSponsorReassignAttempts(), 0, "campaign never tried to reassign a never-sponsor's event");
+        assertGt(handler.neverSponsorAssumeAttempts(), 0, "campaign never tried to take a never-sponsor's event");
+        assertGt(handler.termsSetAfterHandover(), 0, "campaign never changed terms from a registrant the role moved to");
     }
 
     /// A slot's owner changes ONLY through a transfer its own owner authorised —
