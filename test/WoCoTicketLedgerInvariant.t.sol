@@ -25,26 +25,26 @@ import {WoCoTicketLedger} from "../src/WoCoTicketLedger.sol";
  * cancel, which a sponsor cannot do on an event it did not register. If the
  * invariants hold for it, they hold for any sponsor.
  *
- * VERSION 2 adds three moving parts, each with its own rule here: seats move
- * only through `setSupply` by the registrant, never below the slots minted and
- * never above the registered supply; the cutoff moves only later, only while
- * open and at most `MAX_SALES_EXTENSION` ahead of now; and a slot is re-pointed
- * by `reissue` only if it was minted bearer and no holder has moved it, in
- * place (no slot minted, no seat used), and never after `disableBearerMints`.
- * The registrant role moves only as audit 1060's fix allows: to the organiser
- * that takes it, or by the owner between the two sponsors here (the handler
- * and `OTHER_SPONSOR`), never by anyone else, and never off an address that
- * was never a sponsor. Every terms action calls as the current registrant.
+ * VERSION 2 adds moving parts, each with its own rule here: supply moves only
+ * through `setSupply`, never below the slots minted and never above the
+ * registered supply; the cutoff moves only later, only while open and at most
+ * `MAX_SALES_EXTENSION` ahead of now; and a slot is re-pointed by `reissue`
+ * only if it was minted bearer and no holder has moved it, in place (no slot
+ * minted, no supply used), and never after `disableBearerMints`. Terms change
+ * only on the ORGANISER's authority: its account or its current key, sending
+ * the call or signing it for any submitter; never a stranger, a sponsor that
+ * is not the organiser, a key it rotated away from, or a spent signature. The
+ * key moves only by the organiser's account (`setOrganiserKey`). On a SEATED
+ * event no seat is ever held by two tickets, the seat bitmap is exactly the
+ * seats tickets hold, and a seat moves only on the organiser key's consent
+ * (plus the holder's, through `reseat`).
  *
  * WHAT THIS CAMPAIGN DOES NOT COVER: the handler never calls
  * `forceCancelEvent`, `addSponsor`/`removeSponsor`, or `setDisputeAuthority`,
- * so these invariants say nothing about admin churn. That includes the rule
- * that a registrant which was ever a sponsor loses `setSupply` and
- * `extendSalesEnd` once withdrawn (`wasSponsor`): both sponsors stay live
- * throughout. Those paths are covered by the unit suite instead. The
- * signature ENCODING (domain, typehash, field
- * order) is pinned by WoCoTicketLedgerSignedTransfer.t.sol, not here: the
- * handler signs `transferSlotDigest` exactly as the contract computes it.
+ * so these invariants say nothing about admin churn. Those paths are covered
+ * by the unit suite instead. The signature ENCODINGS (domain, typehashes,
+ * field order) are pinned by the unit suites, not here: the handler signs the
+ * contract's own digest views exactly as the contract computes them.
  *
  * Kept in its own file because invariant campaigns are slow; the unit suites
  * run in milliseconds and stay the fast feedback loop.
@@ -137,47 +137,75 @@ contract LedgerHandler is Test {
     bool public cutoffTooFarLanded;
     bool public lapsedCutoffExtended;
 
-    // ── the registrant role (audit 1060) ──────────────────────────────────────
+    // ── the organiser's authority ──────────────────────────────────────────────
 
-    /// The organiser of every event whose organiser is not the handler. Never a
-    /// sponsor, so the role it takes is its own for good.
+    /// The organiser of every event whose organiser is not the handler.
     address internal constant ORGANISER_B = address(0x0B0B);
-    /// Registers its own events: a registrant that was never a sponsor.
-    address internal constant NEVER_SPONSOR = address(0x5E1F);
-    /// The ledger's constructor sponsor (see setUp): the owner moves the role
-    /// between it and the handler. Both stay live throughout.
-    address internal constant OTHER_SPONSOR = address(0xDEAD);
+    /// Organiser keys the handler can sign with; events start on one and
+    /// rotate among them (`rotateKey`).
+    uint256[] internal orgKeys;
 
-    /// The registrant each event must have: set at registration, and moved
-    /// only by the two role actions, when the move lands.
-    mapping(bytes32 => address) public expectedRegistrant;
-    /// Events whose registrant was never a sponsor: an organiser that took
-    /// the role, or `NEVER_SPONSOR`'s own registrations. Nothing moves them.
-    bytes32[] internal neverSponsorHeld;
-    uint256 public assumptionsMade;
-    uint256 public unauthorisedAssumeAttempts;
-    uint256 public reassignmentsMade;
-    uint256 public neverSponsorReassignAttempts;
-    uint256 public neverSponsorAssumeAttempts;
-    /// `setSupply`/`extendSalesEnd` landed from a registrant the role moved
-    /// to: the witness that the powers moved, not only the field.
-    uint256 public termsSetAfterHandover;
-    mapping(bytes32 => bool) internal roleMoved;
-    /// Set if anyone but the organiser took the role.
-    bool public registrantMovedByOutsider;
-    /// Set if the role of an event a never-sponsor holds moved.
-    bool public neverSponsorEventMoved;
-    /// Set if a move the rules allow, or terms from the registrant it moved
-    /// to, was refused.
-    bool public allowedMoveRefused;
-    /// Set if the handler set terms on an event whose role had moved off it.
-    bool public formerRegistrantKeptPowers;
+    /// The organiser key each event must have: set at registration, moved
+    /// only by `rotateKey` when the organiser's `setOrganiserKey` lands.
+    mapping(bytes32 => address) public expectedKey;
+    /// A key the event's key rotated away from, kept to prove it lost its power.
+    mapping(bytes32 => uint256) internal retiredKey;
+    bytes32[] internal rotatedEvents;
+
+    uint256 public signedTermsMade;
+    uint256 public directKeyTermsMade;
+    uint256 public keyRotations;
+    uint256 public unauthorisedTermsAttempts;
+    uint256 public retiredKeyAttempts;
+    uint256 public termsReplayAttempts;
+    uint256 public outsiderKeyMoveAttempts;
+    /// Set if a terms write landed without the organiser's authority: a
+    /// stranger, a non-organiser sponsor, a retired key, a spent signature.
+    bool public unauthorisedTermsLanded;
+    /// Set if anyone but the organiser's account moved its key.
+    bool public keyMovedByOutsider;
+
+    /// The last signed `setSupply`, kept to replay.
+    struct SpentTerms {
+        bytes32 eventId;
+        uint64  supply;
+        uint256 deadline;
+        bytes   sig;
+    }
+
+    SpentTerms internal lastSpentTerms;
+    bool internal hasSpentTerms;
+
+    // ── seats ─────────────────────────────────────────────────────────────────
+
+    bytes32[] public seatedIds;
+    mapping(bytes32 => bool) public seated;
+    /// Seat + 1 per slot as the handler saw it land; 0 = no seat.
+    mapping(bytes32 => mapping(uint256 => uint256)) public seenSeat;
+    /// Seated slots minted to an actor key, so `reseat` has holders that sign.
+    bytes32[] internal actorSeatEvent;
+    uint256[] internal actorSeatSlot;
+
+    uint256 public seatMints;
+    uint256 public takenSeatAttempts;
+    uint256 public bearerReseats;
+    uint256 public holderReseats;
+    uint256 public unauthorisedReseatAttempts;
+    uint256 public kindMismatchAttempts;
+    /// Set if a mint landed on a seat a ticket held, a seat moved without the
+    /// organiser key (and, for a held slot, the holder), or a mint path
+    /// landed on the other kind of event.
+    bool public seatRuleBroken;
 
     constructor(WoCoTicketLedger _ledger, address _ledgerOwner) {
         ledger = _ledger;
         ledgerOwner = _ledgerOwner;
         for (uint256 k = 0xA1; k <= 0xA4; ++k) {
             actorKeys.push(k);
+            keyOf[vm.addr(k)] = k;
+        }
+        for (uint256 k = 0xB1; k <= 0xB3; ++k) {
+            orgKeys.push(k);
             keyOf[vm.addr(k)] = k;
         }
     }
@@ -194,10 +222,15 @@ contract LedgerHandler is Test {
         uint64 endTs = uint64(block.timestamp + bound(endOffset, 1, 365 days));
 
         // Handler is its own organiser on half, so it can exercise cancelEvent
-        // without a prank; `ORGANISER_B` takes the role of the other half.
+        // without a prank; `ORGANISER_B` is the organiser of the other half.
+        // Bit 1 picks a seated registration, so both kinds share every action.
         address organiser = uint256(manifestRef) & 1 == 0 ? address(this) : ORGANISER_B;
-        bytes32 id = ledger.registerEvent(organiser, supply64, manifestRef, endTs);
-        _track(id, supply64, endTs, organiser, manifestRef, address(this));
+        address key = vm.addr(orgKeys[uint256(manifestRef) % orgKeys.length]);
+        bool asSeated = uint256(manifestRef) & 2 != 0;
+        bytes32 id = asSeated
+            ? ledger.registerSeatedEvent(organiser, key, supply64, manifestRef, endTs)
+            : ledger.registerEvent(organiser, key, supply64, manifestRef, endTs);
+        _track(id, supply64, endTs, organiser, manifestRef, key, asSeated);
     }
 
     function _track(
@@ -206,7 +239,8 @@ contract LedgerHandler is Test {
         uint64 endTs,
         address organiser,
         bytes32 manifestRef,
-        address registrant
+        address key,
+        bool asSeated
     ) internal {
         eventIds.push(id);
         stamped[id] = Stamped({
@@ -217,16 +251,31 @@ contract LedgerHandler is Test {
             seenCancelled: false,
             registeredSupply: supply
         });
-        expectedRegistrant[id] = registrant;
+        expectedKey[id] = key;
+        if (asSeated) {
+            seated[id] = true;
+            seatedIds.push(id);
+        }
     }
 
-    /// A fresh open event the handler registers, named for `organiser`.
+    /// A fresh open GA event the handler registers, named for `organiser`.
     function _registerFresh(address organiser) internal returns (bytes32 id) {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 freshEnd = uint64(block.timestamp + 30 days);
         bytes32 manifest = bytes32(uint256(7));
-        id = ledger.registerEvent(organiser, 100, manifest, freshEnd);
-        _track(id, 100, freshEnd, organiser, manifest, address(this));
+        address key = vm.addr(orgKeys[0]);
+        id = ledger.registerEvent(organiser, key, 100, manifest, freshEnd);
+        _track(id, 100, freshEnd, organiser, manifest, key, false);
+    }
+
+    /// A fresh open SEATED event, organised by the handler.
+    function _registerFreshSeated() internal returns (bytes32 id) {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 freshEnd = uint64(block.timestamp + 30 days);
+        bytes32 manifest = bytes32(uint256(11));
+        address key = vm.addr(orgKeys[1]);
+        id = ledger.registerSeatedEvent(address(this), key, 300, manifest, freshEnd);
+        _track(id, 300, freshEnd, address(this), manifest, key, true);
     }
 
     function claimFor(uint256 eventIndex, address owner, bytes32 orderRef) external {
@@ -235,6 +284,7 @@ contract LedgerHandler is Test {
         if (owner == address(0)) owner = address(0x1);
 
         try ledger.claimFor(id, owner, orderRef) returns (uint256 slot) {
+            if (seated[id]) seatRuleBroken = true;
             _recordSlot(id, slot, owner);
         } catch {
             // Reverts are expected (sold out, cancelled, past cutoff) and are
@@ -250,6 +300,7 @@ contract LedgerHandler is Test {
         address actor = vm.addr(actorKeys[bound(actorSeed, 0, actorKeys.length - 1)]);
 
         try ledger.claimFor(id, actor, orderRef) returns (uint256 slot) {
+            if (seated[id]) seatRuleBroken = true;
             _recordSlot(id, slot, actor);
             actorSlotEvent.push(id);
             actorSlotIndex.push(slot);
@@ -268,6 +319,7 @@ contract LedgerHandler is Test {
         for (uint256 i; i < count; ++i) owners[i] = owner;
 
         try ledger.batchClaimFor(id, owners, orderRef) returns (uint256 first) {
+            if (seated[id]) seatRuleBroken = true;
             for (uint256 i; i < count; ++i) _recordSlot(id, first + i, owner);
         } catch {
             // See claimFor.
@@ -446,6 +498,7 @@ contract LedgerHandler is Test {
 
         try ledger.batchClaimBearer(id, owners, orderRef) returns (uint256 first) {
             if (bearerMintsSeenDisabled) forbiddenReissue = true;
+            if (seated[id]) seatRuleBroken = true;
             for (uint256 i; i < count; ++i) _recordBearer(id, first + i, owner);
         } catch {
             // See claimFor.
@@ -470,7 +523,7 @@ contract LedgerHandler is Test {
             found = !seenMoved[id][slot] && !cancelled && block.timestamp < endTs;
         }
         if (!found) {
-            id = _openEvent(eventIndex);
+            id = _openGaEvent(eventIndex);
             address[] memory one = new address[](1);
             one[0] = address(0x3);
             try ledger.batchClaimBearer(id, one, bytes32(uint256(5))) returns (uint256 first) {
@@ -517,7 +570,7 @@ contract LedgerHandler is Test {
             eligible = seenBearer[id][slot] && !seenMoved[id][slot] && !bearerMintsSeenDisabled;
         }
         if (eligible) {
-            id = _openEvent(eventIndex);
+            id = _openGaEvent(eventIndex);
             try ledger.claimFor(id, address(0x3), bytes32(uint256(6))) returns (uint256 s) {
                 _recordSlot(id, s, address(0x3));
                 slot = s;
@@ -537,31 +590,56 @@ contract LedgerHandler is Test {
         } catch {}
     }
 
-    /// As the current registrant, wherever the role has moved.
-    function setSupply(uint256 eventIndex, uint256 supplySeed) external {
-        if (eventIds.length == 0) return;
-        bytes32 id = _openEvent(eventIndex);
-        address registrant = expectedRegistrant[id];
+    /// A supply the event can take now, or 0 if none differs from the current.
+    function _nextSupply(bytes32 id, uint256 supplySeed) internal view returns (uint64 supply) {
         (uint64 current, uint64 minted, , ) = ledger.getEvent(id);
         uint64 floor = minted == 0 ? 1 : minted;
         uint64 ceiling = stamped[id].registeredSupply;
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 supply = uint64(bound(supplySeed, floor, ceiling));
+        supply = uint64(bound(supplySeed, floor, ceiling));
         if (supply == current) {
             if (current < ceiling) supply = current + 1;
             else if (current > floor) supply = current - 1;
-            else return;
-        }
-        vm.prank(registrant);
-        try ledger.setSupply(id, supply) {
-            stamped[id].totalSupply = supply;
-            supplySets++;
-        } catch {
-            // See claimFor: closed, cancelled or unchanged.
+            else return 0;
         }
     }
 
-    function extendSalesEnd(uint256 eventIndex, uint256 offset) external {
+    /// On the organiser's authority, by one of its three roads picked by
+    /// `road`: its account sending the call, its key sending it, or its key's
+    /// signature handed in by any submitter.
+    function setSupply(uint256 eventIndex, uint256 supplySeed, uint256 road, address submitter) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = _openEvent(eventIndex);
+        uint64 supply = _nextSupply(id, supplySeed);
+        if (supply == 0) return;
+        uint256 r = road % 3;
+        bool landed;
+        if (r == 2) {
+            uint256 deadline = block.timestamp + 1 hours;
+            bytes memory sig = _sign(keyOf[expectedKey[id]], ledger.setSupplyDigest(id, supply, deadline));
+            if (submitter == address(0)) submitter = address(0xCAFE);
+            vm.prank(submitter);
+            try ledger.setSupplyWithSignature(id, supply, deadline, sig) {
+                landed = true;
+                signedTermsMade++;
+                lastSpentTerms = SpentTerms({eventId: id, supply: supply, deadline: deadline, sig: sig});
+                hasSpentTerms = true;
+            } catch {}
+        } else {
+            vm.prank(r == 0 ? stamped[id].organiser : expectedKey[id]);
+            try ledger.setSupply(id, supply) {
+                landed = true;
+                if (r == 1) directKeyTermsMade++;
+            } catch {}
+        }
+        if (landed) {
+            stamped[id].totalSupply = supply;
+            supplySets++;
+        }
+    }
+
+    /// As `setSupply`: the account or the key directly, or the key's signature.
+    function extendSalesEnd(uint256 eventIndex, uint256 offset, uint256 road, address submitter) external {
         if (eventIds.length == 0) return;
         bytes32 id = _openEvent(eventIndex);
         // `_openEvent` returns an event whose cutoff is still ahead.
@@ -570,14 +648,429 @@ contract LedgerHandler is Test {
         if (limit <= endTs) return;
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 newEnd = uint64(endTs + bound(offset, 1, limit - endTs));
-        address registrant = expectedRegistrant[id];
-        vm.prank(registrant);
-        try ledger.extendSalesEnd(id, newEnd) {
+        uint256 r = road % 3;
+        bool landed;
+        if (r == 2) {
+            uint256 deadline = block.timestamp + 1 hours;
+            bytes memory sig = _sign(keyOf[expectedKey[id]], ledger.extendSalesEndDigest(id, newEnd, deadline));
+            if (submitter == address(0)) submitter = address(0xCAFE);
+            vm.prank(submitter);
+            try ledger.extendSalesEndWithSignature(id, newEnd, deadline, sig) {
+                landed = true;
+                signedTermsMade++;
+            } catch {}
+        } else {
+            vm.prank(r == 0 ? stamped[id].organiser : expectedKey[id]);
+            try ledger.extendSalesEnd(id, newEnd) {
+                landed = true;
+                if (r == 1) directKeyTermsMade++;
+            } catch {}
+        }
+        if (landed) {
             if (newEnd <= stamped[id].eventEndTs) cutoffMovedEarlier = true;
             stamped[id].eventEndTs = newEnd;
             cutoffExtensions++;
-        } catch {
-            // See claimFor: cancelled.
+        }
+    }
+
+    /// Terms attempted WITHOUT the organiser's authority: a stranger or a
+    /// sponsor sending it, a signature from a key that is not the event's, or
+    /// a signature from a key it rotated away from. Must always revert.
+    function termsUnauthorised(uint256 eventIndex, uint256 supplySeed, uint256 road, address caller) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = _openEvent(eventIndex);
+        uint64 supply = _nextSupply(id, supplySeed);
+        if (supply == 0) return;
+        uint256 r = road % 3;
+        if (r == 0) {
+            if (caller == stamped[id].organiser || caller == expectedKey[id]) caller = address(0xBAD);
+            unauthorisedTermsAttempts++;
+            vm.prank(caller);
+            try ledger.setSupply(id, supply) {
+                unauthorisedTermsLanded = true;
+            } catch {}
+            // The handler is a sponsor: being one is no authority either.
+            if (stamped[id].organiser != address(this)) {
+                unauthorisedTermsAttempts++;
+                try ledger.cancelEvent(id) {
+                    unauthorisedTermsLanded = true;
+                } catch {}
+            }
+        } else {
+            // An actor key: never an organiser key here.
+            uint256 wrong = actorKeys[bound(supplySeed, 0, actorKeys.length - 1)];
+            unauthorisedTermsAttempts++;
+            uint256 deadline = block.timestamp + 1 hours;
+            bytes memory sig = _sign(wrong, ledger.setSupplyDigest(id, supply, deadline));
+            vm.prank(caller == address(0) ? address(0xCAFE) : caller);
+            try ledger.setSupplyWithSignature(id, supply, deadline, sig) {
+                unauthorisedTermsLanded = true;
+            } catch {}
+        }
+    }
+
+    /// A signature from a key the event's key was rotated away from: from a
+    /// rotated event still open, else one rotated in this same call. Must
+    /// always revert.
+    function termsByRetiredKey(uint256 pick, uint256 supplySeed, address submitter) external {
+        bytes32 id;
+        bool found;
+        if (rotatedEvents.length > 0) {
+            id = rotatedEvents[bound(pick, 0, rotatedEvents.length - 1)];
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(id);
+            found = !cancelled && block.timestamp < endTs && vm.addr(retiredKey[id]) != expectedKey[id]
+                && _nextSupply(id, supplySeed) != 0;
+        }
+        if (!found) {
+            id = _registerFresh(address(this));
+            bytes32[] memory ids = new bytes32[](1);
+            ids[0] = id;
+            address next = vm.addr(orgKeys[2]);
+            ledger.setOrganiserKey(ids, next);
+            retiredKey[id] = keyOf[expectedKey[id]];
+            rotatedEvents.push(id);
+            expectedKey[id] = next;
+            keyRotations++;
+        }
+        uint64 supply = _nextSupply(id, supplySeed);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _sign(retiredKey[id], ledger.setSupplyDigest(id, supply, deadline));
+        retiredKeyAttempts++;
+        vm.prank(submitter == address(0) ? address(0xCAFE) : submitter);
+        try ledger.setSupplyWithSignature(id, supply, deadline, sig) {
+            unauthorisedTermsLanded = true;
+        } catch {}
+    }
+
+    /// Hand in again the last signed `setSupply`. Its nonce is consumed, so it
+    /// must never land twice, even once the supply is back where it signed for.
+    function replaySpentTerms(address submitter) external {
+        SpentTerms memory s = lastSpentTerms;
+        bool live;
+        if (hasSpentTerms) {
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(s.eventId);
+            live = block.timestamp <= s.deadline && !cancelled && block.timestamp < endTs;
+        }
+        // No live spent signature: spend one in this same call.
+        if (!live) {
+            bytes32 fresh = _registerFresh(address(this));
+            uint64 target = _nextSupply(fresh, 50);
+            uint256 deadline = block.timestamp + 1 hours;
+            bytes memory sig = _sign(keyOf[expectedKey[fresh]], ledger.setSupplyDigest(fresh, target, deadline));
+            try ledger.setSupplyWithSignature(fresh, target, deadline, sig) {
+                stamped[fresh].totalSupply = target;
+                supplySets++;
+                signedTermsMade++;
+            } catch {
+                return;
+            }
+            s = SpentTerms({eventId: fresh, supply: target, deadline: deadline, sig: sig});
+            lastSpentTerms = s;
+            hasSpentTerms = true;
+        }
+        (uint64 current, , , ) = ledger.getEvent(s.eventId);
+        // Restore a different supply first, so a refusal can only be the nonce.
+        if (current == s.supply) {
+            uint64 other = _nextSupply(s.eventId, uint256(s.supply) + 1);
+            if (other == 0) return;
+            vm.prank(stamped[s.eventId].organiser);
+            try ledger.setSupply(s.eventId, other) {
+                stamped[s.eventId].totalSupply = other;
+                supplySets++;
+            } catch {
+                return;
+            }
+        }
+        termsReplayAttempts++;
+        vm.prank(submitter == address(0) ? address(0xCAFE) : submitter);
+        try ledger.setSupplyWithSignature(s.eventId, s.supply, s.deadline, s.sig) {
+            unauthorisedTermsLanded = true;
+        } catch {}
+    }
+
+    /// The organiser's account moves the key to another organiser key. The
+    /// key it leaves is kept, to prove it loses every power.
+    function rotateKey(uint256 eventIndex, uint256 keySeed) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        address current = expectedKey[id];
+        uint256 k = bound(keySeed, 0, orgKeys.length - 1);
+        address next = vm.addr(orgKeys[k]);
+        if (next == current) next = vm.addr(orgKeys[(k + 1) % orgKeys.length]);
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = id;
+        vm.prank(stamped[id].organiser);
+        try ledger.setOrganiserKey(ids, next) {
+            retiredKey[id] = keyOf[current];
+            rotatedEvents.push(id);
+            expectedKey[id] = next;
+            keyRotations++;
+        } catch {}
+    }
+
+    /// The key moved by anyone but the organiser's account: the key itself, a
+    /// stranger, the handler on an event it does not organise. Must revert.
+    function rotateKeyUnauthorised(uint256 eventIndex, address caller) external {
+        if (eventIds.length == 0) return;
+        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
+        if (caller == stamped[id].organiser) caller = expectedKey[id];
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = id;
+        outsiderKeyMoveAttempts++;
+        vm.prank(caller);
+        try ledger.setOrganiserKey(ids, address(0xF00D)) {
+            keyMovedByOutsider = true;
+        } catch {}
+    }
+
+    // ── seats ─────────────────────────────────────────────────────────────────
+
+    /// A seated event still on sale: the picked one if so, else a fresh one.
+    function _openSeated(uint256 pick) internal returns (bytes32 id) {
+        uint256 n = seatedIds.length;
+        if (n > 0) {
+            id = seatedIds[bound(pick, 0, n - 1)];
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(id);
+            (uint64 supply, uint64 minted, , ) = ledger.getEvent(id);
+            if (!cancelled && block.timestamp < endTs && minted < supply) return id;
+        }
+        id = _registerFreshSeated();
+    }
+
+    /// A free seat at or after `seed`, or `type(uint256).max` if all are held.
+    /// Reads each bitmap word once: a seated event here has at most two.
+    function _freeSeat(bytes32 id, uint256 seed) internal view returns (uint256) {
+        uint256 total = stamped[id].registeredSupply;
+        uint256[2] memory words = [ledger.seatWord(id, 0), total > 256 ? ledger.seatWord(id, 1) : 0];
+        uint256 start = bound(seed, 0, total - 1);
+        for (uint256 k; k < total; ++k) {
+            uint256 s = (start + k) % total;
+            if (words[s >> 8] & (uint256(1) << (s & 255)) == 0) return s;
+        }
+        return type(uint256).max;
+    }
+
+    /// Mint `n` seated slots into free seats, bearer or not, to `owner` or to
+    /// an actor key (so `reseat` has holders that sign).
+    function claimSeats(uint256 pick, uint256 n, uint256 seatSeed, uint256 actorSeed, bool bearer) external {
+        bytes32 id = _openSeated(pick);
+        (uint64 supply, uint64 minted, , ) = ledger.getEvent(id);
+        uint256 count = bound(n, 1, 5);
+        if (minted + count > supply) count = supply - minted;
+        if (count == 0) return;
+
+        address[] memory owners = new address[](count);
+        uint256[] memory seats = new uint256[](count);
+        address owner = vm.addr(actorKeys[bound(actorSeed, 0, actorKeys.length - 1)]);
+        uint256 seed = seatSeed;
+        for (uint256 i; i < count; ++i) {
+            owners[i] = owner;
+            uint256 s = _freeSeat(id, seed);
+            if (s == type(uint256).max) return;
+            // Seats already chosen in this batch are not yet set on chain.
+            for (uint256 j; j < i; ++j) if (seats[j] == s) s = _freeSeat(id, s + 1);
+            if (s == type(uint256).max) return;
+            seats[i] = s;
+            seed = s + 7;
+        }
+        // A duplicate inside the batch the free-seat walk could not avoid is
+        // left in: the mint must refuse it.
+        bool landed;
+        uint256 first;
+        if (bearer && !bearerMintsSeenDisabled) {
+            try ledger.batchClaimSeatsBearer(id, owners, seats, bytes32(uint256(12))) returns (uint256 f) {
+                landed = true;
+                first = f;
+            } catch {}
+        } else {
+            bearer = false;
+            try ledger.batchClaimSeats(id, owners, seats, bytes32(uint256(13))) returns (uint256 f) {
+                landed = true;
+                first = f;
+            } catch {}
+        }
+        if (!landed) return;
+        for (uint256 i; i < count; ++i) {
+            uint256 slot = first + i;
+            if (bearer) _recordBearer(id, slot, owner);
+            else _recordSlot(id, slot, owner);
+            seenSeat[id][slot] = seats[i] + 1;
+            actorSeatEvent.push(id);
+            actorSeatSlot.push(slot);
+        }
+        seatMints++;
+    }
+
+    /// Every general-admission mint path on an open seated event. Must always
+    /// revert: a seated event never has a seatless ticket.
+    function gaMintOnSeated(uint256 pick, uint256 road) external {
+        bytes32 id = _openSeated(pick);
+        address[] memory one = new address[](1);
+        one[0] = address(0x3);
+        kindMismatchAttempts++;
+        uint256 r = road % 3;
+        if (r == 0) {
+            try ledger.claimFor(id, address(0x3), bytes32(uint256(18))) {
+                seatRuleBroken = true;
+            } catch {}
+        } else if (r == 1) {
+            try ledger.batchClaimFor(id, one, bytes32(uint256(18))) {
+                seatRuleBroken = true;
+            } catch {}
+        } else {
+            try ledger.batchClaimBearer(id, one, bytes32(uint256(18))) {
+                seatRuleBroken = true;
+            } catch {}
+        }
+    }
+
+    /// A seat mint into a seat a ticket already holds. Must always revert.
+    function claimTakenSeat(uint256 pick) external {
+        bytes32 id;
+        uint256 held;
+        bool usable;
+        if (actorSeatEvent.length > 0) {
+            uint256 i = bound(pick, 0, actorSeatEvent.length - 1);
+            id = actorSeatEvent[i];
+            held = seenSeat[id][actorSeatSlot[i]];
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(id);
+            (uint64 supply, uint64 minted, , ) = ledger.getEvent(id);
+            usable = held != 0 && !cancelled && block.timestamp < endTs && minted < supply;
+        }
+        address[] memory owners = new address[](1);
+        owners[0] = address(0x3);
+        uint256[] memory seats = new uint256[](1);
+        // No usable held seat: take one in this same call.
+        if (!usable) {
+            id = _openSeated(pick);
+            uint256 seat = _freeSeat(id, pick);
+            if (seat == type(uint256).max) return;
+            seats[0] = seat;
+            try ledger.batchClaimSeats(id, owners, seats, bytes32(uint256(17))) returns (uint256 f) {
+                _recordSlot(id, f, address(0x3));
+                seenSeat[id][f] = seat + 1;
+            } catch {
+                return;
+            }
+            (uint64 supply2, uint64 minted2, , ) = ledger.getEvent(id);
+            if (minted2 >= supply2) return;
+            held = seat + 1;
+        }
+        seats[0] = held - 1;
+        takenSeatAttempts++;
+        try ledger.batchClaimSeats(id, owners, seats, bytes32(uint256(14))) {
+            seatRuleBroken = true;
+        } catch {}
+    }
+
+    /// Move a seated ticket: a bearer one on the organiser key's signature
+    /// alone, any one on the key's and its holder's. Picks a free seat, or
+    /// `NO_SEAT` now and then.
+    function reseat(uint256 pick, uint256 seatSeed, bool twoParty, address submitter) external {
+        bytes32 id;
+        uint256 slot;
+        bool usable;
+        if (actorSeatEvent.length > 0) {
+            uint256 i = bound(pick, 0, actorSeatEvent.length - 1);
+            id = actorSeatEvent[i];
+            slot = actorSeatSlot[i];
+            (uint64 endTs, bool cancelled) = ledger.getEventStatus(id);
+            usable = !cancelled && block.timestamp < endTs && keyOf[seenSlotOwner[id][slot]] != 0;
+            if (!twoParty) usable = usable && seenBearer[id][slot] && !seenMoved[id][slot];
+        }
+        // An unusable pick gets a fresh seat minted in this same call, so the
+        // move witnesses never starve (the #18 lesson).
+        if (!usable) {
+            if (!twoParty && bearerMintsSeenDisabled) return;
+            id = _openSeated(pick);
+            uint256 seat = _freeSeat(id, seatSeed + 1);
+            if (seat == type(uint256).max) return;
+            address[] memory one = new address[](1);
+            one[0] = vm.addr(actorKeys[bound(pick, 0, actorKeys.length - 1)]);
+            uint256[] memory seats = new uint256[](1);
+            seats[0] = seat;
+            if (twoParty) {
+                try ledger.batchClaimSeats(id, one, seats, bytes32(uint256(15))) returns (uint256 f) {
+                    slot = f;
+                } catch {
+                    return;
+                }
+            } else {
+                try ledger.batchClaimSeatsBearer(id, one, seats, bytes32(uint256(16))) returns (uint256 f) {
+                    slot = f;
+                } catch {
+                    return;
+                }
+            }
+            if (twoParty) _recordSlot(id, slot, one[0]);
+            else _recordBearer(id, slot, one[0]);
+            seenSeat[id][slot] = seat + 1;
+            actorSeatEvent.push(id);
+            actorSeatSlot.push(slot);
+        }
+
+        uint256 toSeat = seatSeed % 9 == 0 ? ledger.NO_SEAT() : _freeSeat(id, seatSeed);
+        if (toSeat == type(uint256).max) return;
+        if (toSeat == ledger.NO_SEAT() && seenSeat[id][slot] == 0) return;
+        if (submitter == address(0)) submitter = address(0xCAFE);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 digest = ledger.reseatDigest(id, slot, toSeat, deadline);
+        bytes memory orgSig = _sign(keyOf[expectedKey[id]], digest);
+
+        bool bearerPath = !twoParty && seenBearer[id][slot] && !seenMoved[id][slot] && !bearerMintsSeenDisabled;
+        bool landed;
+        if (bearerPath) {
+            vm.prank(submitter);
+            try ledger.reseatBearer(id, slot, toSeat, deadline, orgSig) {
+                landed = true;
+                bearerReseats++;
+            } catch {}
+        } else {
+            uint256 holderKey = keyOf[seenSlotOwner[id][slot]];
+            if (holderKey == 0) return; // moved to a key the handler does not hold
+            vm.prank(submitter);
+            try ledger.reseat(id, slot, toSeat, deadline, orgSig, _sign(holderKey, digest)) {
+                landed = true;
+                holderReseats++;
+                seenMoved[id][slot] = true;
+            } catch {}
+        }
+        if (landed) seenSeat[id][slot] = toSeat == ledger.NO_SEAT() ? 0 : toSeat + 1;
+    }
+
+    /// A seat move without the consent it needs: a bearer move signed by a
+    /// key that is not the organiser's, a holder's signature alone (as both
+    /// signatures), a held slot through `reseatBearer`. Must always revert.
+    function reseatUnauthorised(uint256 pick, uint256 seatSeed, uint256 road) external {
+        if (actorSeatEvent.length == 0) return;
+        uint256 i = bound(pick, 0, actorSeatEvent.length - 1);
+        bytes32 id = actorSeatEvent[i];
+        uint256 slot = actorSeatSlot[i];
+        uint256 toSeat = _freeSeat(id, seatSeed);
+        if (toSeat == type(uint256).max) return;
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 digest = ledger.reseatDigest(id, slot, toSeat, deadline);
+        uint256 r = road % 3;
+        unauthorisedReseatAttempts++;
+        if (r == 0) {
+            bytes memory wrong = _sign(actorKeys[bound(seatSeed, 0, actorKeys.length - 1)], digest);
+            try ledger.reseatBearer(id, slot, toSeat, deadline, wrong) {
+                seatRuleBroken = true;
+            } catch {}
+        } else if (r == 1) {
+            uint256 holderKey = keyOf[seenSlotOwner[id][slot]];
+            if (holderKey == 0 || vm.addr(holderKey) == expectedKey[id]) return;
+            bytes memory h = _sign(holderKey, digest);
+            try ledger.reseat(id, slot, toSeat, deadline, h, h) {
+                seatRuleBroken = true;
+            } catch {}
+        } else {
+            if (!seenMoved[id][slot]) return;
+            bytes memory orgSig = _sign(keyOf[expectedKey[id]], digest);
+            try ledger.reseatBearer(id, slot, toSeat, deadline, orgSig) {
+                seatRuleBroken = true;
+            } catch {}
         }
     }
 
@@ -588,7 +1081,7 @@ contract LedgerHandler is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 supply = stamped[id].registeredSupply + uint64(bound(overSeed, 1, 1000));
         aboveRegisteredAttempts++;
-        vm.prank(expectedRegistrant[id]);
+        vm.prank(stamped[id].organiser);
         try ledger.setSupply(id, supply) {
             supplyAboveRegisteredLanded = true;
         } catch {}
@@ -601,7 +1094,7 @@ contract LedgerHandler is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 newEnd = uint64(block.timestamp + ledger.MAX_SALES_EXTENSION() + bound(overSeed, 1, 365 days));
         tooFarAttempts++;
-        vm.prank(expectedRegistrant[id]);
+        vm.prank(stamped[id].organiser);
         try ledger.extendSalesEnd(id, newEnd) {
             cutoffTooFarLanded = true;
         } catch {}
@@ -629,23 +1122,24 @@ contract LedgerHandler is Test {
             // forge-lint: disable-next-line(unsafe-typecast)
             uint64 end = uint64(block.timestamp + 1);
             bytes32 manifest = bytes32(uint256(8));
-            id = ledger.registerEvent(address(this), 10, manifest, end);
-            _track(id, 10, end, address(this), manifest, address(this));
+            address key = vm.addr(orgKeys[0]);
+            id = ledger.registerEvent(address(this), key, 10, manifest, end);
+            _track(id, 10, end, address(this), manifest, key, false);
             vm.warp(end);
         }
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 newEnd = uint64(block.timestamp + bound(offset, 1, 365 days));
         lapsedExtendAttempts++;
-        vm.prank(expectedRegistrant[id]);
+        vm.prank(stamped[id].organiser);
         try ledger.extendSalesEnd(id, newEnd) {
             lapsedCutoffExtended = true;
         } catch {}
     }
 
-    /// The off switch. Held back until a reissue has run, or most campaigns
-    /// would switch it off before ever exercising reissue.
+    /// The off switch. Held back until a reissue and a bearer seat move have
+    /// run, or most campaigns would switch it off before exercising either.
     function disableBearerMints() external {
-        if (reissuesMade == 0 || bearerMintsSeenDisabled) return;
+        if (reissuesMade == 0 || bearerReseats == 0 || bearerMintsSeenDisabled) return;
         vm.prank(ledgerOwner);
         ledger.disableBearerMints();
         bearerMintsSeenDisabled = true;
@@ -663,183 +1157,11 @@ contract LedgerHandler is Test {
         id = _registerFresh(address(this));
     }
 
-    // ── the registrant role (audit 1060) ──────────────────────────────────────
-
-    /// The organiser takes the role, of the first event from the pick on whose
-    /// role can move to its organiser (it does not hold it, and the registrant
-    /// was ever a sponsor). With none, a fresh event naming `ORGANISER_B`, so
-    /// the witness never starves.
-    function assumeRegistrant(uint256 eventIndex) external {
-        if (eventIds.length == 0) return;
-        uint256 n = eventIds.length;
-        uint256 start = bound(eventIndex, 0, n - 1);
-        bytes32 id;
-        bool found;
-        for (uint256 k; k < n; ++k) {
-            bytes32 candidate = eventIds[(start + k) % n];
-            address current = expectedRegistrant[candidate];
-            if (stamped[candidate].organiser != current && ledger.wasSponsor(current)) {
-                id = candidate;
-                found = true;
-                break;
-            }
-        }
-        if (!found) id = _registerFresh(ORGANISER_B);
-        _assume(id);
-    }
-
-    function _assume(bytes32 id) internal {
-        address organiser = stamped[id].organiser;
-        vm.prank(organiser);
-        try ledger.assumeRegistrant(id) {
-            expectedRegistrant[id] = organiser;
-            roleMoved[id] = true;
-            if (!ledger.wasSponsor(organiser)) neverSponsorHeld.push(id);
-            assumptionsMade++;
-        } catch {
-            allowedMoveRefused = true;
-        }
-    }
-
-    /// Terms set by a registrant the role moved to land, and the handler, when
-    /// it no longer holds the role, is refused. On an open event whose role has
-    /// moved; with none, a fresh one whose role is moved first (to its
-    /// organiser or to `OTHER_SPONSOR`, by the seed), so the witness never
-    /// starves.
-    function setSupplyAfterHandover(uint256 eventIndex, uint256 supplySeed) external {
-        if (eventIds.length == 0) return;
-        uint256 n = eventIds.length;
-        uint256 start = bound(eventIndex, 0, n - 1);
-        bytes32 id;
-        bool found;
-        for (uint256 k; k < n; ++k) {
-            bytes32 candidate = eventIds[(start + k) % n];
-            (uint64 endTs, bool cancelled) = ledger.getEventStatus(candidate);
-            if (roleMoved[candidate] && !cancelled && block.timestamp < endTs) {
-                id = candidate;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            if (supplySeed & 1 == 0) {
-                id = _registerFresh(ORGANISER_B);
-                _assume(id);
-            } else {
-                id = _registerFresh(address(this));
-                _reassign(id, OTHER_SPONSOR);
-            }
-        }
-
-        address registrant = expectedRegistrant[id];
-        (uint64 current, uint64 minted, , ) = ledger.getEvent(id);
-        uint64 floor = minted == 0 ? 1 : minted;
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 supply = uint64(bound(supplySeed, floor, stamped[id].registeredSupply));
-        if (supply == current) {
-            if (current < stamped[id].registeredSupply) supply = current + 1;
-            else if (current > floor) supply = current - 1;
-            else return;
-        }
-        if (registrant != address(this)) {
-            try ledger.setSupply(id, supply) {
-                formerRegistrantKeptPowers = true;
-            } catch {}
-        }
-        vm.prank(registrant);
-        try ledger.setSupply(id, supply) {
-            stamped[id].totalSupply = supply;
-            supplySets++;
-            termsSetAfterHandover++;
-        } catch {
-            allowedMoveRefused = true;
-        }
-    }
-
-    /// Anyone but the organiser tries to take the role. Must always revert.
-    function assumeRegistrantUnauthorised(uint256 eventIndex, address caller) external {
-        if (eventIds.length == 0) return;
-        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
-        if (caller == stamped[id].organiser) return;
-        unauthorisedAssumeAttempts++;
-        vm.prank(caller);
-        try ledger.assumeRegistrant(id) {
-            registrantMovedByOutsider = true;
-        } catch {}
-    }
-
-    /// The owner moves the role between the handler and `OTHER_SPONSOR`. When
-    /// the picked event's registrant was never a sponsor, a fresh event is
-    /// used, so the witness never starves.
-    function reassignRegistrant(uint256 eventIndex) external {
-        if (eventIds.length == 0) return;
-        bytes32 id = eventIds[bound(eventIndex, 0, eventIds.length - 1)];
-        address current = expectedRegistrant[id];
-        if (!ledger.wasSponsor(current)) {
-            id = _registerFresh(address(this));
-            current = address(this);
-        }
-        _reassign(id, current == address(this) ? OTHER_SPONSOR : address(this));
-    }
-
-    function _reassign(bytes32 id, address to) internal {
-        vm.prank(ledgerOwner);
-        try ledger.reassignRegistrant(_one(id), to) {
-            expectedRegistrant[id] = to;
-            roleMoved[id] = true;
-            reassignmentsMade++;
-        } catch {
-            allowedMoveRefused = true;
-        }
-    }
-
-    /// `NEVER_SPONSOR` registers its own event, naming `ORGANISER_B`.
-    function registerAsNeverSponsor(uint256 supply, uint256 endOffset) external {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        _registerAsNeverSponsor(uint64(bound(supply, 1, 500)), endOffset);
-    }
-
-    function _registerAsNeverSponsor(uint64 supply, uint256 endOffset) internal returns (bytes32 id) {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint64 endTs = uint64(block.timestamp + bound(endOffset, 1, 365 days));
-        bytes32 manifest = bytes32(uint256(11));
-        vm.prank(NEVER_SPONSOR);
-        id = ledger.registerEvent(ORGANISER_B, supply, manifest, endTs);
-        _track(id, supply, endTs, ORGANISER_B, manifest, NEVER_SPONSOR);
-        neverSponsorHeld.push(id);
-    }
-
-    /// Always refused: the owner moving the role of an event a never-sponsor
-    /// holds.
-    function reassignNeverSponsorEvent(uint256 pick, uint256 endOffset) external {
-        bytes32 id = _neverSponsorEvent(pick, endOffset);
-        address to = expectedRegistrant[id] == address(this) ? OTHER_SPONSOR : address(this);
-        neverSponsorReassignAttempts++;
-        vm.prank(ledgerOwner);
-        try ledger.reassignRegistrant(_one(id), to) {
-            neverSponsorEventMoved = true;
-        } catch {}
-    }
-
-    /// Always refused: the organiser taking the role of an event a
-    /// never-sponsor holds (its own, or `NEVER_SPONSOR`'s).
-    function assumeNeverSponsorEvent(uint256 pick, uint256 endOffset) external {
-        bytes32 id = _neverSponsorEvent(pick, endOffset);
-        neverSponsorAssumeAttempts++;
-        vm.prank(stamped[id].organiser);
-        try ledger.assumeRegistrant(id) {
-            neverSponsorEventMoved = true;
-        } catch {}
-    }
-
-    function _neverSponsorEvent(uint256 pick, uint256 endOffset) internal returns (bytes32) {
-        if (neverSponsorHeld.length == 0) return _registerAsNeverSponsor(10, endOffset);
-        return neverSponsorHeld[bound(pick, 0, neverSponsorHeld.length - 1)];
-    }
-
-    function _one(bytes32 id) internal pure returns (bytes32[] memory ids) {
-        ids = new bytes32[](1);
-        ids[0] = id;
+    /// As `_openEvent`, but general admission: the GA mint fallbacks below
+    /// must not starve on a seated pick, which refuses them.
+    function _openGaEvent(uint256 eventIndex) internal returns (bytes32 id) {
+        id = _openEvent(eventIndex);
+        if (seated[id]) id = _registerFresh(address(this));
     }
 
     function _recordBearer(bytes32 id, uint256 slot, address owner) internal {
@@ -873,7 +1195,7 @@ contract LedgerHandler is Test {
             slot = bound(slotSeed, 0, count - 1);
             if (seenSlotOwner[id][slot] != address(0)) return (id, slot);
         }
-        id = _openEvent(eventIndex);
+        id = _openGaEvent(eventIndex);
         try ledger.claimFor(id, address(0x3), bytes32(uint256(10))) returns (uint256 s) {
             _recordSlot(id, s, address(0x3));
             slot = s;
@@ -934,22 +1256,19 @@ contract WoCoTicketLedgerInvariantTest is Test {
     }
 
     /// Terms change only as version 2 allows: supply only by `setSupply` and
-    /// the cutoff only later by `extendSalesEnd` (the handler tracks both),
-    /// organiser and manifest never, and the registrant only by the
-    /// organiser's own `assumeRegistrant` or the owner's `reassignRegistrant`
-    /// between sponsors, never off a never-sponsor (audit 1060). Nothing a
-    /// sponsor, an organiser, or the passage of time does may reinterpret them
-    /// otherwise.
+    /// the cutoff only later by `extendSalesEnd` (the handler tracks both, on
+    /// every road), organiser and manifest never, the organiser key only by
+    /// the organiser's account, and none of it on anyone else's authority: a
+    /// stranger, a sponsor that is not the organiser, a key not the event's, a
+    /// key it rotated away from, or a spent signature.
     /// forge-config: default.invariant.runs = 64
     function invariant_TermsMoveOnlyAsAllowed() public view {
         assertFalse(handler.cutoffMovedEarlier(), "the sales cutoff moved earlier");
         assertFalse(handler.supplyAboveRegisteredLanded(), "supply was set above the registered supply");
         assertFalse(handler.cutoffTooFarLanded(), "a cutoff moved past MAX_SALES_EXTENSION");
         assertFalse(handler.lapsedCutoffExtended(), "a cutoff that had passed was moved");
-        assertFalse(handler.registrantMovedByOutsider(), "someone but the organiser took the registrant role");
-        assertFalse(handler.neverSponsorEventMoved(), "the role moved off a registrant that was never a sponsor");
-        assertFalse(handler.allowedMoveRefused(), "a registrant move the rules allow was refused");
-        assertFalse(handler.formerRegistrantKeptPowers(), "a key the role moved off still set terms");
+        assertFalse(handler.unauthorisedTermsLanded(), "terms changed without the organiser's authority");
+        assertFalse(handler.keyMovedByOutsider(), "someone but the organiser's account moved its key");
         uint256 n = handler.eventCount();
         for (uint256 i; i < n; ++i) {
             bytes32 id = handler.eventIds(i);
@@ -959,13 +1278,54 @@ contract WoCoTicketLedgerInvariantTest is Test {
 
             (uint64 totalSupply, , address org, bytes32 manifest) = ledger.getEvent(id);
             (uint64 endTs, ) = ledger.getEventStatus(id);
-            address registrant = ledger.getRegistrant(id);
 
             assertEq(totalSupply, sSupply,   "totalSupply moved other than by setSupply");
             assertEq(org,         sOrg,      "organiser changed after registration");
             assertEq(manifest,    sManifest, "manifestRef changed after registration");
             assertEq(endTs,       sEndTs,    "eventEndTs moved other than by extendSalesEnd");
-            assertEq(registrant,  handler.expectedRegistrant(id), "registrant moved other than as allowed");
+            assertEq(ledger.getOrganiserKey(id), handler.expectedKey(id), "organiser key moved other than as allowed");
+            assertEq(ledger.isSeated(id), handler.seated(id), "an event changed kind");
+        }
+    }
+
+    /// Seats: on a seated event every claimed slot holds exactly the seat the
+    /// handler saw it take (or none, after a move to `NO_SEAT`), the bitmap
+    /// holds exactly those seats, so no seat is held twice; a GA event holds
+    /// no seat at all. No mint landed on a held seat or on the other kind of
+    /// event, and no seat moved without the consent it needs.
+    /// forge-config: default.invariant.runs = 64
+    function invariant_SeatsAreHeldOnce() public view {
+        assertFalse(handler.seatRuleBroken(), "a seat rule was broken");
+        uint256 noSeat = ledger.NO_SEAT();
+        uint256 n = handler.eventCount();
+        for (uint256 i; i < n; ++i) {
+            bytes32 id = handler.eventIds(i);
+            if (!handler.seated(id)) {
+                // A GA event's seat bitmap stays empty (its supply here is at most 500).
+                assertEq(ledger.seatWord(id, 0) | ledger.seatWord(id, 1), 0, "a GA event holds a seat");
+                continue;
+            }
+            (, uint64 minted, , ) = ledger.getEvent(id);
+            uint256 held;
+            for (uint256 s; s < minted; ++s) {
+                uint256 seat = ledger.seatOf(id, s);
+                uint256 seen = handler.seenSeat(id, s);
+                assertEq(seat, seen == 0 ? noSeat : seen - 1, "a ticket's seat moved other than as allowed");
+                if (seat == noSeat) continue;
+                assertTrue(ledger.seatWord(id, seat >> 8) & (uint256(1) << (seat & 255)) != 0, "a held seat reads free");
+                held++;
+            }
+            uint256 bits;
+            uint256 words = (uint256(ledger.getRegisteredSupply(id)) + 255) >> 8;
+            for (uint256 w; w < words; ++w) bits += _popcount(ledger.seatWord(id, w));
+            assertEq(bits, held, "the seat bitmap is not exactly the seats tickets hold");
+        }
+    }
+
+    function _popcount(uint256 x) internal pure returns (uint256 c) {
+        while (x != 0) {
+            x &= x - 1;
+            ++c;
         }
     }
 
@@ -1048,12 +1408,19 @@ contract WoCoTicketLedgerInvariantTest is Test {
         assertGt(handler.aboveRegisteredAttempts(), 0, "campaign never tried a supply above the registered one");
         assertGt(handler.tooFarAttempts(), 0, "campaign never tried a cutoff past MAX_SALES_EXTENSION");
         assertGt(handler.lapsedExtendAttempts(), 0, "campaign never tried to move a cutoff that had passed");
-        assertGt(handler.assumptionsMade(), 0, "campaign never had an organiser take the registrant role");
-        assertGt(handler.unauthorisedAssumeAttempts(), 0, "campaign never tried a non-organiser assumeRegistrant");
-        assertGt(handler.reassignmentsMade(), 0, "campaign never exercised reassignRegistrant");
-        assertGt(handler.neverSponsorReassignAttempts(), 0, "campaign never tried to reassign a never-sponsor's event");
-        assertGt(handler.neverSponsorAssumeAttempts(), 0, "campaign never tried to take a never-sponsor's event");
-        assertGt(handler.termsSetAfterHandover(), 0, "campaign never changed terms from a registrant the role moved to");
+        assertGt(handler.signedTermsMade(), 0, "campaign never landed a signed terms action");
+        assertGt(handler.directKeyTermsMade(), 0, "campaign never had the key send terms itself");
+        assertGt(handler.keyRotations(), 0, "campaign never rotated an organiser key");
+        assertGt(handler.unauthorisedTermsAttempts(), 0, "campaign never tried terms without authority");
+        assertGt(handler.retiredKeyAttempts(), 0, "campaign never tried a rotated-away key");
+        assertGt(handler.termsReplayAttempts(), 0, "campaign never replayed a spent terms signature");
+        assertGt(handler.outsiderKeyMoveAttempts(), 0, "campaign never tried to move a key from outside");
+        assertGt(handler.seatMints(), 0, "campaign never minted seats");
+        assertGt(handler.takenSeatAttempts(), 0, "campaign never tried a held seat");
+        assertGt(handler.bearerReseats(), 0, "campaign never landed reseatBearer");
+        assertGt(handler.holderReseats(), 0, "campaign never landed a two-party reseat");
+        assertGt(handler.unauthorisedReseatAttempts(), 0, "campaign never tried a seat move without consent");
+        assertGt(handler.kindMismatchAttempts(), 0, "campaign never tried a GA mint on a seated event");
     }
 
     /// A slot's owner changes ONLY through a transfer its own owner authorised —

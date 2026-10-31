@@ -44,7 +44,7 @@ contract WoCoTicketLedgerTest is Test {
     /// the caller is the platform, `organiser` is stamped separately.
     function _register() internal returns (bytes32 eventId) {
         vm.prank(sponsor);
-        eventId = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        eventId = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
     }
 
     /// Mirrors the contract's derivation. Written out in full rather than
@@ -143,9 +143,9 @@ contract WoCoTicketLedgerTest is Test {
         WoCoTicketLedger other = new WoCoTicketLedger(owner, sponsor, type(uint32).max);
 
         vm.prank(sponsor);
-        bytes32 idA = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        bytes32 idA = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
         vm.prank(sponsor);
-        bytes32 idB = other.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        bytes32 idB = other.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
 
         // Same registrant, same nonce (0 on each), same args — only the
         // deployment differs.
@@ -162,7 +162,7 @@ contract WoCoTicketLedgerTest is Test {
 
         vm.chainId(8453);
         vm.prank(sponsor);
-        bytes32 onBase = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        bytes32 onBase = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
         assertEq(onBase, keccak256(abi.encode(uint256(8453), address(ledger), sponsor, uint256(0))));
 
         // The same (contract, registrant, nonce) on a different chain would have
@@ -178,13 +178,13 @@ contract WoCoTicketLedgerTest is Test {
     function test_RegisterEvent_RevertZeroOrganiser() public {
         vm.expectRevert(WoCoTicketLedger.ZeroAddress.selector);
         vm.prank(sponsor);
-        ledger.registerEvent(address(0), SUPPLY, MANIFEST, END_TS);
+        ledger.registerEvent(address(0), organiser, SUPPLY, MANIFEST, END_TS);
     }
 
     function test_RegisterEvent_RevertZeroSupply() public {
         vm.expectRevert(WoCoTicketLedger.InsufficientSupply.selector);
         vm.prank(sponsor);
-        ledger.registerEvent(organiser, 0, MANIFEST, END_TS);
+        ledger.registerEvent(organiser, organiser,0, MANIFEST, END_TS);
     }
 
     /// Its own error, not ZeroAddress: a zero organiser and an empty manifest
@@ -192,21 +192,21 @@ contract WoCoTicketLedgerTest is Test {
     function test_RegisterEvent_RevertZeroManifest() public {
         vm.expectRevert(WoCoTicketLedger.EmptyManifestRef.selector);
         vm.prank(sponsor);
-        ledger.registerEvent(organiser, SUPPLY, bytes32(0), END_TS);
+        ledger.registerEvent(organiser, organiser,SUPPLY, bytes32(0), END_TS);
     }
 
     function test_RegisterEvent_RevertPastEndTs() public {
         vm.expectRevert(WoCoTicketLedger.InvalidEventEnd.selector);
         vm.prank(sponsor);
         // forge-lint: disable-next-line(unsafe-typecast)
-        ledger.registerEvent(organiser, SUPPLY, MANIFEST, uint64(block.timestamp));
+        ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, uint64(block.timestamp));
     }
 
     /// Registration is permissionless — it is not a sponsor-gated call. This
     /// pins that deliberately, so a future change has to argue with a test.
     function test_RegisterEvent_OpenToAnyCaller() public {
         vm.prank(stranger);
-        bytes32 eventId = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        bytes32 eventId = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
         (, , address org, ) = ledger.getEvent(eventId);
         assertEq(org, organiser);
         assertEq(ledger.registrantNonce(stranger), 1);
@@ -343,7 +343,7 @@ contract WoCoTicketLedgerTest is Test {
 
     function test_BatchClaimFor_RevertTooLarge() public {
         vm.prank(sponsor);
-        bytes32 eventId = ledger.registerEvent(organiser, 200, MANIFEST, END_TS);
+        bytes32 eventId = ledger.registerEvent(organiser, organiser,200, MANIFEST, END_TS);
 
         vm.expectRevert(WoCoTicketLedger.BatchTooLarge.selector);
         vm.prank(sponsor);
@@ -352,7 +352,7 @@ contract WoCoTicketLedgerTest is Test {
 
     function test_BatchClaimFor_AcceptsBatchLimit() public {
         vm.prank(sponsor);
-        bytes32 eventId = ledger.registerEvent(organiser, 200, MANIFEST, END_TS);
+        bytes32 eventId = ledger.registerEvent(organiser, organiser,200, MANIFEST, END_TS);
 
         vm.prank(sponsor);
         ledger.batchClaimFor(eventId, _owners(100), bytes32(0));
@@ -740,7 +740,7 @@ contract WoCoTicketLedgerTest is Test {
         emit Registered(expectedId, organiser, sponsor, SUPPLY, MANIFEST, END_TS);
 
         vm.prank(sponsor);
-        ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
     }
 
     function test_Emit_SlotClaimed() public {
@@ -865,7 +865,7 @@ contract WoCoTicketLedgerTest is Test {
 
         // An event the sponsor registered naming ITSELF organiser: cancel opens.
         vm.prank(sponsor);
-        bytes32 ours = ledger.registerEvent(sponsor, SUPPLY, MANIFEST, END_TS);
+        bytes32 ours = ledger.registerEvent(sponsor, sponsor, SUPPLY, MANIFEST, END_TS);
         vm.prank(sponsor);
         ledger.cancelEvent(ours);
 
@@ -880,7 +880,7 @@ contract WoCoTicketLedgerTest is Test {
     /// Pinned so the property is deliberate, and so indexers inherit the warning.
     function test_Register_OrganiserIsAssertedNotProven() public {
         vm.prank(stranger);
-        bytes32 eventId = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        bytes32 eventId = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
 
         (, , address org, ) = ledger.getEvent(eventId);
         assertEq(org, organiser, "stranger named an organiser that never consented");

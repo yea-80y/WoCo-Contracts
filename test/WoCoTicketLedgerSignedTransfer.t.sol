@@ -61,7 +61,7 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
         returns (bytes32 eventId, uint256 slot)
     {
         vm.prank(sponsor);
-        eventId = l.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        eventId = l.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
         vm.prank(sponsor);
         slot = l.claimFor(eventId, to, keccak256("stripe-ref"));
     }
@@ -189,7 +189,7 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
     function test_SubmitterCannotApplyItToAnotherEvent() public {
         (bytes32 eventA, uint256 slotA) = _claimToHolder();
         vm.prank(sponsor);
-        bytes32 eventB = ledger.registerEvent(organiser, SUPPLY, keccak256("manifest-B"), END_TS);
+        bytes32 eventB = ledger.registerEvent(organiser, organiser,SUPPLY, keccak256("manifest-B"), END_TS);
         vm.prank(sponsor);
         uint256 slotB = ledger.claimFor(eventB, holder, keccak256("stripe-ref-B"));
         assertEq(slotA, slotB, "precondition: same slot index in both events");
@@ -370,7 +370,7 @@ contract WoCoTicketLedgerSignedTransferTest is Test {
     /// it; it must be refused as unclaimed, never read as authority.
     function test_Guard_UnclaimedSlot() public {
         vm.prank(sponsor);
-        bytes32 eventId = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        bytes32 eventId = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
         bytes memory sig = _sign(HOLDER_KEY, ledger.transferSlotDigest(eventId, 0, recipient, DEADLINE));
 
         vm.prank(relayer);
