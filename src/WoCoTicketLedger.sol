@@ -23,13 +23,14 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * Version 2 (EIP-712 domain version "2") adds, over the deployed version 1:
  * seats an event's registrant can lower and restore, never above the supply
  * it registered (`setSupply`), a sales cutoff it can only move later, while
- * still open and at most two years ahead (`extendSalesEnd`), and the
+ * still open and at most two years ahead (`extendSalesEnd`), a registrant
+ * role that can move (`assumeRegistrant`, `reassignRegistrant`), and the
  * platform's replacement of a bearer ticket (`reissue`), with a one-way off
  * switch (`disableBearerMints`).
  *
  * ── The guarantee this contract makes ────────────────────────────────────────
  *
- *   On an event it did not itself register, sponsor authority grants exactly
+ *   On an event it is not the registrant of, sponsor authority grants exactly
  *   TWO powers, both within that sponsor's hourly mint cap, before
  *   `eventEndTs` and only while not cancelled:
  *     1. appending new slots, within the event's supply;
@@ -49,8 +50,8 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * having stamped itself as their organiser, cancel those, and as their
  * REGISTRANT change their supply (within the registered supply) and move their
  * cutoff later. That is not sponsor authority — it is what any address can do
- * for the events it registered, and it reaches only those. The guarantee above
- * is about the events it did not.
+ * for the events it is the registrant of, and it reaches only those. The
+ * guarantee above is about the events it is not.
  *
  * One difference, because in production the platform's sponsor key is the
  * registrant of every platform event (audit 1059 M-1): an address that was
@@ -59,6 +60,26 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * sponsor (`removeSponsor`, or a cap of 0) therefore withdraws everything it
  * could do, not only its minting. An address that was never a sponsor, such
  * as an organiser registering its own events, keeps them for good.
+ *
+ * The registrant role moves in exactly two ways, and only away from an
+ * address that was ever a sponsor (audit 1060 N-1, I-2):
+ *   - the event's organiser takes it (`assumeRegistrant`), and from then on
+ *     manages the event from its own account. A never-sponsor organiser then
+ *     holds it, and nothing moves it again unless the owner later appoints
+ *     that organiser's address as a sponsor (`addSponsor`, audit 1060 I-1),
+ *     which binds its powers to sponsor state and lets the owner move the
+ *     role on. The platform never makes an organiser's address a sponsor.
+ *   - the owner moves it to another sponsor (`reassignRegistrant`): a key
+ *     rotation, or the repair after a sponsor key is withdrawn, where the new
+ *     key restores what the old one changed. The owner chooses WHICH platform
+ *     key holds powers the organiser entrusted to the platform; it never
+ *     changes an event's terms itself, never hands the role to an address
+ *     that is not an authorised sponsor (so never to an organiser, under the
+ *     rule above), and never reaches an event whose current registrant was
+ *     never a sponsor.
+ * A registrant can never give the role away. A pushed handover was rejected:
+ * a key in other hands could lower every supply and then hand each event to
+ * its organiser, out of the owner's reach, before anyone could repair it.
  *
  * ── Reissue: the platform replacing a bearer ticket ──────────────────────────
  *
@@ -102,10 +123,16 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * SPONSOR ROTATION. Reissue checks the slot's minting sponsor, so a sponsor
  * key removed from service can no longer reissue the bearer tickets it minted
  * (they still verify at the door). That is the right outcome for a key that
- * leaked. Removal also freezes the terms of every event the key registered
- * (supply and cutoff, see above). For a routine rotation, keep the old key
- * authorised with a small cap until the last event it minted into or
- * registered is over.
+ * leaked, and it is not transferable: the power to re-point a ticket stays
+ * with the key that minted it. The terms of the events a key holds as
+ * registrant DO move: for a routine rotation, add the new key and
+ * `reassignRegistrant` the old key's events to it, keep the old key
+ * authorised with a small cap for reissue only, and remove it once the last
+ * bearer event it minted into is over. After a leak: `removeSponsor(old)`
+ * first, in its own transaction (it never reverts, and the gap loses nothing:
+ * a withdrawn key's events are frozen), then add the new key and reassign the
+ * old one's events (see `reassignRegistrant`), then restore from the new key
+ * what the old one changed.
  *
  * ── What bounds a sponsor (audit 959 M-1) ────────────────────────────────────
  *
@@ -117,9 +144,11 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * at most its cap per window, and at most twice it across a window boundary
  * (see `MintAllowance`), until the owner calls `removeSponsor` or
  * `setSponsorMintCap(sponsor, 0)`. Either lever withdraws all of it: minting,
- * reissue, and its registrant powers over the events it registered. What such
- * a key can leave behind is bounded too: supply never above the registered
- * supply, and no cutoff later than `MAX_SALES_EXTENSION` past its withdrawal.
+ * reissue, and its registrant powers over the events it holds. What such a key
+ * can leave behind is bounded too: supply never above the registered supply,
+ * and no cutoff later than `MAX_SALES_EXTENSION` past its withdrawal. A supply
+ * it lowered is restored from the key the owner moves its events to
+ * (`reassignRegistrant`); a cutoff it moved later stays.
  *
  * `UNLIMITED_MINTS` is for a sponsor whose mints the chain CAN check — a
  * payments contract that mints only in the transaction that takes the money.
@@ -148,9 +177,15 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  *     registrant only), only while it has not passed, and never more than
  *     `MAX_SALES_EXTENSION` ahead of the moment it moves. Release time
  *     downstream is `eventEndTs + releaseDelay`, so it can never be pulled
- *     earlier than buyers agreed to, and a key can postpone it by a bounded
- *     time, never for good. Payments must still do its release arithmetic in
- *     uint256 (a registered `eventEndTs` itself is unbounded, below).
+ *     earlier than buyers agreed to. The bound is per move, not in total
+ *     (audit 1060 L-1): a live registrant can move it again before each
+ *     cutoff, without limit. For a sponsor key the owner's withdrawal ends
+ *     that, leaving at most `MAX_SALES_EXTENSION` past it; a registrant that
+ *     was never a sponsor, such as an organiser that took the role, can delay
+ *     its own event's release indefinitely. Anything off chain that keys a
+ *     deadline on this value must bound it itself. Payments must still do its
+ *     release arithmetic in uint256 (a registered `eventEndTs` itself is
+ *     unbounded, below).
  *   - Supply is not read across the boundary: changing it (`setSupply`)
  *     decides how many tickets may still be sold, never who is paid or when.
  *     It never passes the edition commitment: `manifestRef` has no setter and
@@ -212,8 +247,15 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * (it is `msg.sender`). Indexers and any future consumer MUST NOT treat a
  * `Registered` log as evidence that the named organiser consented; filter on
  * `registrant`, or require a signature at a higher layer. The consequence
- * inside this contract is contained: a stamped organiser can only ever cancel
- * the event that named them, which is buyer-protective and one-way.
+ * inside this contract is contained. A stamped organiser can cancel the event
+ * that named them, which is buyer-protective and one-way. It can take the
+ * registrant role (`assumeRegistrant`) only of an event whose current
+ * registrant was ever a sponsor: a sponsor is a key the owner appointed, so
+ * that organiser is one the platform stamped. An organiser named by an
+ * address that was never a sponsor gets no role while it stays one.
+ *
+ * `registrant` is authenticated, and it MOVES in exactly the two ways the
+ * header names (`RegistrantChanged`); `getRegistrant` reads the current one.
  *
  * `registrantNonce` is keyed by the REGISTRANT (`msg.sender`), not by
  * `organiser` — it is the eventId derivation counter. Renamed from V1/V2's
@@ -260,10 +302,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         // ---- slot 2 ----
         bytes32 manifestRef;
         // ---- slot 3 ----
-        /// `msg.sender` at registration: the one address that may change supply
-        /// or move the cutoff later, and only while its sponsor authority is
-        /// live if it was ever a sponsor (`wasSponsor`). Authenticated, unlike
-        /// `organiser`.
+        /// `msg.sender` at registration, and from then on the CURRENT holder of
+        /// the role: the one address that may change supply or move the cutoff
+        /// later, and only while its sponsor authority is live if it was ever a
+        /// sponsor (`wasSponsor`). Authenticated, unlike `organiser`. The
+        /// organiser may take it from an ever-sponsor (`assumeRegistrant`), the
+        /// owner may move it between sponsors (`reassignRegistrant`), nothing
+        /// else moves it. The event id is keyed on the address at registration
+        /// and never re-derived.
         address registrant;
     }
 
@@ -371,6 +417,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     // ── Events ────────────────────────────────────────────────────────────────
 
+    /// @dev `registrant` is the address at registration. Indexers MUST fold
+    ///      `RegistrantChanged` over it for the current one.
     event Registered(
         bytes32 indexed eventId,
         address indexed organiser,
@@ -437,6 +485,20 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice The owner ended bearer minting and reissue, for good.
     event BearerMintsDisabled(address indexed by);
 
+    /// @notice The registrant role moved. `byOwner` is true for
+    ///         `reassignRegistrant`, false for the organiser's own
+    ///         `assumeRegistrant`: `registrant` alone cannot tell them apart
+    ///         when an organiser is also a sponsor (as `EventCancelled.forced`).
+    /// @dev Indexers MUST fold this over `Registered.registrant`. `previous` is
+    ///      indexed for "which events did key X hold", the question after a
+    ///      key is withdrawn.
+    event RegistrantChanged(
+        bytes32 indexed eventId,
+        address indexed previous,
+        address indexed registrant,
+        bool byOwner
+    );
+
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error EventNotFound();
@@ -477,14 +539,22 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error SlotHeld();
     error BearerMintsOff();
     error AlreadyDisabled();
-    /// @dev The registrant was a sponsor and is no longer a live one (removed,
-    ///      or capped at 0), so its registrant powers are withdrawn with it.
+    /// @dev The caller was a sponsor and is no longer a live one (removed, or
+    ///      capped at 0), so its registrant powers are withdrawn with it, and
+    ///      as an organiser it cannot take the role (`assumeRegistrant`).
     error SponsorWithdrawn();
     /// @dev Never above the supply the event was registered with: more seats
     ///      than that is a new registration (a new ticket type).
     error SupplyAboveRegistered();
     /// @dev Later than `block.timestamp + MAX_SALES_EXTENSION`.
     error SalesEndTooFar();
+    /// @dev The registrant was never a sponsor: an organiser's own
+    ///      registration, or an organiser that took the role, whose powers are
+    ///      its own and are not moved while that address is never made a
+    ///      sponsor.
+    error RegistrantNeverSponsor();
+    /// @dev The role would move to the address that already holds it.
+    error RegistrantUnchanged();
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -582,7 +652,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         // The off-chain mirror of this formula lives in the server's
         // `deriveEventId` (lib/event/onchain-registry.ts). Changing one without
         // the other makes the registration walk silently find nothing, which
-        // reads as "never registered" and re-broadcasts a duplicate.
+        // reads as "never registered" and re-broadcasts a duplicate. It is
+        // keyed on the registrant AT registration: a later `RegistrantChanged`
+        // changes no id and nothing the server mirrors.
         eventId = keccak256(
             abi.encode(block.chainid, address(this), msg.sender, registrantNonce[msg.sender]++)
         );
@@ -795,9 +867,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /**
      * @notice Set the event's supply: fewer seats for a smaller venue, and back
      *         up again, never above the supply it was registered with. The
-     *         REGISTRANT only — the address that registered it, which could
-     *         have stamped any supply in the first place — and, if it was ever
-     *         a sponsor, only while it is a live one.
+     *         current REGISTRANT only — the address that registered it, which
+     *         could have stamped any supply in the first place, or the one the
+     *         role moved to — and, if it was ever a sponsor, only while it is a
+     *         live one.
      * @dev An absolute value, not a delta, so a retried transaction changes
      *      nothing twice. Never below the slots minted (a sold ticket is never
      *      taken back), never 0, and never above `registeredSupply`: the
@@ -824,13 +897,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     /**
      * @notice Move the sales cutoff LATER, for a postponed event, while it is
-     *         still open. The REGISTRANT only and, if it was ever a sponsor,
-     *         only while it is a live one. Never earlier: see the monotonicity
-     *         note in the header.
+     *         still open. The current REGISTRANT only and, if it was ever a
+     *         sponsor, only while it is a live one. Never earlier: see the
+     *         monotonicity note in the header.
      * @dev Refused once the cutoff has passed (audit 1059 L-4): the cutoff is
      *      the event's real end, so a postponement is known before it, and an
      *      event that is over is registered again rather than reopened. At most
-     *      `MAX_SALES_EXTENSION` ahead of now (audit 1059 M-1).
+     *      `MAX_SALES_EXTENSION` ahead of now (audit 1059 M-1), per call: a
+     *      live registrant can call again (audit 1060 L-1, see the header).
      */
     function extendSalesEnd(bytes32 eventId, uint64 eventEndTs) external {
         Event storage ev = _events[eventId];
@@ -855,6 +929,93 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     function _registrantLive(address registrant) private view returns (bool) {
         if (!wasSponsor[registrant]) return true;
         return authorisedSponsors[registrant] && _mintAllowance[registrant].perHour != 0;
+    }
+
+    // ── The registrant role (audit 1060 N-1, I-2) ─────────────────────────────
+
+    /**
+     * @notice The event's ORGANISER takes the registrant role, and from then on
+     *         sets its supply and cutoff from its own account. Only from a
+     *         registrant that was ever a sponsor, live or withdrawn: the
+     *         platform's keys, which hold the role on the organiser's behalf.
+     * @dev A pull, never a push: no registrant can hand the role away (see the
+     *      header). For a never-sponsor organiser it is one-way, as the owner
+     *      cannot move the role of a never-sponsor registrant. Its powers then
+     *      follow `_registrantLive` as for any registrant (audit 1060 I-1): an
+     *      organiser that is also a sponsor keeps them only while live, and the
+     *      owner can move them on. So an organiser's own address is never made
+     *      a sponsor. A withdrawn ever-sponsor caller is refused: the pull would
+     *      gain it nothing it could use, and without the check a withdrawn key
+     *      named as some event's organiser could take that event back from the
+     *      key the owner moved it to, again after every repair.
+     *
+     *      No cancelled or cutoff check: the role carries nothing to exercise
+     *      on such an event, and moving it harms no one. No cap charge: it
+     *      appends nothing and moves no ticket.
+     */
+    function assumeRegistrant(bytes32 eventId) external {
+        Event storage ev = _events[eventId];
+        if (!ev.exists)                   revert EventNotFound();
+        if (msg.sender != ev.organiser)   revert NotOrganiser();
+        address previous = ev.registrant;
+        if (previous == msg.sender)       revert RegistrantUnchanged();
+        if (!_registrantLive(msg.sender)) revert SponsorWithdrawn();
+        if (!wasSponsor[previous])        revert RegistrantNeverSponsor();
+
+        ev.registrant = msg.sender;
+        emit RegistrantChanged(eventId, previous, msg.sender, false);
+    }
+
+    /**
+     * @notice Move the registrant role of events a sponsor holds to another
+     *         sponsor, `to`. Owner only. A key rotation, or the repair after a
+     *         sponsor key is withdrawn: the new key restores what the old one
+     *         changed (`setSupply(id, getRegisteredSupply(id))`).
+     * @dev Reaches only events whose registrant was ever a sponsor, live or
+     *      withdrawn, and `to` is always an authorised sponsor. So the owner
+     *      chooses which platform key holds powers the organiser entrusted to
+     *      the platform, never exercises them itself, never hands an event to
+     *      an address that is not an authorised sponsor (so never to an
+     *      organiser while an organiser's address is never made a sponsor;
+     *      only the organiser's own `assumeRegistrant` does), and never
+     *      reaches an event whose current registrant was never a sponsor,
+     *      including one a never-sponsor organiser took (audit 1060 I-1: the
+     *      owner appointing that address as a sponsor would change that).
+     *      A live registrant is allowed: the
+     *      owner could withdraw, move and re-add it anyway, and requiring the
+     *      cap-0 pause first would risk a cutoff lapsing mid-pause (audit 1060
+     *      L-2).
+     *
+     *      `to` at a cap of 0 is accepted: its events wait, paused, until its
+     *      cap is raised. All or nothing, like `reissue`: build the list from
+     *      `getRegistrant` reads just before signing. An organiser's
+     *      `assumeRegistrant` landing in between reverts the batch
+     *      (`RegistrantNeverSponsor`), and so does a duplicate id
+     *      (`RegistrantUnchanged`): rebuild the list and send again. No size
+     *      cap: owner only, bounded by the block's gas.
+     *
+     *      Leak response: `removeSponsor(old)` first, in its own transaction,
+     *      then `addSponsor(new, cap)`, then this, from `getRegistrant` reads
+     *      made at that moment. Never bundle it atomically with
+     *      `removeSponsor`, whose never reverting is the point (audit 960
+     *      I-3): a refused batch would roll the removal back with it.
+     */
+    function reassignRegistrant(bytes32[] calldata eventIds, address to) external onlyOwner {
+        uint256 n = eventIds.length;
+        if (n == 0)                  revert BatchEmpty();
+        if (!authorisedSponsors[to]) revert NotSponsor();
+
+        for (uint256 i; i < n;) {
+            Event storage ev = _events[eventIds[i]];
+            if (!ev.exists)              revert EventNotFound();
+            address previous = ev.registrant;
+            if (previous == to)          revert RegistrantUnchanged();
+            if (!wasSponsor[previous])   revert RegistrantNeverSponsor();
+
+            ev.registrant = to;
+            emit RegistrantChanged(eventIds[i], previous, to, true);
+            unchecked { ++i; }
+        }
     }
 
     // ── Cancellation ──────────────────────────────────────────────────────────
@@ -1212,8 +1373,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         return (sd.bearer, sd.held);
     }
 
-    /// @notice The address that registered the event: the one that may change
-    ///         its supply and move its cutoff later, while live (`wasSponsor`).
+    /// @notice The event's CURRENT registrant: the one that may change its
+    ///         supply and move its cutoff later, while live (`wasSponsor`). The
+    ///         address that registered it unless the role has moved
+    ///         (`RegistrantChanged`).
     function getRegistrant(bytes32 eventId) external view returns (address) {
         Event storage ev = _events[eventId];
         if (!ev.exists) revert EventNotFound();
@@ -1274,10 +1437,11 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///      an address that never was one takes nothing from it.
     ///
     ///      Also ends the removed key's registrant powers over the events it
-    ///      registered (`setSupply`, `extendSalesEnd`): their terms stay as they
-    ///      are. To restore a supply the key lowered before it was removed, add
-    ///      it back with a cap of 1, set it, and remove it again. A cutoff it
-    ///      moved later stays: the cutoff never moves earlier.
+    ///      holds (`setSupply`, `extendSalesEnd`): their terms stay as they
+    ///      are. To restore a supply the key lowered before it was removed,
+    ///      move its events to another sponsor with `reassignRegistrant` and
+    ///      set the supply from there; never add a withdrawn key back for it.
+    ///      A cutoff it moved later stays: the cutoff never moves earlier.
     function removeSponsor(address sponsor) external onlyOwner {
         authorisedSponsors[sponsor] = false;
         emit SponsorRemoved(sponsor);
@@ -1287,9 +1451,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///         next mint; raising it lifts a refusal at once, and 0 stops the
     ///         sponsor minting without de-authorising it.
     /// @dev 0 also pauses the sponsor's registrant powers over the events it
-    ///      registered, like `removeSponsor`. A cutoff that passes during the
-    ///      pause cannot be moved later afterwards (`extendSalesEnd` is refused
-    ///      once the cutoff has passed).
+    ///      holds, like `removeSponsor`. A cutoff that passes during the pause
+    ///      cannot be moved later afterwards (`extendSalesEnd` is refused once
+    ///      the cutoff has passed). A rotation does not need this pause:
+    ///      `reassignRegistrant` moves a live key's events.
     ///
     ///      Between finite caps it writes `perHour` only: the open window keeps
     ///      its end and its count. Into or out of `UNLIMITED_MINTS` it closes the
