@@ -70,6 +70,11 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  *     window, `issuedAt` to `deadline`, at most `MAX_TERMS_SIGNATURE_TTL`
  *     long: usable only inside it, and never later (audit 1152 L-2).
  *
+ * Every organiser signature, terms or seat move, also dies on the organiser's
+ * next write to the event: a terms change, a key move, or `revokeSignatures`,
+ * which changes nothing else and is the organiser's way to cancel what it has
+ * signed but not yet seen land (audit 1153 L-1).
+ *
  * The key is per EVENT, not per organiser: registration is permissionless, so
  * a per-organiser record set at registration would let anyone name the key of
  * an organiser that has not registered yet. A key on a junk registration
@@ -411,10 +416,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     /// Per-event counter consumed by every ORGANISER write to the event's terms
     /// or its organiser key, on either path, direct or signed: `setSupply`,
-    /// `extendSalesEnd`, `cancelEvent` and `setOrganiserKey`. A signed terms
-    /// action commits to its current value, so it is dead once used and dead
-    /// once any other terms write lands first. `forceCancelEvent` leaves it:
-    /// once cancelled, every terms and seat path refuses anyway (audit 1152 I-2).
+    /// `extendSalesEnd`, `cancelEvent`, `setOrganiserKey` and `revokeSignatures`.
+    /// Every organiser-signed action, terms AND seat moves, commits to its
+    /// current value, so a signature is dead once used and dead once any other
+    /// organiser write lands first: a new key, even one moved back to an earlier
+    /// key, finds no earlier signature alive (audit 1153 L-1). Seat moves do not
+    /// consume it, so several can be signed at once. `forceCancelEvent` leaves
+    /// it: once cancelled, every terms and seat path refuses anyway (audit 1152
+    /// I-2).
     mapping(bytes32 => uint256) public termsNonces;
 
     /// One-way: once true, `batchClaimBearer`, `batchClaimSeatsBearer`,
@@ -485,20 +494,25 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     bytes32 public constant CANCEL_EVENT_TYPEHASH = keccak256(
         "CancelEvent(bytes32 eventId,uint256 nonce,uint256 issuedAt,uint256 deadline)"
     );
+    bytes32 public constant REVOKE_SIGNATURES_TYPEHASH = keccak256(
+        "RevokeSignatures(bytes32 eventId,uint256 nonce,uint256 issuedAt,uint256 deadline)"
+    );
 
     /// EIP-712 types of a seat move. `holder` and `nonce` are the slot's current
-    /// owner and `transferNonces[eventId][slot]`, read from storage at
-    /// submission, so a consent dies when the slot moves by any path, and moves
-    /// on different slots never collide. One type per path (audit 1152 L-1):
-    /// `Reseat` is the two-party move, signed by the organiser key AND the
-    /// holder, and sets `held`; `ReseatBearer` is the organiser key alone on a
-    /// bearer ticket. So a consent given for one path can never be submitted
-    /// through the other, and a holder's signed move always sets `held`.
+    /// owner and `transferNonces[eventId][slot]`, and `termsNonce` is
+    /// `termsNonces[eventId]`, all read from storage at submission: a consent
+    /// dies when the slot moves by any path and when the organiser writes
+    /// anything (terms, key, `revokeSignatures`), and moves on different slots
+    /// never collide. One type per path (audit 1152 L-1): `Reseat` is the
+    /// two-party move, signed by the organiser key AND the holder, and sets
+    /// `held`; `ReseatBearer` is the organiser key alone on a bearer ticket. So
+    /// a consent given for one path can never be submitted through the other,
+    /// and a holder's signed move always sets `held`.
     bytes32 public constant RESEAT_TYPEHASH = keccak256(
-        "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 issuedAt,uint256 deadline)"
+        "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"
     );
     bytes32 public constant RESEAT_BEARER_TYPEHASH = keccak256(
-        "ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 issuedAt,uint256 deadline)"
+        "ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"
     );
 
     /// @notice The longest window a signed terms action or seat move may name.
@@ -601,6 +615,11 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @dev Indexers fold this from registration on for the current key;
     ///      `getOrganiserKey` reads it.
     event OrganiserKeySet(bytes32 indexed eventId, address indexed previous, address indexed key);
+
+    /// @notice The organiser voided every signed action and seat move it had
+    ///         not yet seen land (`revokeSignatures`). `by` is the caller on the
+    ///         direct path, the organiser key on the signed one.
+    event SignaturesRevoked(bytes32 indexed eventId, address indexed by);
 
     /// @notice `reissue` pointed a bearer slot at a fresh key.
     /// @dev Indexers MUST fold this over `SlotClaimed` as they fold
@@ -1210,7 +1229,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      * @dev The rotation at a passkey removal: the account adds this call to
      *      the same operation that moves its key ring, so the old key and the
      *      new one swap with nothing in between. Consumes each event's
-     *      `termsNonces`, so a terms signature the old key made is dead. Not
+     *      `termsNonces`, so every signature the old key made, terms or seat
+     *      move, is dead, and stays dead if the key ever comes back. Not
      *      refused once cancelled or past the cutoff, nor for an id already on
      *      `key` (skipped, no nonce spent): a rotation must not fail on one
      *      old or retried event. A wrong id (unknown, or another organiser's)
@@ -1243,6 +1263,44 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
             emit OrganiserKeySet(eventId, previous, key);
             unchecked { ++i; }
         }
+    }
+
+    /**
+     * @notice Void every organiser-signed action and seat move for the event
+     *         that has not landed yet, and change nothing else. The ORGANISER
+     *         only, as `setSupply`; `revokeSignaturesWithSignature` takes the
+     *         key's signature. The app's "cancel" on a change still being saved.
+     * @dev Consumes `termsNonces` (audit 1153 L-1), the bulk cancel signed
+     *      approvals carry elsewhere (a counter, as an order book's). A holder's
+     *      own signed `transferSlot` is untouched: it is the holder's, not the
+     *      organiser's. Not refused once cancelled or past the cutoff: it can
+     *      only take power away, so it never fails on an old event.
+     */
+    function revokeSignatures(bytes32 eventId) external {
+        _directTerms(eventId);
+        _revoke(eventId, msg.sender);
+    }
+
+    /// @notice `revokeSignatures` on the organiser key's EIP-712 signature over
+    ///         `revokeSignaturesDigest(eventId, issuedAt, deadline)`. Anyone may
+    ///         submit.
+    function revokeSignaturesWithSignature(
+        bytes32 eventId,
+        uint256 issuedAt,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        _checkWindow(issuedAt, deadline);
+        Event storage ev =
+            _signedTerms(eventId, revokeSignaturesDigest(eventId, issuedAt, deadline), signature);
+        _revoke(eventId, ev.organiserKey);
+    }
+
+    /// @dev `by` is who revoked: the caller on the direct path, the organiser
+    ///      key on the signed one (never the submitter).
+    function _revoke(bytes32 eventId, address by) private {
+        unchecked { ++termsNonces[eventId]; }
+        emit SignaturesRevoked(eventId, by);
     }
 
     /// @dev The direct terms path: the organiser's account, or its key, sends
@@ -1801,9 +1859,21 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         );
     }
 
+    /// @notice What the organiser key signs for `revokeSignaturesWithSignature`.
+    function revokeSignaturesDigest(bytes32 eventId, uint256 issuedAt, uint256 deadline)
+        public
+        view
+        returns (bytes32)
+    {
+        return _hashTypedDataV4(
+            keccak256(abi.encode(REVOKE_SIGNATURES_TYPEHASH, eventId, termsNonces[eventId], issuedAt, deadline))
+        );
+    }
+
     /// @notice What the organiser key AND the holder sign for `reseat`.
-    ///         Bound to the slot's CURRENT owner and transfer nonce, so it
-    ///         changes whenever the slot moves or reseats.
+    ///         Bound to the slot's CURRENT owner and transfer nonce and to the
+    ///         event's CURRENT `termsNonces`, so it changes whenever the slot
+    ///         moves or reseats and whenever the organiser writes anything.
     function reseatDigest(bytes32 eventId, uint256 slot, uint256 toSeat, uint256 issuedAt, uint256 deadline)
         public
         view
@@ -1839,6 +1909,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
                     toSeat,
                     _slots[eventId][slot].owner,
                     transferNonces[eventId][slot],
+                    termsNonces[eventId],
                     issuedAt,
                     deadline
                 )
