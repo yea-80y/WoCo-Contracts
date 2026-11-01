@@ -222,6 +222,7 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
         vm.chainId(42161);
         _etchSafe(owner);
         TestableDeployTicketLedger s = _script(owner, sponsor, 1_000);
+        s.setConfirmArbitrumOne(true);
         vm.expectRevert(bytes("INITIAL_OWNER is not the WoCo owner Safe"));
         s.run();
     }
@@ -229,9 +230,29 @@ contract DeployTicketLedgerTest is ScriptEnvFixture {
     function test_ArbitrumOne_AcceptsTheWoCoOwnerSafe() public {
         vm.chainId(42161);
         _etchSafe(WOCO_SAFE);
-        WoCoTicketLedger ledger = _script(WOCO_SAFE, sponsor, 1_000).run();
+        TestableDeployTicketLedger s = _script(WOCO_SAFE, sponsor, 1_000);
+        s.setConfirmArbitrumOne(true);
+        WoCoTicketLedger ledger = s.run();
         assertEq(ledger.owner(), WOCO_SAFE);
         assertEq(ledger.disputeAuthority(), WOCO_SAFE);
+    }
+
+    /// Audit 1155 I-6: the production deploy needs the explicit switch, even with
+    /// every other input right.
+    function test_ArbitrumOne_RefusesWithoutTheConfirmation() public {
+        vm.chainId(42161);
+        _etchSafe(WOCO_SAFE);
+        TestableDeployTicketLedger s = _script(WOCO_SAFE, sponsor, 1_000);
+        vm.expectRevert(bytes("Set CONFIRM_ARBITRUM_ONE_DEPLOY=true to deploy on Arbitrum One"));
+        s.run();
+    }
+
+    /// Other chains never need it.
+    function test_OtherChains_NeedNoConfirmation() public {
+        vm.chainId(OTHER_PROD_CHAIN);
+        _etchSafe(owner);
+        WoCoTicketLedger ledger = _script(owner, sponsor, 1_000).run();
+        assertEq(ledger.owner(), owner);
     }
 
     /// Testnet rehearsals (here the local chain) may use an EOA owner.
@@ -269,6 +290,10 @@ contract TestableDeployTicketLedger is DeployWoCoTicketLedger {
 
     function setOwnerSigner(address s) external {
         cfg.ownerSigner = s;
+    }
+
+    function setConfirmArbitrumOne(bool v) external {
+        cfg.confirmArbitrumOne = v;
     }
 
     function _config() internal view override returns (Config memory) {
