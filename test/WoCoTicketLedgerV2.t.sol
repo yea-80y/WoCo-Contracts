@@ -1234,6 +1234,10 @@ contract WoCoTicketLedgerV2Test is Test {
         bytes memory bearerOnly = _bearerSig(ORG_KEY, id, s, 9, deadline);
         vm.expectRevert(WoCoTicketLedger.NotOrganiserKey.selector);
         ledger.reseat(id, s, 9, issued, deadline, bearerOnly, h);
+        // Nor is a holder half signed over the bearer type.
+        bytes memory holderOverBearer = _bearerSig(HOLDER_KEY, id, s, 9, deadline);
+        vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
+        ledger.reseat(id, s, 9, issued, deadline, o, holderOverBearer);
 
         ledger.reseat(id, s, 9, issued, deadline, o, h);
         assertTrue(_held(id, s), "the holder's signed move did not set held");

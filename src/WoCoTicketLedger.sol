@@ -89,19 +89,23 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * undo a reduction), move the cutoff later within `MAX_SALES_EXTENSION`, move
  * or empty (`NO_SEAT`) the seat of any bearer ticket nobody has moved, until
  * `disableBearerMints`, and, with a holder's signature, move that holder's
- * ticket. None of it moves money toward anyone, and it cannot move the key.
+ * ticket. None of it moves money toward anyone, and it cannot move the key
+ * (the account is never registered as its own key).
  *
  * Not all of it can be undone after the account moves the key (audit 1152
- * L-3). The new key can seat bearer tickets again, but not into a seat the
- * leaked key's holder has since taken: a key holder who also holds tickets
- * can empty bearer tickets out of seats and `reseat` its own tickets into
- * them, and a `reseat` sets `held`, which puts those tickets beyond the new
- * key. A seat it empties is also free for sale until the new key restores
- * the ticket. Accepted, not engineered out: a lever over `held` tickets is the
- * power `held` exists to remove, and every remedy left is off chain: a leak
- * is met by moving the key at once, a seat picker must not sell a seat an
- * organiser-only move freed until the account confirms it, and the last
- * resort is `forceCancelEvent` with refunds.
+ * L-3). A cutoff it extends stays extended, by the monotonic rule below: up to
+ * `MAX_SALES_EXTENSION` per move, it keeps the sales window open and delays
+ * whatever keys on `eventEndTs`. The new key can seat bearer tickets again,
+ * but not into a seat the leaked key's holder has since taken: a key holder
+ * who also holds tickets can empty bearer tickets out of seats and `reseat`
+ * its own tickets into them, and a `reseat` sets `held`, which puts those
+ * tickets beyond the new key. A seat it empties is also free for sale until
+ * the new key restores the ticket. Accepted, not engineered out: a lever over
+ * `held` tickets is the power `held` exists to remove, and every remedy left
+ * is off chain: a leak is met by moving the key at once, a seat picker must
+ * not sell a seat an organiser-only move freed until the account confirms it,
+ * and the last resort is cancellation (`cancelEvent` or `forceCancelEvent`)
+ * with refunds.
  *
  * ── Seats ────────────────────────────────────────────────────────────────────
  *
@@ -129,9 +133,13 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * exists for it, and `seatWord` then shows the seat free while `remaining()`
  * is 0. It is refilled by seating the seatless ticket that left it: for a
  * card (bearer) ticket, `reissue` that slot to the next buyer's fresh key and
- * `reseatBearer` it into the seat; for a `held` ticket, only its holder can
- * hand the slot on (`transferSlot`). A seat picker reads `remaining()` with
- * `seatWord`, and never offers a seat it cannot fill.
+ * `reseatBearer` it into the seat (by the sponsor that minted it, before the
+ * cutoff, while not cancelled and until `disableBearerMints`; after that the
+ * seat stays empty); for a `held` ticket, only its holder can hand the slot
+ * on (`transferSlot`), and a `reseat` then seats it. A refilled slot keeps the
+ * ORIGINAL sale's claimer and `orderRef`, so the next buyer's order is keyed
+ * on `SlotReissued`, never on the slot's `orderRef`. A seat picker reads
+ * `remaining()` with `seatWord`, and never offers a seat it cannot fill.
  *
  * ── Reissue: the platform replacing a bearer ticket ──────────────────────────
  *
@@ -494,17 +502,22 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     );
 
     /// @notice The longest window a signed terms action or seat move may name.
-    ///         No signature the platform relays is a standing option: each one
-    ///         names its window, `issuedAt` to `deadline`, at most this long,
-    ///         and is usable only inside it (the registrar's ceiling,
-    ///         `WoCoRegistrar.sol`). The window is part of what is signed, so a
-    ///         signature asking for longer is refused for good, not merely
-    ///         until its deadline comes near (audit 1152 L-2). CHAIN time,
-    ///         under the rule stated on `registerEvent`'s `eventEndTs` (audit
-    ///         961 L-2): sign with `issuedAt` a few minutes in the past, or a
-    ///         lagging chain clock refuses the signature as not yet valid, and
-    ///         a signature can stay valid up to ~24h past the wall-clock
-    ///         deadline, or lapse early.
+    ///         Each signature names its window, `issuedAt` to `deadline`, at
+    ///         most this long, and is usable only inside it (the registrar's
+    ///         ceiling, `WoCoRegistrar.sol`). The window is part of what is
+    ///         signed, so a signature asking for longer is refused for good,
+    ///         not merely until its deadline comes near (audit 1152 L-2). The
+    ///         chain cannot tell a post-dated `issuedAt` from an honest one: a
+    ///         window set in the future is a standing option until it opens,
+    ///         and is what the signer signed. So clients stamp `issuedAt` from
+    ///         their clock, never ahead of it, and the relayer refuses anything
+    ///         whose `issuedAt` is ahead of the latest block. CHAIN time, under
+    ///         the rule stated on `registerEvent`'s `eventEndTs` (audit 961
+    ///         L-2): backdate `issuedAt` by about 15 minutes, since a lagging
+    ///         chain clock only delays a signature (`SignatureNotYetValid`
+    ///         until chain time reaches it), and every minute backdated comes
+    ///         off the window's usable span. A signature can stay valid up to
+    ///         ~24h past the wall-clock deadline, or lapse early.
     uint256 public constant MAX_TERMS_SIGNATURE_TTL = 48 hours;
 
     /// @notice `seatOf` for a slot with no seat, and the `toSeat` that moves a
