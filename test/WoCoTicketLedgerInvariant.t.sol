@@ -452,7 +452,21 @@ contract LedgerHandler is Test {
 
         address from = seenSlotOwner[id][slot];
         uint256 key = keyOf[from];
-        if (key == 0) return; // moved to a fuzzed owner by the holder path
+        // Moved to a fuzzed owner by the holder path: mint a fresh actor slot
+        // in this same call, so the witness never starves as the action list grows.
+        if (key == 0) {
+            id = _openGaEvent(pick);
+            key = actorKeys[bound(toSeed, 0, actorKeys.length - 1)];
+            from = vm.addr(key);
+            try ledger.claimFor(id, from, bytes32(uint256(19))) returns (uint256 s) {
+                _recordSlot(id, s, from);
+                actorSlotEvent.push(id);
+                actorSlotIndex.push(s);
+                slot = s;
+            } catch {
+                return;
+            }
+        }
         uint256 t = bound(toSeed, 0, actorKeys.length - 1);
         address to = vm.addr(actorKeys[t]);
         if (to == from) to = vm.addr(actorKeys[(t + 1) % actorKeys.length]);

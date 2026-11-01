@@ -80,6 +80,13 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * There is deliberately no owner lever to move an organiser's key: that would
  * be the platform control this design removes.
  *
+ * A LEAKED organiser key, until the account moves it, can do exactly what the
+ * organiser can and nothing more: cancel (one-way, buyer-protective), lower
+ * supply to what is minted, move the cutoff later within `MAX_SALES_EXTENSION`,
+ * and move or empty (`NO_SEAT`) the seat of any bearer ticket until
+ * `disableBearerMints`. None of it moves money toward anyone, the new key can
+ * seat the tickets again, and it cannot move the key.
+ *
  * ── Seats ────────────────────────────────────────────────────────────────────
  *
  * A seated event (`registerSeatedEvent`) has `supply` seats, indices
@@ -87,8 +94,10 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * Slots stay SEQUENTIAL exactly as on a general-admission event; each ticket's
  * seat is recorded beside its slot (`seatOf`) and one bit per seat records
  * that a ticket holds it (`seatWord`), so no seat is ever sold twice. Each
- * kind refuses the other's mint paths, so a seated event never has a
- * seatless ticket and a general-admission event never has a seat.
+ * kind refuses the other's mint paths, so a seated event never MINTS a
+ * seatless ticket and a general-admission event never has a seat. The one
+ * seatless ticket a seated event can hold is one moved to `NO_SEAT`, which the
+ * door must refuse (see `seatOf`).
  *
  * A seat moves only with the organiser's consent: `reseatBearer` on its key's
  * signature for a bearer ticket nobody holds the key to (until
@@ -110,7 +119,8 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * ticket signed by the fresh key takes its place. This IS the platform moving
  * a ticket, which the platform-authorised transfer rejected below
  * (`transferSlot`) would also have done. What differs:
- *   - SCOPE: only slots minted through `batchClaimBearer` by the calling
+ *   - SCOPE: only slots minted through `batchClaimBearer` or
+ *     `batchClaimSeatsBearer` by the calling
  *     sponsor and never moved by a holder since (`held`). A slot minted to its
  *     holder's own key (`batchClaimFor`, `claimFor`), or moved there, is out
  *     of reach from then on, with no action by the holder.
@@ -321,7 +331,8 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// Packed: address (20) + uint64 (8) + 2 bools = 30 bytes, one SSTORE per slot.
     ///
     /// `bearer` is set at mint and never changes: true only through
-    /// `batchClaimBearer`, for a ticket whose key is not kept. Only a bearer
+    /// `batchClaimBearer` and `batchClaimSeatsBearer`, for a ticket whose key
+    /// is not kept. Only a bearer
     /// slot can be reissued. `held` is set by the first holder-authorised move
     /// (`_transfer`) and never cleared: from then on a key someone keeps holds
     /// the slot, and `reissue` cannot reach it. A reissue does not set it.
@@ -452,7 +463,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice How far ahead a signed terms action or seat move may set its
     ///         deadline. No signature the platform relays is a standing
     ///         option: an organiser's consent lapses within two days of chain
-    ///         time (the registrar's ceiling, `WoCoRegistrar.sol`).
+    ///         time (the registrar's ceiling, `WoCoRegistrar.sol`). CHAIN time,
+    ///         under the rule stated on `registerEvent`'s `eventEndTs` (audit
+    ///         961 L-2): a signature can stay valid up to ~24h past the
+    ///         wall-clock deadline, or lapse early.
     uint256 public constant MAX_TERMS_SIGNATURE_TTL = 48 hours;
 
     /// @notice `seatOf` for a slot with no seat, and the `toSeat` that moves a
@@ -599,8 +613,6 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error SupplyAboveRegistered();
     /// @dev Later than `block.timestamp + MAX_SALES_EXTENSION`.
     error SalesEndTooFar();
-    /// @dev The organiser key would be set to the one already set.
-    error OrganiserKeyUnchanged();
     /// @dev A signature deadline more than `MAX_TERMS_SIGNATURE_TTL` ahead.
     error DeadlineTooFar();
     /// @dev A general-admission mint path called on a seated event.
@@ -1138,9 +1150,11 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
      *      the same operation that moves its key ring, so the old key and the
      *      new one swap with nothing in between. Consumes each event's
      *      `termsNonces`, so a terms signature the old key made is dead. Not
-     *      refused once cancelled or past the cutoff: the key then has nothing
-     *      to act on, and a rotation should not fail on one old event. No size
-     *      cap: the organiser pays for its own list.
+     *      refused once cancelled or past the cutoff, nor for an id already on
+     *      `key` (skipped, no nonce spent): a rotation must not fail on one
+     *      old or retried event. A wrong id (unknown, or another organiser's)
+     *      still reverts the batch. No size cap: the organiser pays for its
+     *      own list.
      */
     function setOrganiserKey(bytes32[] calldata eventIds, address key) external {
         uint256 n = eventIds.length;
@@ -1154,8 +1168,14 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
             if (!ev.exists)               revert EventNotFound();
             if (msg.sender != ev.organiser) revert NotOrganiser();
             address previous = ev.organiserKey;
-            // Also refuses an id listed twice.
-            if (previous == key)          revert OrganiserKeyUnchanged();
+            // Already on this key (a retried rotation, an id listed twice):
+            // nothing moves, no nonce is spent. Never a revert: this call
+            // rides inside the passkey-removal operation (audit 960 I-3's
+            // rule for an emergency lever).
+            if (previous == key) {
+                unchecked { ++i; }
+                continue;
+            }
 
             unchecked { ++termsNonces[eventId]; }
             ev.organiserKey = key;

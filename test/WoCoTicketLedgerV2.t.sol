@@ -584,6 +584,20 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.extendSalesEndWithSignature(id, later + 1, deadline, wrong);
     }
 
+    function test_SignedExtendSalesEnd_Deadlines() public {
+        bytes32 id = _register();
+        uint64 later = END_TS + 3 days;
+        uint256 past = block.timestamp - 1;
+        bytes memory sig = _sign(ORG_KEY, ledger.extendSalesEndDigest(id, later, past));
+        vm.expectRevert(WoCoTicketLedger.SignatureExpired.selector);
+        ledger.extendSalesEndWithSignature(id, later, past, sig);
+
+        uint256 tooFar = block.timestamp + ledger.MAX_TERMS_SIGNATURE_TTL() + 1;
+        sig = _sign(ORG_KEY, ledger.extendSalesEndDigest(id, later, tooFar));
+        vm.expectRevert(WoCoTicketLedger.DeadlineTooFar.selector);
+        ledger.extendSalesEndWithSignature(id, later, tooFar, sig);
+    }
+
     /// `by` is the organiser key, never whoever submitted it.
     function test_SignedCancel_LogsTheKey() public {
         bytes32 id = _register();
@@ -688,17 +702,35 @@ contract WoCoTicketLedgerV2Test is Test {
         ledger.setOrganiserKey(_ids(id), address(0));
         vm.expectRevert(WoCoTicketLedger.TransferToLedger.selector);
         ledger.setOrganiserKey(_ids(id), address(ledger));
-        vm.expectRevert(WoCoTicketLedger.OrganiserKeyUnchanged.selector);
-        ledger.setOrganiserKey(_ids(id), orgKey);
         vm.expectRevert(WoCoTicketLedger.EventNotFound.selector);
         ledger.setOrganiserKey(_ids(keccak256("nope")), orgKey2);
-        // An id listed twice: the second entry is unchanged.
-        bytes32[] memory twice = new bytes32[](2);
+        vm.stopPrank();
+    }
+
+    /// An id already on the key is skipped, never a revert: the call rides
+    /// inside the passkey-removal operation, and a retried rotation or a
+    /// duplicate id must not fail it. Nothing moves and no nonce is spent.
+    function test_SetOrganiserKey_AlreadyCurrentIsANoOp() public {
+        bytes32 id = _register();
+        vm.recordLogs();
+        vm.prank(organiser);
+        ledger.setOrganiserKey(_ids(id), orgKey);
+        assertEq(vm.getRecordedLogs().length, 0, "a no-op logged a key change");
+        assertEq(ledger.getOrganiserKey(id), orgKey);
+        assertEq(ledger.termsNonces(id), 0, "a no-op spent the terms nonce");
+
+        // An id listed twice: the first moves it, the second is skipped.
+        bytes32 other = _register();
+        bytes32[] memory twice = new bytes32[](3);
         twice[0] = id;
         twice[1] = id;
-        vm.expectRevert(WoCoTicketLedger.OrganiserKeyUnchanged.selector);
+        twice[2] = other;
+        vm.prank(organiser);
         ledger.setOrganiserKey(twice, orgKey2);
-        vm.stopPrank();
+        assertEq(ledger.getOrganiserKey(id), orgKey2);
+        assertEq(ledger.getOrganiserKey(other), orgKey2, "the batch stopped at a skipped id");
+        assertEq(ledger.termsNonces(id), 1, "a duplicate spent the nonce twice");
+        assertEq(ledger.termsNonces(other), 1);
     }
 
     /// A rotation never fails on an old event: cancelled and past-cutoff ids move too.
@@ -908,6 +940,20 @@ contract WoCoTicketLedgerV2Test is Test {
         _claimSeats(id, _seats(1), fresh);
     }
 
+    /// A move across bitmap words clears the old word's bit and sets the new one's.
+    function test_ReseatBearer_AcrossBitmapWords() public {
+        vm.prank(sponsor);
+        bytes32 id = ledger.registerSeatedEvent(organiser, orgKey, 600, MANIFEST, END_TS);
+        uint256 s = _claimSeatsBearer(id, _seats(300), holder);
+        assertEq(ledger.seatWord(id, 1), uint256(1) << (300 - 256));
+        _reseatBearer(id, s, 5);
+        assertEq(ledger.seatWord(id, 1), 0, "the old word's bit was not cleared");
+        assertEq(ledger.seatWord(id, 0), uint256(1) << 5);
+        _reseatBearer(id, s, 300);
+        assertEq(ledger.seatWord(id, 0), 0, "the old word's bit was not cleared");
+        assertEq(ledger.seatWord(id, 1), uint256(1) << (300 - 256));
+    }
+
     /// Out to `NO_SEAT` for a move to another band, and back into a seat.
     function test_ReseatBearer_ToNoSeatAndBack() public {
         bytes32 id = _registerSeated();
@@ -1068,6 +1114,28 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.expectRevert(WoCoTicketLedger.NotSlotOwner.selector);
         ledger.reseat(id, s, 9, deadline, o, _sign(OTHER_KEY, digest));
         assertEq(ledger.seatOf(id, s), 1);
+    }
+
+    function test_Reseat_DeadlinesAndUnclaimedSlot() public {
+        bytes32 id = _registerSeated();
+        uint256 s = _claimSeats(id, _seats(1), holder);
+
+        uint256 past = block.timestamp - 1;
+        bytes32 digest = ledger.reseatDigest(id, s, 9, past);
+        vm.expectRevert(WoCoTicketLedger.SignatureExpired.selector);
+        ledger.reseat(id, s, 9, past, _sign(ORG_KEY, digest), _sign(HOLDER_KEY, digest));
+
+        uint256 tooFar = block.timestamp + ledger.MAX_TERMS_SIGNATURE_TTL() + 1;
+        digest = ledger.reseatDigest(id, s, 9, tooFar);
+        vm.expectRevert(WoCoTicketLedger.DeadlineTooFar.selector);
+        ledger.reseat(id, s, 9, tooFar, _sign(ORG_KEY, digest), _sign(HOLDER_KEY, digest));
+
+        // An unclaimed slot: its holder reads as zero, so no holder signature
+        // can match; refused as unclaimed first.
+        uint256 deadline = _deadline();
+        digest = ledger.reseatDigest(id, 7, 9, deadline);
+        vm.expectRevert(WoCoTicketLedger.SlotUnclaimed.selector);
+        ledger.reseat(id, 7, 9, deadline, _sign(ORG_KEY, digest), _sign(HOLDER_KEY, digest));
     }
 
     /// The holder's consent dies with the slot's move: after a transfer, the
@@ -1568,7 +1636,6 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(bytes32(WoCoTicketLedger.SupplyUnchanged.selector),   bytes32(bytes4(keccak256("SupplyUnchanged()"))));
         assertEq(bytes32(WoCoTicketLedger.SupplyAboveRegistered.selector), bytes32(bytes4(keccak256("SupplyAboveRegistered()"))));
         assertEq(bytes32(WoCoTicketLedger.SalesEndTooFar.selector),    bytes32(bytes4(keccak256("SalesEndTooFar()"))));
-        assertEq(bytes32(WoCoTicketLedger.OrganiserKeyUnchanged.selector), bytes32(bytes4(keccak256("OrganiserKeyUnchanged()"))));
         assertEq(bytes32(WoCoTicketLedger.DeadlineTooFar.selector),    bytes32(bytes4(keccak256("DeadlineTooFar()"))));
         assertEq(bytes32(WoCoTicketLedger.SeatedEvent.selector),       bytes32(bytes4(keccak256("SeatedEvent()"))));
         assertEq(bytes32(WoCoTicketLedger.NotSeated.selector),         bytes32(bytes4(keccak256("NotSeated()"))));
