@@ -93,9 +93,10 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * supply anywhere from what is minted up to `registeredSupply` (so it can also
  * undo a reduction), move the cutoff later within `MAX_SALES_EXTENSION`, move
  * or empty (`NO_SEAT`) the seat of any bearer ticket nobody has moved, until
- * `disableBearerMints`, and, with a holder's signature, move that holder's
- * ticket. None of it moves money toward anyone, and it cannot move the key
- * (the account is never registered as its own key).
+ * `disableBearerMints`, with a holder's signature, move that holder's
+ * ticket, and void its own pending signatures (`revokeSignatures`). None of it
+ * moves money toward anyone, and it cannot move the key (the account is never
+ * registered as its own key).
  *
  * Not all of it can be undone after the account moves the key (audit 1152
  * L-3). A cutoff it extends stays extended, by the monotonic rule below: up to
@@ -418,8 +419,9 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// or its organiser key, on either path, direct or signed: `setSupply`,
     /// `extendSalesEnd`, `cancelEvent`, `setOrganiserKey` and `revokeSignatures`.
     /// Every organiser-signed action, terms AND seat moves, commits to its
-    /// current value, so a signature is dead once used and dead once any other
-    /// organiser write lands first: a new key, even one moved back to an earlier
+    /// current value, so a signature is dead once used (a seat move by its
+    /// slot's `transferNonces`) and dead once any other organiser write lands
+    /// first: a new key, even one moved back to an earlier
     /// key, finds no earlier signature alive (audit 1153 L-1). Seat moves do not
     /// consume it, so several can be signed at once. `forceCancelEvent` leaves
     /// it: once cancelled, every terms and seat path refuses anyway (audit 1152
