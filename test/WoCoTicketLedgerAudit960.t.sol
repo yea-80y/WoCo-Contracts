@@ -35,7 +35,7 @@ contract WoCoTicketLedgerAudit960Test is Test {
 
     function _register() internal returns (bytes32 eventId) {
         vm.prank(sponsor);
-        eventId = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        eventId = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
     }
 
     function _mint(bytes32 eventId, uint256 n) internal {

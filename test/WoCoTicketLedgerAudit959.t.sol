@@ -44,7 +44,7 @@ contract WoCoTicketLedgerAudit959Test is Test {
 
     function _register() internal returns (bytes32 eventId) {
         vm.prank(sponsor);
-        eventId = ledger.registerEvent(organiser, SUPPLY, MANIFEST, END_TS);
+        eventId = ledger.registerEvent(organiser, organiser,SUPPLY, MANIFEST, END_TS);
     }
 
     function _owners(uint256 n) internal view returns (address[] memory a) {
@@ -448,7 +448,7 @@ contract WoCoTicketLedgerCapInvariantTest is Test {
         vm.warp(1_800_000_000);
         ledger = new WoCoTicketLedger(owner, address(0xDEAD), 1);
         vm.prank(address(0xDEAD));
-        bytes32 eventId = ledger.registerEvent(address(0x3), type(uint64).max, keccak256("m"), uint64(block.timestamp + 3650 days));
+        bytes32 eventId = ledger.registerEvent(address(0x3), address(0x3), type(uint64).max, keccak256("m"), uint64(block.timestamp + 3650 days));
         handler = new CapHandler(ledger, owner, eventId, 10);
         vm.prank(owner);
         ledger.addSponsor(address(handler), 10);
