@@ -95,8 +95,10 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * or empty (`NO_SEAT`) the seat of any bearer ticket nobody has moved, until
  * `disableBearerMints`, with a holder's signature, move that holder's
  * ticket, and void its own pending signatures (`revokeSignatures`). None of it
- * moves money toward anyone, and it cannot move the key (the account is never
- * registered as its own key).
+ * moves money toward anyone, and it cannot move the key: only the account can.
+ * The platform never names the account as its own key; an EOA organiser that
+ * registers itself may, and then its key IS the account, so a leak of it is a
+ * leak of the account (audit 1155 I-1).
  *
  * Not all of it can be undone after the account moves the key (audit 1152
  * L-3). A cutoff it extends stays extended, by the monotonic rule below: up to
@@ -470,12 +472,22 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ///         multiply (audit 1059 M-1). Two festival cycles.
     uint64 public constant MAX_SALES_EXTENSION = 730 days;
 
-    /// Per-slot counter consumed by EVERY ownership change: both transfer
-    /// paths and `reissue`. A signed transfer commits to its current value, so
-    /// a signature is dead once used and dead once the slot moves any other
-    /// way — including a round trip back to the signer, after which (from, to,
-    /// deadline) alone would validate again.
+    /// Per-slot counter consumed by EVERY ownership change and seat move: both
+    /// transfer paths, `reissue` and `_reseat` (audit 1155 I-3). A signed
+    /// transfer or seat move commits to its current value, so a signature is
+    /// dead once used and dead once the slot moves any other way — including a
+    /// round trip back to the signer, after which (from, to, deadline) alone
+    /// would validate again. A seat move therefore also kills the holder's
+    /// pending signed transfer of that slot; the holder signs again.
     mapping(bytes32 => mapping(uint256 => uint256)) public transferNonces;
+
+    /// Per-seat counter bumped each time the seat is FREED (`_freeSeat`). A seat
+    /// move commits to its target seat's value, so a signed move that reverted
+    /// `SeatTaken` is dead once that seat changes hands, rather than landing
+    /// later when it frees (audit 1155 L-1). A take needs no bump: the move
+    /// cannot land while the seat is held, and the free that follows bumps it.
+    /// `NO_SEAT` is never freed, so a move out of a seat always reads 0.
+    mapping(bytes32 => mapping(uint256 => uint256)) public seatNonces;
 
     /// EIP-712 type a holder signs to move a slot (domain: "WoCoTicketLedger",
     /// version "2", this chain, this contract). `from` and `nonce` are read from
@@ -501,20 +513,21 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     );
 
     /// EIP-712 types of a seat move. `holder` and `nonce` are the slot's current
-    /// owner and `transferNonces[eventId][slot]`, and `termsNonce` is
-    /// `termsNonces[eventId]`, all read from storage at submission: a consent
-    /// dies when the slot moves by any path and when the organiser writes
-    /// anything (terms, key, `revokeSignatures`), and moves on different slots
-    /// never collide. One type per path (audit 1152 L-1): `Reseat` is the
-    /// two-party move, signed by the organiser key AND the holder, and sets
-    /// `held`; `ReseatBearer` is the organiser key alone on a bearer ticket. So
-    /// a consent given for one path can never be submitted through the other,
-    /// and a holder's signed move always sets `held`.
+    /// owner and `transferNonces[eventId][slot]`, `termsNonce` is
+    /// `termsNonces[eventId]`, and `seatNonce` is `seatNonces[eventId][toSeat]`,
+    /// all read from storage at submission: a consent dies when the slot moves
+    /// by any path, when the organiser writes anything (terms, key,
+    /// `revokeSignatures`), and when its target seat changes hands; moves on
+    /// different slots never collide. One type per path (audit 1152 L-1):
+    /// `Reseat` is the two-party move, signed by the organiser key AND the
+    /// holder, and sets `held`; `ReseatBearer` is the organiser key alone on a
+    /// bearer ticket. So a consent given for one path can never be submitted
+    /// through the other, and a holder's signed move always sets `held`.
     bytes32 public constant RESEAT_TYPEHASH = keccak256(
-        "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"
+        "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 seatNonce,uint256 issuedAt,uint256 deadline)"
     );
     bytes32 public constant RESEAT_BEARER_TYPEHASH = keccak256(
-        "ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"
+        "ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 seatNonce,uint256 issuedAt,uint256 deadline)"
     );
 
     /// @notice The longest window a signed terms action or seat move may name.
@@ -810,8 +823,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     ) private returns (bytes32 eventId) {
         if (organiser == address(0))       revert ZeroAddress();
         if (organiserKey == address(0))    revert ZeroAddress();
-        // The ledger signs nothing, so a key set to it could never act.
+        // The ledger signs nothing and never calls itself, so a key or an
+        // organiser set to it could never act (audit 1155 I-8).
         if (organiserKey == address(this)) revert TransferToLedger();
+        if (organiser == address(this))    revert TransferToLedger();
         if (supply == 0)                   revert InsufficientSupply();
         if (manifestRef == bytes32(0))     revert EmptyManifestRef();
         if (eventEndTs <= block.timestamp) revert InvalidEventEnd();
@@ -1006,9 +1021,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         _seatTaken[eventId][seat >> 8] = word | bit;
     }
 
-    /// @dev Clears the seat's bit. Only called for a seat a ticket holds.
+    /// @dev Clears the seat's bit and bumps its `seatNonces`, so a signed move
+    ///      into it made while it was held stays dead. Only called for a seat a
+    ///      ticket holds.
     function _freeSeat(bytes32 eventId, uint256 seat) private {
         _seatTaken[eventId][seat >> 8] &= ~(uint256(1) << (seat & 255));
+        unchecked { ++seatNonces[eventId][seat]; }
     }
 
     /**
@@ -1873,9 +1891,10 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     }
 
     /// @notice What the organiser key AND the holder sign for `reseat`.
-    ///         Bound to the slot's CURRENT owner and transfer nonce and to the
-    ///         event's CURRENT `termsNonces`, so it changes whenever the slot
-    ///         moves or reseats and whenever the organiser writes anything.
+    ///         Bound to the slot's CURRENT owner and transfer nonce, the event's
+    ///         CURRENT `termsNonces` and the target seat's CURRENT `seatNonces`,
+    ///         so it changes whenever the slot moves or reseats, whenever the
+    ///         organiser writes anything, and whenever the target seat is freed.
     function reseatDigest(bytes32 eventId, uint256 slot, uint256 toSeat, uint256 issuedAt, uint256 deadline)
         public
         view
@@ -1912,6 +1931,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
                     _slots[eventId][slot].owner,
                     transferNonces[eventId][slot],
                     termsNonces[eventId],
+                    seatNonces[eventId][toSeat],
                     issuedAt,
                     deadline
                 )

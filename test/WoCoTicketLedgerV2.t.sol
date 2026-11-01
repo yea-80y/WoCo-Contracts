@@ -142,6 +142,17 @@ contract WoCoTicketLedgerV2Test is Test {
         vm.stopPrank();
     }
 
+    /// Audit 1155 I-8: nor the organiser. The ledger never calls itself, so such
+    /// an event could never act or move its key.
+    function test_Register_OrganiserNeverTheLedger() public {
+        vm.startPrank(sponsor);
+        vm.expectRevert(WoCoTicketLedger.TransferToLedger.selector);
+        ledger.registerEvent(address(ledger), orgKey, SUPPLY, MANIFEST, END_TS);
+        vm.expectRevert(WoCoTicketLedger.TransferToLedger.selector);
+        ledger.registerSeatedEvent(address(ledger), orgKey, SUPPLY, MANIFEST, END_TS);
+        vm.stopPrank();
+    }
+
     /// An EOA organiser registering its own events may be its own key.
     function test_Register_KeyMayBeTheOrganiser() public {
         vm.prank(organiser);
@@ -1360,7 +1371,11 @@ contract WoCoTicketLedgerV2Test is Test {
     function test_ReseatDigests_AreEip712AndDistinct() public {
         bytes32 id = _registerSeated();
         uint256 s = _claimSeats(id, _seats(1), holder);
-        // A terms write first, so the seat digests are seen to carry termsNonce 1.
+        // Seat 9 held then freed, so the digests are seen to carry seatNonce 1.
+        uint256 other = _claimSeatsBearer(id, _seats(9), holder);
+        _reseatBearer(id, other, 8);
+        assertEq(ledger.seatNonces(id, 9), 1);
+        // A terms write, so they are seen to carry termsNonce 1.
         vm.prank(organiser);
         ledger.setSupply(id, SUPPLY - 1);
         uint256 issued = _issued();
@@ -1377,9 +1392,9 @@ contract WoCoTicketLedgerV2Test is Test {
         bytes32 structHash = keccak256(
             abi.encode(
                 keccak256(
-                    "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"
+                    "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 seatNonce,uint256 issuedAt,uint256 deadline)"
                 ),
-                id, s, uint256(9), holder, uint256(0), uint256(1), issued, deadline
+                id, s, uint256(9), holder, uint256(0), uint256(1), uint256(1), issued, deadline
             )
         );
         assertEq(
@@ -1389,9 +1404,9 @@ contract WoCoTicketLedgerV2Test is Test {
         bytes32 bearerStruct = keccak256(
             abi.encode(
                 keccak256(
-                    "ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"
+                    "ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 seatNonce,uint256 issuedAt,uint256 deadline)"
                 ),
-                id, s, uint256(9), holder, uint256(0), uint256(1), issued, deadline
+                id, s, uint256(9), holder, uint256(0), uint256(1), uint256(1), issued, deadline
             )
         );
         assertEq(
@@ -1472,6 +1487,71 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(ledger.seatOf(id, a), 7);
         assertEq(ledger.seatOf(id, b), 8);
         assertEq(ledger.termsNonces(id), 0);
+    }
+
+    // ── a failed seat move stays dead (audit 1155 L-1) ───────────────────────
+
+    /// The audit's scenario: a move into a held seat reverts; the holder of that
+    /// seat moves off; the first signature, resubmitted, is refused, on both paths.
+    function test_SeatMove_FailedSignatureDiesWhenItsSeatChangesHands() public {
+        bytes32 id = _registerSeated();
+        uint256 a = _claimSeatsBearer(id, _seats(1), holder);
+        uint256 b = _claimSeatsBearer(id, _seats(5), holder);
+        uint256 h = _claimSeats(id, _seats(2), holder);
+        uint256 issued = _issued();
+        uint256 deadline = _deadline();
+        bytes memory early = _bearerSig(ORG_KEY, id, a, 5, deadline);
+        bytes32 twoParty = ledger.reseatDigest(id, h, 5, issued, deadline);
+        bytes memory o = _sign(ORG_KEY, twoParty);
+        bytes memory hs = _sign(HOLDER_KEY, twoParty);
+        vm.expectRevert(WoCoTicketLedger.SeatTaken.selector);
+        ledger.reseatBearer(id, a, 5, issued, deadline, early);
+        vm.expectRevert(WoCoTicketLedger.SeatTaken.selector);
+        ledger.reseat(id, h, 5, issued, deadline, o, hs);
+
+        _reseatBearer(id, b, 7);
+        assertEq(ledger.seatNonces(id, 5), 1);
+        assertFalse(_seatTaken(id, 5));
+
+        vm.prank(stranger);
+        vm.expectRevert(WoCoTicketLedger.NotOrganiserKey.selector);
+        ledger.reseatBearer(id, a, 5, issued, deadline, early);
+        vm.expectRevert(WoCoTicketLedger.NotOrganiserKey.selector);
+        ledger.reseat(id, h, 5, issued, deadline, o, hs);
+        assertEq(ledger.seatOf(id, a), 1);
+        assertEq(ledger.seatOf(id, h), 2);
+        assertFalse(_held(id, h), "a refused late move set held");
+    }
+
+    /// A move into a seat that stays free keeps its intent: it lands, and a seat
+    /// that was only ever taken (a mint) bumps nothing.
+    function test_SeatMove_IntoASeatThatStaysFreeLands() public {
+        bytes32 id = _registerSeated();
+        uint256 a = _claimSeatsBearer(id, _seats(1), holder);
+        _claimSeats(id, _seats(4), holder);
+        assertEq(ledger.seatNonces(id, 4), 0, "a take bumped the seat nonce");
+        uint256 issued = _issued();
+        uint256 deadline = _deadline();
+        bytes memory sig = _bearerSig(ORG_KEY, id, a, 6, deadline);
+        ledger.reseatBearer(id, a, 6, issued, deadline, sig);
+        assertEq(ledger.seatOf(id, a), 6);
+        assertEq(ledger.seatNonces(id, 1), 1, "the seat it left was not bumped");
+        assertEq(ledger.seatNonces(id, 6), 0, "the seat it took was bumped");
+    }
+
+    /// A move out to `NO_SEAT` is unaffected: `NO_SEAT` is never freed, so it
+    /// reads 0, and the seat left behind is bumped.
+    function test_SeatMove_ToNoSeatUnaffected() public {
+        bytes32 id = _registerSeated();
+        uint256 a = _claimSeatsBearer(id, _seats(3), holder);
+        uint256 noSeat = ledger.NO_SEAT();
+        uint256 issued = _issued();
+        uint256 deadline = _deadline();
+        bytes memory sig = _bearerSig(ORG_KEY, id, a, noSeat, deadline);
+        ledger.reseatBearer(id, a, noSeat, issued, deadline, sig);
+        assertEq(ledger.seatOf(id, a), noSeat);
+        assertEq(ledger.seatNonces(id, noSeat), 0);
+        assertEq(ledger.seatNonces(id, 3), 1);
     }
 
     /// `revokeSignatures` voids every pending organiser signature, terms and
@@ -1973,6 +2053,7 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(bytes32(WoCoTicketLedger.cancelEventDigest.selector), bytes32(bytes4(keccak256("cancelEventDigest(bytes32,uint256,uint256)"))));
         assertEq(bytes32(WoCoTicketLedger.reseatDigest.selector),     bytes32(bytes4(keccak256("reseatDigest(bytes32,uint256,uint256,uint256,uint256)"))));
         assertEq(bytes32(WoCoTicketLedger.reseatBearerDigest.selector), bytes32(bytes4(keccak256("reseatBearerDigest(bytes32,uint256,uint256,uint256,uint256)"))));
+        assertEq(bytes32(ledger.seatNonces.selector),                 bytes32(bytes4(keccak256("seatNonces(bytes32,uint256)"))));
         assertEq(bytes32(WoCoTicketLedger.revokeSignatures.selector), bytes32(bytes4(keccak256("revokeSignatures(bytes32)"))));
         assertEq(bytes32(WoCoTicketLedger.revokeSignaturesWithSignature.selector), bytes32(bytes4(keccak256("revokeSignaturesWithSignature(bytes32,uint256,uint256,bytes)"))));
         assertEq(bytes32(WoCoTicketLedger.revokeSignaturesDigest.selector), bytes32(bytes4(keccak256("revokeSignaturesDigest(bytes32,uint256,uint256)"))));
@@ -1997,8 +2078,8 @@ contract WoCoTicketLedgerV2Test is Test {
         assertEq(ledger.SET_SUPPLY_TYPEHASH(),       keccak256("SetSupply(bytes32 eventId,uint64 supply,uint256 nonce,uint256 issuedAt,uint256 deadline)"));
         assertEq(ledger.EXTEND_SALES_END_TYPEHASH(), keccak256("ExtendSalesEnd(bytes32 eventId,uint64 eventEndTs,uint256 nonce,uint256 issuedAt,uint256 deadline)"));
         assertEq(ledger.CANCEL_EVENT_TYPEHASH(),     keccak256("CancelEvent(bytes32 eventId,uint256 nonce,uint256 issuedAt,uint256 deadline)"));
-        assertEq(ledger.RESEAT_TYPEHASH(),           keccak256("Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"));
-        assertEq(ledger.RESEAT_BEARER_TYPEHASH(),    keccak256("ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 issuedAt,uint256 deadline)"));
+        assertEq(ledger.RESEAT_TYPEHASH(),           keccak256("Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 seatNonce,uint256 issuedAt,uint256 deadline)"));
+        assertEq(ledger.RESEAT_BEARER_TYPEHASH(),    keccak256("ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 seatNonce,uint256 issuedAt,uint256 deadline)"));
         assertEq(ledger.REVOKE_SIGNATURES_TYPEHASH(), keccak256("RevokeSignatures(bytes32 eventId,uint256 nonce,uint256 issuedAt,uint256 deadline)"));
 
         assertEq(bytes32(WoCoTicketLedger.BearerMintsOff.selector),    bytes32(bytes4(keccak256("BearerMintsOff()"))));

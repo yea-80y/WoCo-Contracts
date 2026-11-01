@@ -16,8 +16,9 @@ import {WoCoTicketLedger, LEDGER_UNLIMITED_MINTS} from "../src/WoCoTicketLedger.
  *     forge script script/DeployTicketLedger.s.sol \
  *       --rpc-url arb_sepolia --broadcast --verify
  *
- *   Arbitrum One (production — explicit confirmation required):
- *     forge script script/DeployTicketLedger.s.sol \
+ *   Arbitrum One (production — explicit confirmation required: run() refuses
+ *   42161 unless CONFIRM_ARBITRUM_ONE_DEPLOY=true, audit 1155 I-6):
+ *     CONFIRM_ARBITRUM_ONE_DEPLOY=true forge script script/DeployTicketLedger.s.sol \
  *       --rpc-url arbitrum --broadcast --verify
  *
  * Dry-run (no broadcast):
@@ -48,6 +49,8 @@ import {WoCoTicketLedger, LEDGER_UNLIMITED_MINTS} from "../src/WoCoTicketLedger.
  *                          M-1). Non-zero and at most 100,000: the first
  *                          sponsor is the hot card key. The Safe retunes it
  *                          later with setSponsorMintCap.
+ *   CONFIRM_ARBITRUM_ONE_DEPLOY — Arbitrum One only: must be `true` or run()
+ *                          refuses before anything is sent.
  *
  * POST-DEPLOY, IN THIS ORDER (1 before 2 — reversing them opens a window in
  * which every mint reverts NotAuthorised and ticket fulfilment stops):
@@ -66,6 +69,7 @@ contract DeployWoCoTicketLedger is Script {
         address sponsor;
         uint256 perHour;
         bool writeDeploymentRecord;
+        bool confirmArbitrumOne;
     }
 
     /// @dev `virtual` ONLY so tests can vary the inputs: `vm.setEnv` writes the
@@ -79,6 +83,7 @@ contract DeployWoCoTicketLedger is Script {
         c.sponsor = vm.envAddress("INITIAL_SPONSOR");
         c.perHour = vm.envUint("INITIAL_SPONSOR_MINTS_PER_HOUR");
         c.writeDeploymentRecord = vm.envOr("WRITE_DEPLOYMENT_RECORD", true);
+        c.confirmArbitrumOne = vm.envOr("CONFIRM_ARBITRUM_ONE_DEPLOY", false);
     }
 
     function run() external returns (WoCoTicketLedger ledger) {
@@ -102,6 +107,8 @@ contract DeployWoCoTicketLedger is Script {
             // list our signer (a second Safe of ours, or a substituted one), so on
             // the production chain the address itself is pinned.
             if (block.chainid == 42161) {
+                // An immutable production deploy is never one by accident.
+                require(c.confirmArbitrumOne, "Set CONFIRM_ARBITRUM_ONE_DEPLOY=true to deploy on Arbitrum One");
                 require(c.owner == WOCO_OWNER_SAFE_ARBITRUM_ONE, "INITIAL_OWNER is not the WoCo owner Safe");
             }
             require(c.owner.code.length > 0, "INITIAL_OWNER must be a Safe deployed on this chain");
