@@ -988,10 +988,22 @@ contract LedgerHandler is Test {
         } catch {}
     }
 
-    /// Move a seated ticket: a bearer one on the organiser key's signature
-    /// alone, any one on the key's and its holder's. Picks a free seat, or
-    /// `NO_SEAT` now and then.
-    function reseat(uint256 pick, uint256 seatSeed, bool twoParty, address submitter) external {
+    /// Move a seated ticket on the organiser key's signature alone (a bearer
+    /// one nobody has moved; otherwise it falls to the two-party road).
+    /// One external entry per road, so each is picked on its own and neither
+    /// witness hangs on a fuzzed bool (audit 1152 sign-off: a run that never
+    /// drew `twoParty == true` missed `holderReseats`, about 1 suite in 12).
+    function reseatBearerRoad(uint256 pick, uint256 seatSeed, address submitter) external {
+        _reseatRoad(pick, seatSeed, false, submitter);
+    }
+
+    /// Move a seated ticket on the organiser key's AND its holder's signatures.
+    function reseatTwoParty(uint256 pick, uint256 seatSeed, address submitter) external {
+        _reseatRoad(pick, seatSeed, true, submitter);
+    }
+
+    /// Picks a free seat, or `NO_SEAT` now and then.
+    function _reseatRoad(uint256 pick, uint256 seatSeed, bool twoParty, address submitter) internal {
         bytes32 id;
         uint256 slot;
         bool usable;
