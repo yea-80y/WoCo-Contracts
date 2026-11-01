@@ -169,6 +169,7 @@ contract LedgerHandler is Test {
     struct SpentTerms {
         bytes32 eventId;
         uint64  supply;
+        uint256 issuedAt;
         uint256 deadline;
         bytes   sig;
     }
@@ -629,14 +630,17 @@ contract LedgerHandler is Test {
         uint256 r = road % 3;
         bool landed;
         if (r == 2) {
+            uint256 issued = block.timestamp;
             uint256 deadline = block.timestamp + 1 hours;
-            bytes memory sig = _sign(keyOf[expectedKey[id]], ledger.setSupplyDigest(id, supply, deadline));
+            bytes memory sig =
+                _sign(keyOf[expectedKey[id]], ledger.setSupplyDigest(id, supply, issued, deadline));
             if (submitter == address(0)) submitter = address(0xCAFE);
             vm.prank(submitter);
-            try ledger.setSupplyWithSignature(id, supply, deadline, sig) {
+            try ledger.setSupplyWithSignature(id, supply, issued, deadline, sig) {
                 landed = true;
                 signedTermsMade++;
-                lastSpentTerms = SpentTerms({eventId: id, supply: supply, deadline: deadline, sig: sig});
+                lastSpentTerms =
+                    SpentTerms({eventId: id, supply: supply, issuedAt: issued, deadline: deadline, sig: sig});
                 hasSpentTerms = true;
             } catch {}
         } else {
@@ -665,11 +669,13 @@ contract LedgerHandler is Test {
         uint256 r = road % 3;
         bool landed;
         if (r == 2) {
+            uint256 issued = block.timestamp;
             uint256 deadline = block.timestamp + 1 hours;
-            bytes memory sig = _sign(keyOf[expectedKey[id]], ledger.extendSalesEndDigest(id, newEnd, deadline));
+            bytes memory sig =
+                _sign(keyOf[expectedKey[id]], ledger.extendSalesEndDigest(id, newEnd, issued, deadline));
             if (submitter == address(0)) submitter = address(0xCAFE);
             vm.prank(submitter);
-            try ledger.extendSalesEndWithSignature(id, newEnd, deadline, sig) {
+            try ledger.extendSalesEndWithSignature(id, newEnd, issued, deadline, sig) {
                 landed = true;
                 signedTermsMade++;
             } catch {}
@@ -714,10 +720,11 @@ contract LedgerHandler is Test {
             // An actor key: never an organiser key here.
             uint256 wrong = actorKeys[bound(supplySeed, 0, actorKeys.length - 1)];
             unauthorisedTermsAttempts++;
+            uint256 issued = block.timestamp;
             uint256 deadline = block.timestamp + 1 hours;
-            bytes memory sig = _sign(wrong, ledger.setSupplyDigest(id, supply, deadline));
+            bytes memory sig = _sign(wrong, ledger.setSupplyDigest(id, supply, issued, deadline));
             vm.prank(caller == address(0) ? address(0xCAFE) : caller);
-            try ledger.setSupplyWithSignature(id, supply, deadline, sig) {
+            try ledger.setSupplyWithSignature(id, supply, issued, deadline, sig) {
                 unauthorisedTermsLanded = true;
             } catch {}
         }
@@ -747,11 +754,12 @@ contract LedgerHandler is Test {
             keyRotations++;
         }
         uint64 supply = _nextSupply(id, supplySeed);
+        uint256 issued = block.timestamp;
         uint256 deadline = block.timestamp + 1 hours;
-        bytes memory sig = _sign(retiredKey[id], ledger.setSupplyDigest(id, supply, deadline));
+        bytes memory sig = _sign(retiredKey[id], ledger.setSupplyDigest(id, supply, issued, deadline));
         retiredKeyAttempts++;
         vm.prank(submitter == address(0) ? address(0xCAFE) : submitter);
-        try ledger.setSupplyWithSignature(id, supply, deadline, sig) {
+        try ledger.setSupplyWithSignature(id, supply, issued, deadline, sig) {
             unauthorisedTermsLanded = true;
         } catch {}
     }
@@ -769,16 +777,18 @@ contract LedgerHandler is Test {
         if (!live) {
             bytes32 fresh = _registerFresh(address(this));
             uint64 target = _nextSupply(fresh, 50);
+            uint256 issued = block.timestamp;
             uint256 deadline = block.timestamp + 1 hours;
-            bytes memory sig = _sign(keyOf[expectedKey[fresh]], ledger.setSupplyDigest(fresh, target, deadline));
-            try ledger.setSupplyWithSignature(fresh, target, deadline, sig) {
+            bytes memory sig =
+                _sign(keyOf[expectedKey[fresh]], ledger.setSupplyDigest(fresh, target, issued, deadline));
+            try ledger.setSupplyWithSignature(fresh, target, issued, deadline, sig) {
                 stamped[fresh].totalSupply = target;
                 supplySets++;
                 signedTermsMade++;
             } catch {
                 return;
             }
-            s = SpentTerms({eventId: fresh, supply: target, deadline: deadline, sig: sig});
+            s = SpentTerms({eventId: fresh, supply: target, issuedAt: issued, deadline: deadline, sig: sig});
             lastSpentTerms = s;
             hasSpentTerms = true;
         }
@@ -797,7 +807,7 @@ contract LedgerHandler is Test {
         }
         termsReplayAttempts++;
         vm.prank(submitter == address(0) ? address(0xCAFE) : submitter);
-        try ledger.setSupplyWithSignature(s.eventId, s.supply, s.deadline, s.sig) {
+        try ledger.setSupplyWithSignature(s.eventId, s.supply, s.issuedAt, s.deadline, s.sig) {
             unauthorisedTermsLanded = true;
         } catch {}
     }
@@ -1028,23 +1038,26 @@ contract LedgerHandler is Test {
         if (toSeat == type(uint256).max) return;
         if (toSeat == ledger.NO_SEAT() && seenSeat[id][slot] == 0) return;
         if (submitter == address(0)) submitter = address(0xCAFE);
+        uint256 issued = block.timestamp;
         uint256 deadline = block.timestamp + 1 hours;
-        bytes32 digest = ledger.reseatDigest(id, slot, toSeat, deadline);
-        bytes memory orgSig = _sign(keyOf[expectedKey[id]], digest);
 
         bool bearerPath = !twoParty && seenBearer[id][slot] && !seenMoved[id][slot] && !bearerMintsSeenDisabled;
         bool landed;
         if (bearerPath) {
+            bytes memory bearerSig =
+                _sign(keyOf[expectedKey[id]], ledger.reseatBearerDigest(id, slot, toSeat, issued, deadline));
             vm.prank(submitter);
-            try ledger.reseatBearer(id, slot, toSeat, deadline, orgSig) {
+            try ledger.reseatBearer(id, slot, toSeat, issued, deadline, bearerSig) {
                 landed = true;
                 bearerReseats++;
             } catch {}
         } else {
             uint256 holderKey = keyOf[seenSlotOwner[id][slot]];
             if (holderKey == 0) return; // moved to a key the handler does not hold
+            bytes32 digest = ledger.reseatDigest(id, slot, toSeat, issued, deadline);
+            bytes memory orgSig = _sign(keyOf[expectedKey[id]], digest);
             vm.prank(submitter);
-            try ledger.reseat(id, slot, toSeat, deadline, orgSig, _sign(holderKey, digest)) {
+            try ledger.reseat(id, slot, toSeat, issued, deadline, orgSig, _sign(holderKey, digest)) {
                 landed = true;
                 holderReseats++;
                 seenMoved[id][slot] = true;
@@ -1055,7 +1068,9 @@ contract LedgerHandler is Test {
 
     /// A seat move without the consent it needs: a bearer move signed by a
     /// key that is not the organiser's, a holder's signature alone (as both
-    /// signatures), a held slot through `reseatBearer`. Must always revert.
+    /// signatures), a held slot through `reseatBearer`, or the organiser's
+    /// half of a two-party consent handed to `reseatBearer` (audit 1152 L-1).
+    /// Must always revert.
     function reseatUnauthorised(uint256 pick, uint256 seatSeed, uint256 road) external {
         if (actorSeatEvent.length == 0) return;
         uint256 i = bound(pick, 0, actorSeatEvent.length - 1);
@@ -1063,26 +1078,33 @@ contract LedgerHandler is Test {
         uint256 slot = actorSeatSlot[i];
         uint256 toSeat = _freeSeat(id, seatSeed);
         if (toSeat == type(uint256).max) return;
+        uint256 issued = block.timestamp;
         uint256 deadline = block.timestamp + 1 hours;
-        bytes32 digest = ledger.reseatDigest(id, slot, toSeat, deadline);
-        uint256 r = road % 3;
+        bytes32 twoPartyDigest = ledger.reseatDigest(id, slot, toSeat, issued, deadline);
+        bytes32 bearerDigest = ledger.reseatBearerDigest(id, slot, toSeat, issued, deadline);
+        uint256 r = road % 4;
         unauthorisedReseatAttempts++;
         if (r == 0) {
-            bytes memory wrong = _sign(actorKeys[bound(seatSeed, 0, actorKeys.length - 1)], digest);
-            try ledger.reseatBearer(id, slot, toSeat, deadline, wrong) {
+            bytes memory wrong = _sign(actorKeys[bound(seatSeed, 0, actorKeys.length - 1)], bearerDigest);
+            try ledger.reseatBearer(id, slot, toSeat, issued, deadline, wrong) {
                 seatRuleBroken = true;
             } catch {}
         } else if (r == 1) {
             uint256 holderKey = keyOf[seenSlotOwner[id][slot]];
             if (holderKey == 0 || vm.addr(holderKey) == expectedKey[id]) return;
-            bytes memory h = _sign(holderKey, digest);
-            try ledger.reseat(id, slot, toSeat, deadline, h, h) {
+            bytes memory h = _sign(holderKey, twoPartyDigest);
+            try ledger.reseat(id, slot, toSeat, issued, deadline, h, h) {
+                seatRuleBroken = true;
+            } catch {}
+        } else if (r == 2) {
+            if (!seenMoved[id][slot]) return;
+            bytes memory orgSig = _sign(keyOf[expectedKey[id]], bearerDigest);
+            try ledger.reseatBearer(id, slot, toSeat, issued, deadline, orgSig) {
                 seatRuleBroken = true;
             } catch {}
         } else {
-            if (!seenMoved[id][slot]) return;
-            bytes memory orgSig = _sign(keyOf[expectedKey[id]], digest);
-            try ledger.reseatBearer(id, slot, toSeat, deadline, orgSig) {
+            bytes memory twoPartyHalf = _sign(keyOf[expectedKey[id]], twoPartyDigest);
+            try ledger.reseatBearer(id, slot, toSeat, issued, deadline, twoPartyHalf) {
                 seatRuleBroken = true;
             } catch {}
         }

@@ -42,9 +42,11 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * by another sponsor, not one minted non-bearer, not one its holder has ever
  * moved. That statement is what a payments contract — present or future,
  * correct or buggy — is audited against, and it holds for every sponsor
- * without re-reading this contract. The owner holds no power over any event's
- * terms either: it appoints and caps sponsors, sets the dispute authority, and
- * can end bearer minting for good.
+ * without re-reading this contract. The owner holds no power over an event's
+ * supply, cutoff or seats either: it appoints and caps sponsors, sets the
+ * dispute authority (the one address besides the organiser that can cancel,
+ * through `forceCancelEvent`; the owner by default), and can end bearer
+ * minting for good (audit 1152 I-11).
  *
  * The platform keeps three powers in all: minting and `reissue`, both within
  * a sponsor's cap, and `forceCancelEvent` through the dispute authority, which
@@ -64,8 +66,9 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  *     action (`setSupplyWithSignature`, `extendSalesEndWithSignature`,
  *     `cancelEventWithSignature`) for anyone to submit and pay for. The
  *     platform relays and can change nothing on its own. A signed action
- *     names every field, commits to `termsNonces[eventId]` and expires within
- *     `MAX_TERMS_SIGNATURE_TTL`.
+ *     names every field, commits to `termsNonces[eventId]` and names its own
+ *     window, `issuedAt` to `deadline`, at most `MAX_TERMS_SIGNATURE_TTL`
+ *     long: usable only inside it, and never later (audit 1152 L-2).
  *
  * The key is per EVENT, not per organiser: registration is permissionless, so
  * a per-organiser record set at registration would let anyone name the key of
@@ -81,11 +84,24 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * be the platform control this design removes.
  *
  * A LEAKED organiser key, until the account moves it, can do exactly what the
- * organiser can and nothing more: cancel (one-way, buyer-protective), lower
- * supply to what is minted, move the cutoff later within `MAX_SALES_EXTENSION`,
- * and move or empty (`NO_SEAT`) the seat of any bearer ticket until
- * `disableBearerMints`. None of it moves money toward anyone, the new key can
- * seat the tickets again, and it cannot move the key.
+ * organiser can and nothing more: cancel (one-way, buyer-protective), set
+ * supply anywhere from what is minted up to `registeredSupply` (so it can also
+ * undo a reduction), move the cutoff later within `MAX_SALES_EXTENSION`, move
+ * or empty (`NO_SEAT`) the seat of any bearer ticket nobody has moved, until
+ * `disableBearerMints`, and, with a holder's signature, move that holder's
+ * ticket. None of it moves money toward anyone, and it cannot move the key.
+ *
+ * Not all of it can be undone after the account moves the key (audit 1152
+ * L-3). The new key can seat bearer tickets again, but not into a seat the
+ * leaked key's holder has since taken: a key holder who also holds tickets
+ * can empty bearer tickets out of seats and `reseat` its own tickets into
+ * them, and a `reseat` sets `held`, which puts those tickets beyond the new
+ * key. A seat it empties is also free for sale until the new key restores
+ * the ticket. Accepted, not engineered out: a lever over `held` tickets is the
+ * power `held` exists to remove, and every remedy left is off chain: a leak
+ * is met by moving the key at once, a seat picker must not sell a seat an
+ * organiser-only move freed until the account confirms it, and the last
+ * resort is `forceCancelEvent` with refunds.
  *
  * ── Seats ────────────────────────────────────────────────────────────────────
  *
@@ -107,6 +123,15 @@ uint32 constant LEDGER_UNLIMITED_MINTS = type(uint32).max;
  * `NO_SEAT` empties the seat for a move to another band, which is another
  * event. Seats cannot be added after registration (a new registration is
  * another band), and a seat is one event's: a season is one ticket per event.
+ *
+ * A seat a band move empties is NOT sold by minting (audit 1152 L-4): a seated
+ * event's supply is its seat count, so once it has sold out no new slot
+ * exists for it, and `seatWord` then shows the seat free while `remaining()`
+ * is 0. It is refilled by seating the seatless ticket that left it: for a
+ * card (bearer) ticket, `reissue` that slot to the next buyer's fresh key and
+ * `reseatBearer` it into the seat; for a `held` ticket, only its holder can
+ * hand the slot on (`transferSlot`). A seat picker reads `remaining()` with
+ * `seatWord`, and never offers a seat it cannot fill.
  *
  * ── Reissue: the platform replacing a bearer ticket ──────────────────────────
  *
@@ -376,11 +401,12 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// WoCoPayments once it ships; any future sponsor contract after that.
     mapping(address => bool) public authorisedSponsors;
 
-    /// Per-event counter consumed by EVERY write to the event's terms or its
-    /// organiser key, on either path, direct or signed: `setSupply`,
+    /// Per-event counter consumed by every ORGANISER write to the event's terms
+    /// or its organiser key, on either path, direct or signed: `setSupply`,
     /// `extendSalesEnd`, `cancelEvent` and `setOrganiserKey`. A signed terms
     /// action commits to its current value, so it is dead once used and dead
-    /// once any other terms write lands first.
+    /// once any other terms write lands first. `forceCancelEvent` leaves it:
+    /// once cancelled, every terms and seat path refuses anyway (audit 1152 I-2).
     mapping(bytes32 => uint256) public termsNonces;
 
     /// One-way: once true, `batchClaimBearer`, `batchClaimSeatsBearer`,
@@ -440,33 +466,45 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     );
 
     /// EIP-712 types the organiser key signs (same domain). `nonce` is
-    /// `termsNonces[eventId]`, read from storage at submission.
+    /// `termsNonces[eventId]`, read from storage at submission. `issuedAt` and
+    /// `deadline` are the window the signer names (see `MAX_TERMS_SIGNATURE_TTL`).
     bytes32 public constant SET_SUPPLY_TYPEHASH = keccak256(
-        "SetSupply(bytes32 eventId,uint64 supply,uint256 nonce,uint256 deadline)"
+        "SetSupply(bytes32 eventId,uint64 supply,uint256 nonce,uint256 issuedAt,uint256 deadline)"
     );
     bytes32 public constant EXTEND_SALES_END_TYPEHASH = keccak256(
-        "ExtendSalesEnd(bytes32 eventId,uint64 eventEndTs,uint256 nonce,uint256 deadline)"
+        "ExtendSalesEnd(bytes32 eventId,uint64 eventEndTs,uint256 nonce,uint256 issuedAt,uint256 deadline)"
     );
     bytes32 public constant CANCEL_EVENT_TYPEHASH = keccak256(
-        "CancelEvent(bytes32 eventId,uint256 nonce,uint256 deadline)"
+        "CancelEvent(bytes32 eventId,uint256 nonce,uint256 issuedAt,uint256 deadline)"
     );
 
-    /// EIP-712 type of a seat move, signed by the organiser key (and, for
-    /// `reseat`, by the holder too, over the same digest). `holder` and `nonce`
-    /// are the slot's current owner and `transferNonces[eventId][slot]`, read
-    /// from storage at submission, so a consent dies when the slot moves by any
-    /// path, and moves on different slots never collide.
+    /// EIP-712 types of a seat move. `holder` and `nonce` are the slot's current
+    /// owner and `transferNonces[eventId][slot]`, read from storage at
+    /// submission, so a consent dies when the slot moves by any path, and moves
+    /// on different slots never collide. One type per path (audit 1152 L-1):
+    /// `Reseat` is the two-party move, signed by the organiser key AND the
+    /// holder, and sets `held`; `ReseatBearer` is the organiser key alone on a
+    /// bearer ticket. So a consent given for one path can never be submitted
+    /// through the other, and a holder's signed move always sets `held`.
     bytes32 public constant RESEAT_TYPEHASH = keccak256(
-        "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 deadline)"
+        "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 issuedAt,uint256 deadline)"
+    );
+    bytes32 public constant RESEAT_BEARER_TYPEHASH = keccak256(
+        "ReseatBearer(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 issuedAt,uint256 deadline)"
     );
 
-    /// @notice How far ahead a signed terms action or seat move may set its
-    ///         deadline. No signature the platform relays is a standing
-    ///         option: an organiser's consent lapses within two days of chain
-    ///         time (the registrar's ceiling, `WoCoRegistrar.sol`). CHAIN time,
+    /// @notice The longest window a signed terms action or seat move may name.
+    ///         No signature the platform relays is a standing option: each one
+    ///         names its window, `issuedAt` to `deadline`, at most this long,
+    ///         and is usable only inside it (the registrar's ceiling,
+    ///         `WoCoRegistrar.sol`). The window is part of what is signed, so a
+    ///         signature asking for longer is refused for good, not merely
+    ///         until its deadline comes near (audit 1152 L-2). CHAIN time,
     ///         under the rule stated on `registerEvent`'s `eventEndTs` (audit
-    ///         961 L-2): a signature can stay valid up to ~24h past the
-    ///         wall-clock deadline, or lapse early.
+    ///         961 L-2): sign with `issuedAt` a few minutes in the past, or a
+    ///         lagging chain clock refuses the signature as not yet valid, and
+    ///         a signature can stay valid up to ~24h past the wall-clock
+    ///         deadline, or lapse early.
     uint256 public constant MAX_TERMS_SIGNATURE_TTL = 48 hours;
 
     /// @notice `seatOf` for a slot with no seat, and the `toSeat` that moves a
@@ -613,8 +651,11 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     error SupplyAboveRegistered();
     /// @dev Later than `block.timestamp + MAX_SALES_EXTENSION`.
     error SalesEndTooFar();
-    /// @dev A signature deadline more than `MAX_TERMS_SIGNATURE_TTL` ahead.
+    /// @dev A signed window (`deadline - issuedAt`) longer than
+    ///      `MAX_TERMS_SIGNATURE_TTL`. Final: the window is signed.
     error DeadlineTooFar();
+    /// @dev A signature whose `issuedAt` is still ahead of chain time.
+    error SignatureNotYetValid();
     /// @dev A general-admission mint path called on a seated event.
     error SeatedEvent();
     /// @dev A seat path called on a general-admission event.
@@ -916,7 +957,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
             // safe: firstSlot + i < totalSupply < 2^64, checked in _claimBatch
             unchecked { s = firstSlot + i; }
             // forge-lint: disable-next-line(unsafe-typecast)
-            _seatOf[eventId][s] = uint64(seat) + 1; // safe: seat < registeredSupply < 2^64 - 1
+            _seatOf[eventId][s] = uint64(seat) + 1; // safe: seat < registeredSupply <= 2^64 - 1
             emit SeatAssigned(eventId, s, seat);
             // safe: i < n <= 100
             unchecked { ++i; }
@@ -1077,12 +1118,17 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     }
 
     /// @notice `setSupply` on the organiser key's EIP-712 signature over
-    ///         `setSupplyDigest(eventId, supply, deadline)`. Anyone may submit.
-    function setSupplyWithSignature(bytes32 eventId, uint64 supply, uint256 deadline, bytes calldata signature)
-        external
-    {
-        _checkDeadline(deadline);
-        Event storage ev = _signedTerms(eventId, setSupplyDigest(eventId, supply, deadline), signature);
+    ///         `setSupplyDigest(eventId, supply, issuedAt, deadline)`. Anyone
+    ///         may submit.
+    function setSupplyWithSignature(
+        bytes32 eventId,
+        uint64 supply,
+        uint256 issuedAt,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        _checkWindow(issuedAt, deadline);
+        Event storage ev = _signedTerms(eventId, setSupplyDigest(eventId, supply, issuedAt, deadline), signature);
         _setSupply(ev, eventId, supply);
     }
 
@@ -1117,15 +1163,17 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     }
 
     /// @notice `extendSalesEnd` on the organiser key's EIP-712 signature over
-    ///         `extendSalesEndDigest(eventId, eventEndTs, deadline)`.
+    ///         `extendSalesEndDigest(eventId, eventEndTs, issuedAt, deadline)`.
     function extendSalesEndWithSignature(
         bytes32 eventId,
         uint64 eventEndTs,
+        uint256 issuedAt,
         uint256 deadline,
         bytes calldata signature
     ) external {
-        _checkDeadline(deadline);
-        Event storage ev = _signedTerms(eventId, extendSalesEndDigest(eventId, eventEndTs, deadline), signature);
+        _checkWindow(issuedAt, deadline);
+        Event storage ev =
+            _signedTerms(eventId, extendSalesEndDigest(eventId, eventEndTs, issuedAt, deadline), signature);
         _extendSalesEnd(ev, eventId, eventEndTs);
     }
 
@@ -1204,21 +1252,23 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         if (ECDSA.recoverCalldata(digest, signature) != ev.organiserKey) revert NotOrganiserKey();
     }
 
-    /// @dev Every signed terms action and seat move: not expired, and not set
-    ///      further ahead than `MAX_TERMS_SIGNATURE_TTL`.
-    function _checkDeadline(uint256 deadline) private view {
+    /// @dev Every signed terms action and seat move: inside the window it
+    ///      names, and that window no longer than `MAX_TERMS_SIGNATURE_TTL`.
+    ///      In this order, so `deadline - issuedAt` cannot underflow.
+    function _checkWindow(uint256 issuedAt, uint256 deadline) private view {
         if (block.timestamp > deadline) revert SignatureExpired();
-        if (deadline > block.timestamp + MAX_TERMS_SIGNATURE_TTL) revert DeadlineTooFar();
+        if (issuedAt > block.timestamp) revert SignatureNotYetValid();
+        if (deadline - issuedAt > MAX_TERMS_SIGNATURE_TTL) revert DeadlineTooFar();
     }
 
     // ── Seats ─────────────────────────────────────────────────────────────────
 
     /**
      * @notice Move a BEARER ticket of a seated event to seat `toSeat`, on the
-     *         organiser key's signature over `reseatDigest(eventId, slot,
-     *         toSeat, deadline)`. For a card ticket, whose key nobody holds:
-     *         a wheelchair space, a broken seat. Anyone may submit. Until
-     *         `disableBearerMints`.
+     *         organiser key's signature over `reseatBearerDigest(eventId, slot,
+     *         toSeat, issuedAt, deadline)`. For a card ticket, whose key nobody
+     *         holds: a wheelchair space, a broken seat. Anyone may submit.
+     *         Until `disableBearerMints`.
      * @dev The slot must be bearer and never moved by a holder (`held`), the
      *      reach of `reissue`, but with the ORGANISER'S consent, not the
      *      platform's: no sponsor can move a seat. `toSeat` is a free seat, or
@@ -1231,12 +1281,13 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
         bytes32 eventId,
         uint256 slot,
         uint256 toSeat,
+        uint256 issuedAt,
         uint256 deadline,
         bytes calldata organiserSig
     ) external {
         if (bearerMintsDisabled) revert BearerMintsOff();
-        _checkDeadline(deadline);
-        bytes32 digest = reseatDigest(eventId, slot, toSeat, deadline);
+        _checkWindow(issuedAt, deadline);
+        bytes32 digest = reseatBearerDigest(eventId, slot, toSeat, issuedAt, deadline);
         Event storage ev = _signedTerms(eventId, digest, organiserSig);
         Slot storage sd = _slots[eventId][slot];
         if (sd.owner == address(0)) revert SlotUnclaimed();
@@ -1247,26 +1298,31 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
 
     /**
      * @notice Move ANY ticket of a seated event to seat `toSeat`, on two
-     *         signatures over the same `reseatDigest`: the organiser key's
-     *         (the seat map is the organiser's) and the holder's (the ticket is
-     *         theirs). Anyone may submit.
+     *         signatures over the same `reseatDigest(eventId, slot, toSeat,
+     *         issuedAt, deadline)`: the organiser key's (the seat map is the
+     *         organiser's) and the holder's (the ticket is theirs). Anyone may
+     *         submit.
      * @dev Two-party on purpose: a holder alone could take any free seat,
      *      including ones the organiser holds back off chain, and an organiser
      *      alone could move a ticket someone holds the key to. Sets `held`:
      *      a key someone keeps signed for the slot, so `reissue` and
-     *      `reseatBearer` no longer reach it. Survives `disableBearerMints`.
-     *      EOA holders only, as `transferSlotWithSignature`.
+     *      `reseatBearer` no longer reach it. The digest is this path's own
+     *      type, so the organiser's half cannot be submitted through
+     *      `reseatBearer` to skip `held` (audit 1152 L-1). Survives
+     *      `disableBearerMints`. EOA holders only, as
+     *      `transferSlotWithSignature`.
      */
     function reseat(
         bytes32 eventId,
         uint256 slot,
         uint256 toSeat,
+        uint256 issuedAt,
         uint256 deadline,
         bytes calldata organiserSig,
         bytes calldata holderSig
     ) external {
-        _checkDeadline(deadline);
-        bytes32 digest = reseatDigest(eventId, slot, toSeat, deadline);
+        _checkWindow(issuedAt, deadline);
+        bytes32 digest = reseatDigest(eventId, slot, toSeat, issuedAt, deadline);
         Event storage ev = _signedTerms(eventId, digest, organiserSig);
         Slot storage sd = _slots[eventId][slot];
         if (sd.owner == address(0)) revert SlotUnclaimed();
@@ -1292,7 +1348,7 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
             if (toSeat >= ev.registeredSupply) revert InvalidSeat();
             _takeSeat(eventId, toSeat);
             // forge-lint: disable-next-line(unsafe-typecast)
-            _seatOf[eventId][slot] = uint64(toSeat) + 1; // safe: toSeat < registeredSupply < 2^64 - 1
+            _seatOf[eventId][slot] = uint64(toSeat) + 1; // safe: toSeat < registeredSupply <= 2^64 - 1
         }
         unchecked { ++transferNonces[eventId][slot]; }
 
@@ -1548,12 +1604,17 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     }
 
     /// @notice `cancelEvent` on the organiser key's EIP-712 signature over
-    ///         `cancelEventDigest(eventId, deadline)`. Anyone may submit; the
-    ///         48-hour deadline ceiling keeps a held signature from being a
-    ///         standing option to cancel.
-    function cancelEventWithSignature(bytes32 eventId, uint256 deadline, bytes calldata signature) external {
-        _checkDeadline(deadline);
-        Event storage ev = _signedTerms(eventId, cancelEventDigest(eventId, deadline), signature);
+    ///         `cancelEventDigest(eventId, issuedAt, deadline)`. Anyone may
+    ///         submit; the signed 48-hour window keeps a held signature from
+    ///         being a standing option to cancel.
+    function cancelEventWithSignature(
+        bytes32 eventId,
+        uint256 issuedAt,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        _checkWindow(issuedAt, deadline);
+        Event storage ev = _signedTerms(eventId, cancelEventDigest(eventId, issuedAt, deadline), signature);
         _cancel(ev, eventId, ev.organiserKey);
     }
 
@@ -1697,47 +1758,75 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// @notice What the organiser key signs for `setSupplyWithSignature`.
     /// @dev Bound to the CURRENT `termsNonces`, so it changes after every
     ///      terms write. Wallets that sign typed data build the same struct.
-    function setSupplyDigest(bytes32 eventId, uint64 supply, uint256 deadline) public view returns (bytes32) {
-        return _hashTypedDataV4(
-            keccak256(abi.encode(SET_SUPPLY_TYPEHASH, eventId, supply, termsNonces[eventId], deadline))
-        );
-    }
-
-    /// @notice What the organiser key signs for `extendSalesEndWithSignature`.
-    function extendSalesEndDigest(bytes32 eventId, uint64 eventEndTs, uint256 deadline)
+    function setSupplyDigest(bytes32 eventId, uint64 supply, uint256 issuedAt, uint256 deadline)
         public
         view
         returns (bytes32)
     {
         return _hashTypedDataV4(
-            keccak256(abi.encode(EXTEND_SALES_END_TYPEHASH, eventId, eventEndTs, termsNonces[eventId], deadline))
+            keccak256(abi.encode(SET_SUPPLY_TYPEHASH, eventId, supply, termsNonces[eventId], issuedAt, deadline))
         );
     }
 
-    /// @notice What the organiser key signs for `cancelEventWithSignature`.
-    function cancelEventDigest(bytes32 eventId, uint256 deadline) public view returns (bytes32) {
-        return _hashTypedDataV4(
-            keccak256(abi.encode(CANCEL_EVENT_TYPEHASH, eventId, termsNonces[eventId], deadline))
-        );
-    }
-
-    /// @notice What the organiser key (and, for `reseat`, the holder) signs
-    ///         for a seat move. Bound to the slot's CURRENT owner and transfer
-    ///         nonce, so it changes whenever the slot moves or reseats.
-    function reseatDigest(bytes32 eventId, uint256 slot, uint256 toSeat, uint256 deadline)
+    /// @notice What the organiser key signs for `extendSalesEndWithSignature`.
+    function extendSalesEndDigest(bytes32 eventId, uint64 eventEndTs, uint256 issuedAt, uint256 deadline)
         public
         view
         returns (bytes32)
     {
         return _hashTypedDataV4(
             keccak256(
+                abi.encode(EXTEND_SALES_END_TYPEHASH, eventId, eventEndTs, termsNonces[eventId], issuedAt, deadline)
+            )
+        );
+    }
+
+    /// @notice What the organiser key signs for `cancelEventWithSignature`.
+    function cancelEventDigest(bytes32 eventId, uint256 issuedAt, uint256 deadline) public view returns (bytes32) {
+        return _hashTypedDataV4(
+            keccak256(abi.encode(CANCEL_EVENT_TYPEHASH, eventId, termsNonces[eventId], issuedAt, deadline))
+        );
+    }
+
+    /// @notice What the organiser key AND the holder sign for `reseat`.
+    ///         Bound to the slot's CURRENT owner and transfer nonce, so it
+    ///         changes whenever the slot moves or reseats.
+    function reseatDigest(bytes32 eventId, uint256 slot, uint256 toSeat, uint256 issuedAt, uint256 deadline)
+        public
+        view
+        returns (bytes32)
+    {
+        return _seatMoveDigest(RESEAT_TYPEHASH, eventId, slot, toSeat, issuedAt, deadline);
+    }
+
+    /// @notice What the organiser key signs for `reseatBearer`. Bound as
+    ///         `reseatDigest`, under its own type (audit 1152 L-1).
+    function reseatBearerDigest(bytes32 eventId, uint256 slot, uint256 toSeat, uint256 issuedAt, uint256 deadline)
+        public
+        view
+        returns (bytes32)
+    {
+        return _seatMoveDigest(RESEAT_BEARER_TYPEHASH, eventId, slot, toSeat, issuedAt, deadline);
+    }
+
+    function _seatMoveDigest(
+        bytes32 typehash,
+        bytes32 eventId,
+        uint256 slot,
+        uint256 toSeat,
+        uint256 issuedAt,
+        uint256 deadline
+    ) private view returns (bytes32) {
+        return _hashTypedDataV4(
+            keccak256(
                 abi.encode(
-                    RESEAT_TYPEHASH,
+                    typehash,
                     eventId,
                     slot,
                     toSeat,
                     _slots[eventId][slot].owner,
                     transferNonces[eventId][slot],
+                    issuedAt,
                     deadline
                 )
             )
