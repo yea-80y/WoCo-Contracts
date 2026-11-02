@@ -523,6 +523,15 @@ contract WoCoTicketLedger is Ownable2Step, EIP712 {
     /// holder, and sets `held`; `ReseatBearer` is the organiser key alone on a
     /// bearer ticket. So a consent given for one path can never be submitted
     /// through the other, and a holder's signed move always sets `held`.
+    ///
+    /// Each move is signed and lands on its own, so a rearrangement of several
+    /// dependent moves - a swap is `a` to `NO_SEAT`, `b` into `a`'s seat, `a`
+    /// into `b`'s, each signed against the nonces the moves before it leave -
+    /// can be landed part-way by whoever holds the signatures, leaving a ticket
+    /// seatless until the organiser revokes and re-signs (audit 1156 L-1). Such
+    /// a sequence is submitted atomically: the organiser's own account sends
+    /// all of it in one transaction, all or nothing, rather than handing the
+    /// signatures to a relayer.
     bytes32 public constant RESEAT_TYPEHASH = keccak256(
         "Reseat(bytes32 eventId,uint256 slot,uint256 toSeat,address holder,uint256 nonce,uint256 termsNonce,uint256 seatNonce,uint256 issuedAt,uint256 deadline)"
     );
